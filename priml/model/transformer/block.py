@@ -17,7 +17,7 @@ from priml.cost import (
     cost,
     elementwise_cost,
 )
-from priml.model.attention.self_attention import SelfAttention
+from priml.model.attention.attention import Attention
 from priml.model.custom_types import (
     CachedAttention,
     ChannelsIn,
@@ -39,6 +39,11 @@ class TransformerBlock(nn.Module):
 
     Module names match sic convention for checkpoint compatibility:
     ``attn``, ``ffn``, and their corresponding ``norm1`` and ``norm2``.
+
+    The attention reads the block's input alone. A stack forwards every message
+    to every block, a ``memory`` too for the blocks that cross-attend to it, so
+    this block keeps the memory from its attention: an ``Attention`` handed one
+    would attend to it instead.
     """
 
     class Config(Fig["TransformerBlock"], kw_only=False):
@@ -50,7 +55,7 @@ class TransformerBlock(nn.Module):
 
         _: KW_ONLY
 
-        attn: Makeable[TensorModule] = field(default_factory=SelfAttention.Config)
+        attn: Makeable[TensorModule] = field(default_factory=Attention.Config)
         """Attention module config."""
 
         ffn: Makeable[TensorModule] = field(default_factory=SwiGLU.Config)
@@ -216,13 +221,15 @@ class TransformerBlock(nn.Module):
         Args:
           x: Input tensor.
           cache: Attention cache passed to the attention module.
-          **kwargs: Additional arguments forwarded to attention and FFN.
+          **kwargs: Additional arguments forwarded to attention and FFN, less
+            ``memory``.
 
         Returns:
           output: Output tensor same shape as x.
           cache: Updated cache after attention.
 
         """
+        kwargs.pop("memory", None)
         if not isinstance(self.attn, CachedAttention):
             raise TypeError("The attention module must implement cached attention.")
         attention = cast(CachedAttention[CacheT], self.attn)
@@ -245,6 +252,9 @@ class TransformerBlock(nn.Module):
         x: Tensor,
         **kwargs: object,
     ) -> Tensor:
+        # Handed the memory a stack sends its cross-attending blocks, this
+        # block's ``Attention`` would attend to it instead of to ``x``.
+        kwargs.pop("memory", None)
         if self.prenorm:
             attn_out = self.attn(self.norm1(x, **kwargs), **kwargs)
             x = x + attn_out

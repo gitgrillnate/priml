@@ -32,12 +32,6 @@ from typing import Final, Literal, Self, override
 
 from configgle import Makes
 
-from priml.baselines.arcagi1.act import (
-    AtomicPool,
-    FeedbackCarry,
-    HaltTraining,
-    SampledMinimum,
-)
 from priml.baselines.arcagi1.data import ArcData, PuzzleData
 from priml.baselines.arcagi1.loss import MeanOverBatch, StablemaxTokens
 from priml.baselines.arcagi1.metric import (
@@ -61,7 +55,14 @@ from priml.baselines.arcagi1.scripts.build_spatial_eval import (
 from priml.baselines.arcagi1.train_step import EvalSignals, TrmTrainStep
 from priml.baselines.arcagi2.model import PuzzleEmbedding, RotaryBlock
 from priml.baselines.arcagi2.train_step import ArcDataParallel
-from priml.baselines.sudoku.act import ActPool
+from priml.baselines.sudoku.act import (
+    AtomicPool,
+    CellCorruption,
+    FeedbackCarry,
+    HaltTraining,
+    SampledMinimum,
+    ZeroStart,
+)
 from priml.baselines.sudoku.embedding import GridEmbedding, PredictionFeedback
 from priml.baselines.sudoku.model import (
     CoreCompile,
@@ -75,8 +76,8 @@ from priml.baselines.sudoku.prefix import (
     SparsePuzzleEmbedding,
 )
 from priml.baselines.sudoku.train_step import SudokuTrainStep
+from priml.model.attention.attention import Attention
 from priml.model.attention.rope import RoPE
-from priml.model.attention.self_attention import SelfAttention
 from priml.model.init import kaiming_uniform
 from priml.model.mlpmixer import MLPMixerBlock
 from priml.model.norm import RMSNorm
@@ -128,8 +129,9 @@ class ArcTrainLoop(
         embedding.grid_shape = spec.grid_shape
         if isinstance(model.block, MLPMixerBlock.Config):
             model.block.seq_len = model.total_seq_len
-        if self.step.act is not None:
-            self.step.act.given_high = spec.vocab_size - 1
+        pool = self.step.pool
+        if pool is not None and pool.feedback is not None:
+            pool.feedback.givens = (2, spec.vocab_size - 1)
         return super().finalize()
 
 
@@ -249,7 +251,8 @@ def exp002() -> ArcTrainLoop:
 
     Returns:
       cfg: exp000 config with deep recurrence (3 slow + 4 fast cycles per
-        task), prediction feedback, and halting policy.
+        task) and halting policy; the feedback channel is present but
+        untrained.
 
     References:
       https://arxiv.org/abs/2510.04871
@@ -263,15 +266,20 @@ def exp002() -> ArcTrainLoop:
     cfg = exp000()
     cfg.experiment_name = "exp002"
     cfg.step.model.recurrence = DeepRecurrence.Config(slow_cycles=3, fast_cycles=4)
-    # The solver refines its own answer, so the previous step's decoded grid is
-    # an input channel: without it each step re-reads the original task.
+    # As trained: the feedback channel is built, but the pool never fed the
+    # decoded grid back in training, so its zero-initialized table stayed zero;
+    # slots were seated from zero latents rather than the learned ones
+    # evaluation starts from.
     embedding = cfg.step.model.embedding
     assert isinstance(embedding, GridEmbedding.Config)
     embedding.channels = [PredictionFeedback.Config()]
-    cfg.step.act = ActPool.Config(
+    cfg.step.pool = AtomicPool.Config(
         batch_size=cfg.dataset.batch_size,
-        max_steps=16,
-        halt_weight=0.5,
+        halting=HaltTraining.Config(
+            weight=0.5,
+            exploration=SampledMinimum.Config(),
+        ),
+        start=ZeroStart.Config(),
     )
     return cfg
 
@@ -356,7 +364,9 @@ class TrmTrainLoop(
         embedding = model.embedding
         assert isinstance(embedding, GridEmbedding.Config)
         embedding.grid_shape = spec.grid_shape
-        if model.rope is not None:
+        # A recipe may lay the grid out in 2D for its rotary (e.g. ``(30, 30)``
+        # for a 900-token grid); only an unset lattice takes the flat default.
+        if model.rope is not None and not model.rope_grid_shape:
             model.rope_grid_shape = spec.grid_shape
         return super().finalize()
 
@@ -397,10 +407,12 @@ def exp004() -> TrmTrainLoop:
     cfg.step.optimizer = AdamATan2.Config(lr=1e-4, betas=(0.9, 0.95), weight_decay=0.1)
     cfg.step.token_loss = StablemaxTokens.Config()
     cfg.step.reduction = MeanOverBatch.Config()
-    cfg.step.pool = AtomicPool.Config(batch_size=batch_size, max_steps=16)
-    cfg.step.halting = HaltTraining.Config(
-        weight=0.5,
-        exploration=SampledMinimum.Config(prob=0.1),
+    cfg.step.pool = AtomicPool.Config(
+        batch_size=batch_size,
+        halting=HaltTraining.Config(
+            weight=0.5,
+            exploration=SampledMinimum.Config(),
+        ),
     )
     cfg.step.ema = EMA.Config(
         decay=0.999,
@@ -597,12 +609,14 @@ def exp008() -> TrmTrainLoop:
     cfg.experiment_name = "exp008"
     model = cfg.step.model
     assert isinstance(model.block, TransformerBlock.Config)
-    assert isinstance(model.block.attn, SelfAttention.Config)
+    assert isinstance(model.block.attn, Attention.Config)
     model.block.attn.norm_qk = RMSNorm.Config(model.block.attn.channels_head)
     assert isinstance(model.embedding, GridEmbedding.Config)
     model.embedding.channels = [PredictionFeedback.Config()]
     assert isinstance(cfg.step.pool, AtomicPool.Config)
-    cfg.step.pool.feedback = FeedbackCarry.Config(corruption_rate=0.075)
+    cfg.step.pool.feedback = FeedbackCarry.Config(
+        corruption=CellCorruption.Config(rate=0.075),
+    )
     return cfg
 
 
@@ -615,7 +629,7 @@ def _reference_model(batch_size: int) -> SudokuNet.Config:
     model.num_layers = 2
     model.embedding = GridEmbedding.Config()
     model.block = RotaryBlock.Config(
-        attn=SelfAttention.Config(
+        attn=Attention.Config(
             num_heads=8,
             channels_head=64,
             init_weight=corrected_fan_in_normal,

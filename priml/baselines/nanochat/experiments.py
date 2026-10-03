@@ -66,11 +66,7 @@ else:
 
 from configgle import Makes, PartialConfig
 
-from priml.baselines.nanochat.attention import (
-    CausalAttention,
-    Flash3Attention,
-    Flash4Attention,
-)
+from priml.baselines.nanochat.attention import CausalAttention
 from priml.baselines.nanochat.data import NanoChatData, ReferenceEvaluation
 from priml.baselines.nanochat.model import (
     GatedResidualMix,
@@ -95,6 +91,8 @@ from priml.baselines.nanochat.train_step import (
 from priml.math.schedules import trapezoidal
 from priml.metrics.bits_per_byte import BitsPerByte
 from priml.model import softcap
+from priml.model.attention.flash3 import Flash3Attention
+from priml.model.attention.flash4 import Flash4Attention
 from priml.model.attention.rope import HuggingFaceFrequencies
 from priml.model.attention.value_gated_attention import (
     SdpaCausal,
@@ -105,6 +103,7 @@ from priml.model.linear import Linear
 from priml.model.narrow_embedding import NarrowEmbedding
 from priml.model.norm import RMSNorm
 from priml.model.swiglu import SwiGLUReluSquared, shifted_relu_squared
+from priml.model.transformer.block import TransformerBlock
 from priml.optimizers.composite import CompositeOptimizer
 from priml.optimizers.fused_adamw import FusedAdamW
 from priml.optimizers.parameter_filter import matching
@@ -118,8 +117,6 @@ from priml.train.tracker import (
     WandbTracker,
 )
 from priml.train.train_loop import TrainLoop
-
-import priml.model.transformer.block
 
 
 class NanoChatLoop(TrainLoop):
@@ -610,7 +607,7 @@ def exp008() -> NgramTrainLoop.Config:
     optimizer.select[6] = matching("embed.contexts.bigram.inner")
     optimizer.select.append(matching("embed.contexts.trigram.inner"))
     template = cfg.step.model.template
-    blocks: list[priml.model.transformer.block.TransformerBlock.Config] = []
+    blocks: list[TransformerBlock.Config] = []
     for _ in range(cfg.step.model.num_layers):
         block = template.copy_tree()
         assert isinstance(block.ffn, SwiGLUReluSquared.Config)
@@ -666,12 +663,12 @@ def exp009() -> NgramTrainLoop.Config:
     model.dtype = torch.bfloat16
     assert isinstance(model.block, list)
     template = model.block[0]
-    blocks: list[priml.model.transformer.block.TransformerBlock.Config] = []
+    blocks: list[TransformerBlock.Config] = []
     for layer in range(model.num_layers):
         block = template.copy_tree()
         assert isinstance(
             block,
-            priml.model.transformer.block.TransformerBlock.Config,
+            TransformerBlock.Config,
         )
         assert isinstance(block.attn, ValueGatedAttention.Config)
         block.attn.window = model.max_seq_len if layer in (3, 7) else 512
@@ -718,7 +715,7 @@ def exp010() -> NgramTrainLoop.Config:
     for block in model.block:
         assert isinstance(
             block,
-            priml.model.transformer.block.TransformerBlock.Config,
+            TransformerBlock.Config,
         )
         attention = CausalAttention.Config().update(block.attn)
         attention.norm_qk = RMSNorm.Config(eps=None)
@@ -955,7 +952,7 @@ def exp014() -> NgramTrainLoop.Config:
     for block, expansion in zip(model.block, (2, 2, 3, 3, 5, 5, 6, 6), strict=True):
         assert isinstance(
             block,
-            priml.model.transformer.block.TransformerBlock.Config,
+            TransformerBlock.Config,
         )
         assert isinstance(block.ffn, OutputNormFeedForward.Config)
         block.ffn.expansion = expansion

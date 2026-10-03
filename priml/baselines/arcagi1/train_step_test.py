@@ -26,14 +26,14 @@ import pytest
 import torch
 
 from priml.baselines.arcagi1 import experiments
-from priml.baselines.arcagi1.act import AtomicPool
 from priml.baselines.arcagi1.model import REFERENCE_NAMES, ConvSwiGLU
 from priml.baselines.arcagi1.train_step import TrmTrainStep
 from priml.baselines.arcagi2.model import RotaryBlock
+from priml.baselines.sudoku.act import AtomicPool
 from priml.baselines.sudoku.embedding import GridEmbedding
 from priml.baselines.sudoku.model import DeepRecurrence, SudokuNet
 from priml.baselines.sudoku.prefix import SparsePuzzleEmbedding
-from priml.model.attention.self_attention import SelfAttention
+from priml.model.attention.attention import Attention
 from priml.model.norm import RMSNorm
 from priml.model.swiglu import SwiGLU
 from priml.testing.bfb import host_agnostic_numerics
@@ -366,8 +366,8 @@ def test_golden_bites(recipe: str, perturb: str) -> None:
         torch.manual_seed(0)
         subject = PortSubject(recipe)
         if perturb == "halt_weight":
-            assert subject.step.halting is not None
-            subject.step.halting.weight *= 1.5
+            assert subject.step.pool.halting is not None
+            subject.step.pool.halting.weight *= 1.5
         else:
             # On the integer view: a float nudge is done in float64 here and
             # rounds straight back to the weight's own width.
@@ -397,6 +397,24 @@ def test_an_all_padding_eval_batch_keeps_the_packed_width(recipe: str) -> None:
     assert empty.get("metrics", {}).keys() == full.get("metrics", {}).keys()
 
 
+@pytest.mark.parametrize("weight", [None, 0.05])
+def test_eval_halt_weight_scores_a_frozen_head(weight: float | None) -> None:
+    """Without halt training the eval loss is the token loss, unless told otherwise."""
+    config = port_config("exp004")
+    config.pool.halting = None
+    config.eval_halt_weight = weight
+    with torch.random.fork_rng(devices=[]), host_agnostic_numerics():
+        torch.manual_seed(0)
+        out = PortSubject.from_config(config).step.eval_loss(**batches()[0])
+        metrics = out.get("metrics", {})
+        lm_loss = torch.as_tensor(metrics["lm_loss"])
+        halt_loss = torch.as_tensor(metrics["q_halt_loss"])
+        expected = lm_loss if weight is None else lm_loss + weight * halt_loss
+    assert float(halt_loss) > 0
+    loss = out["loss"].reshape(())
+    assert torch.equal(loss, expected.to(loss.dtype))
+
+
 def test_a_whole_model_compile_is_rejected() -> None:
     """The step calls the model directly, so a whole-model compile would be ignored."""
     config = port_config("exp004")
@@ -417,7 +435,7 @@ def shrink_model(model: SudokuNet.Config) -> None:
     model.recurrence.fast_cycles = 2
     block = model.block
     if isinstance(block, RotaryBlock.Config):
-        assert isinstance(block.attn, SelfAttention.Config)
+        assert isinstance(block.attn, Attention.Config)
         block.attn.num_heads = 2
         block.attn.channels_head = 4 // 2
         if isinstance(block.attn.norm_qk, RMSNorm.Config):

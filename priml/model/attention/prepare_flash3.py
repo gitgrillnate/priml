@@ -1,18 +1,24 @@
 #!/bin/sh
 # ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# Run directly, this file resolves the repository's project, whose Torch is not
+# the 2.9.1 FA3 builds against, so the build stops at its runtime check and names
+# the isolated-runtime command below. The cli-shape lint pins the exec line to the
+# enclosing project; an exec into the runtime would fail that gate.
 # fmt: off
 '''' 2>/dev/null #
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"
-Build the pinned FlashAttention-3 source once and install it under the cache.
+Build the pinned FlashAttention 3 source once and install it under the cache.
 
 Clones the pinned FA3 revision, checks the CUTLASS submodule against its pin,
 builds the SM90 wheel with the nanochat hdim128/bf16 profile, and installs it
 atomically under the content-addressed artifact path that
-``priml.baselines.nanochat.attention.load_flash3`` reads. Needs x86_64
-Linux, torch 2.9.1+cu128 with the C++11 ABI, and nvcc 12.8.
+``priml.model.attention.flash3.load_flash3`` reads. A valid artifact
+returns at once, so rerunning is free. Needs x86_64 Linux, torch 2.9.1+cu128
+with the C++11 ABI, and nvcc 12.8; the isolated runtime below supplies the
+torch.
 
 Examples:
-  uv --quiet run --frozen python -m priml.baselines.nanochat.scripts.prepare_flash3
+  uv --quiet run --frozen --isolated --project priml/baselines/nanochat/runtime python -m priml.model.attention.prepare_flash3
 
 '''
 # fmt: on
@@ -31,7 +37,7 @@ import subprocess
 import sys
 import tempfile
 
-from priml.baselines.nanochat.attention import (
+from priml.model.attention.flash3 import (
     artifact_path,
     artifact_validation_error,
     cutlass_revision,
@@ -64,7 +70,7 @@ def main() -> int:
     )
     _add_arguments(parser)
     flags = cast(Flags, parser.parse_args())
-    print(prepare_flash3(cache_root=flags.cache_root))
+    print(prepare_flash3(cache_root=flags.cache_root))  # noqa: T201 -- The CLI reports the prepared path.
     return 0
 
 
@@ -237,7 +243,9 @@ def _validate_build_runtime() -> None:
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise RuntimeError("FA3 must be built on x86_64 Linux.")
     if torch.__version__.split("+", maxsplit=1)[0] != "2.9.1":
-        raise RuntimeError(f"FA3 requires Torch 2.9.1; found {torch.__version__}.")
+        raise RuntimeError(
+            f"FA3 requires Torch 2.9.1; found {torch.__version__}. Build it in the isolated runtime: `uv --quiet run --frozen --isolated --project priml/baselines/nanochat/runtime python -m priml.model.attention.prepare_flash3`.",
+        )
     if torch.version.cuda != "12.8":
         raise RuntimeError(f"FA3 requires CUDA 12.8; found {torch.version.cuda}.")
     if not torch.compiled_with_cxx11_abi():
