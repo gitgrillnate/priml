@@ -522,6 +522,9 @@ _RAE: Final = Reference(
         "model/vision_ae/rae.py::if tokens.shape[1] != self.num_patches:": (
             "Raises where the reference resizes; rae_test drives it."
         ),
+        "model/vision_ae/rae.py::if (channels, height, width) != self.latent_shape:": (
+            "Raises where the reference reshapes; rae_test drives it."
+        ),
         "model/vision_ae/rae.py::if channels % num_heads:": (
             "A misconfiguration guard; valid configs never take it."
         ),

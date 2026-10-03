@@ -981,8 +981,8 @@ class RAE(nn.Module):
         batch, channels, height, width = latent.shape
         if (channels, height, width) != self.latent_shape:
             raise ValueError(
-                f"decoder built for {math.prod(self.latent_shape[1:])} latent tokens, "
-                f"got {height * width}; latent grid must have shape {self.latent_shape}.",
+                f"RAE decodes latents of shape {self.latent_shape}, got "
+                f"{(channels, height, width)}; the reference would reshape them silently.",
             )
         tokens = latent.view(batch, channels, height * width).transpose(1, 2)
         pixels = self.decoder.unpatchify(self.decoder(tokens))

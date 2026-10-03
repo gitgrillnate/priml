@@ -74,11 +74,6 @@ def tiny() -> RAE.Config:
 
 # A private generator: the harness reseeds the global one before building the module,
 # and replay loads the stored input rather than rebuilding it.
-def test_decode_refuses_rectangular_grid_with_matching_token_count() -> None:
-    with pytest.raises(ValueError, match="grid"):
-        tiny().make().decode(torch.zeros(1, 8, 1, 4))
-
-
 def _image() -> Tensor:
     """Return a uint8 image batch larger than the encoder side."""
     generator = torch.Generator().manual_seed(0)
@@ -144,10 +139,18 @@ def test_decode_returns_the_decoder_size_in_the_unit_interval() -> None:
     assert image.max() <= 1
 
 
-def test_decode_rejects_a_grid_the_decoder_was_not_built_for() -> None:
-    model = tiny().make()
+@pytest.mark.parametrize("shape", [(1, 8, 3, 3), (1, 8, 1, 4), (1, 16, 2, 2)])
+def test_decode_rejects_a_latent_shape_the_model_was_not_built_for(
+    shape: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError, match=r"shape \(8, 2, 2\), got"):
+        _ = tiny().make().decode(torch.zeros(shape))
+
+
+def test_decoder_rejects_a_token_count_it_was_not_built_for() -> None:
+    decoder = tiny().make().decoder
     with pytest.raises(ValueError, match="built for 4 latent tokens, got 9"):
-        _ = model.decode(torch.zeros(1, 8, 3, 3))
+        _ = decoder(torch.zeros(1, 9, 8))
 
 
 def test_train_leaves_the_frozen_model_in_eval_mode() -> None:
