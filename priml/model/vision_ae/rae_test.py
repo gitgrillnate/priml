@@ -10,6 +10,10 @@ record holds the reference commit, the tiny weights, the input, and the
 reference's latent and (unclamped) pixels. The reference's encoder attention was pinned to HF's eager
 kernel, the port's; its ``from_pretrained`` default, ``sdpa``, moves 6 of the 64
 latent values by up to 3 float32 ULP.
+
+Mint it on x86-64, the CI architecture. The tiny weights come from seeded
+initialization, whose draws differ on arm64, so a parity run on an Apple machine
+reports the stored weights as mismatched; this replay loads them and passes on both.
 """
 
 from __future__ import annotations
