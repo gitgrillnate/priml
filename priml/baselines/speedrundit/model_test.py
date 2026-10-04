@@ -69,6 +69,39 @@ def test_cost_counts_shared_projector_once() -> None:
     assert estimate["flops", "primal", "matmul", torch.float32] > 0
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [{}, {"drop_ratio": 0.0, "path_drop_prob": 0.0}, {"path_drop_prob": 1.0}],
+)
+def test_every_trainable_parameter_receives_a_gradient(
+    overrides: dict[str, object],
+) -> None:
+    """Replicated ranks desync on a trainable parameter whose gradient never arrives."""
+    config = tiny_model().config.copy_tree()
+    for name, value in overrides.items():
+        setattr(config, name, value)
+    model = config.make().train()
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.copy_(0.2 * torch.randn(parameter.shape, generator=generator))
+    output = model(
+        torch.randn(2, 2, 4, 4, generator=generator),
+        torch.rand(2, generator=generator),
+        torch.tensor([0, 1]),
+        torch.randn(2, 8, generator=generator),
+    )
+    aligned = torch.stack([p.tokens.square().mean() for p in output.projections])
+    loss = output.velocity.square().mean() + output.cls_velocity.square().mean()
+    (loss + aligned.sum()).backward()
+    unused = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    assert not unused
+
+
 def test_cost_counts_the_projector_even_when_no_depth_projects() -> None:
     config = tiny_model().config.copy_tree()
     config.projection_depths = ()
@@ -236,7 +269,7 @@ def test_shift_and_sampler_return_expected_latent_shapes() -> None:
         ({"projection_depths": (2, 7)}, "outside the model"),
         ({"patch_size": 3}, "divisible by patch_size"),
         ({"encoder_blocks": 0}, "encoder_blocks"),
-        ({"drop_ratio": 0.0}, "drop_ratio"),
+        ({"drop_ratio": -0.1}, "drop_ratio"),
         ({"drop_ratio": 1.0}, "drop_ratio"),
         ({"drop_ratio": math.nan}, "drop_ratio"),
         ({"path_drop_prob": -0.2}, "path_drop_prob"),

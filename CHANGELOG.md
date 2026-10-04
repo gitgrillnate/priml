@@ -63,11 +63,12 @@ All notable priml changes are documented here. This project follows
   counts, the step reports `skipped_steps`, refuses a closure-based optimizer
   its stochastic objective cannot serve, and names a teacher that returns no
   feature tuple.
-- SpeedrunDiT: the model refuses `encoder_blocks < 1`, a `drop_ratio` outside
-  `(0, 1)`, and a `path_drop_prob` outside `[0, 1]`; the first two left
-  parameters untrained, which replicated ranks let drift apart. A model built
-  on the meta device initializes every tensor, and its cost counts the
-  projector when no depth projects.
+- SpeedrunDiT: the model refuses `encoder_blocks < 1`, whose value-residual
+  blends never trained, and freezes the fusion mask token when no token or path
+  is ever dropped; replicated ranks let such untrained parameters drift apart.
+  It refuses a `drop_ratio` outside `[0, 1)` and a `path_drop_prob` outside
+  `[0, 1]`. A model built on the meta device initializes every tensor, and its
+  cost counts the projector when no depth projects.
 - SpeedrunDiT: the corpus loader refuses two files naming one pair, and an
   image that is not `[3, H, W]` uint8.
 

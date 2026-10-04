@@ -340,19 +340,16 @@ class SpeedrunDiT(nn.Module):
             raise ValueError("projection depth outside the model")
         if config.input_size % config.patch_size:
             raise ValueError("input_size must be divisible by patch_size")
-        # Each leaves parameters that never receive a gradient, which composable
-        # replicate (find_unused_parameters=False) lets drift apart across ranks.
+        # Without a dense block before routing no v1_lambda ever gets a gradient, which
+        # composable replicate (find_unused_parameters=False) lets drift across ranks.
         if config.encoder_blocks < 1:
             raise ValueError(
                 "encoder_blocks must be at least 1: every later block's v1_lambda "
                 "blends in the first dense block's values.",
             )
         drop = config.drop_ratio
-        if math.isnan(drop) or drop <= 0 or drop >= 1:
-            raise ValueError(
-                f"drop_ratio must lie strictly between 0 and 1; got {drop}. Without "
-                "dropped tokens fusion.mask_token is never trained.",
-            )
+        if math.isnan(drop) or drop < 0 or drop >= 1:
+            raise ValueError(f"drop_ratio must lie in [0, 1); got {drop}.")
         chance = config.path_drop_prob
         if math.isnan(chance) or chance < 0 or chance > 1:
             raise ValueError(f"path_drop_prob must be a probability; got {chance}.")
@@ -361,6 +358,12 @@ class SpeedrunDiT(nn.Module):
         # Match the reference module registration order. Global gradient
         # clipping reduces gradients in that order, which affects low bits.
         self.fusion = SparseDenseFusion.Config(channels=config.hidden_size).make()
+        # The mask token fills dropped tokens and dropped paths. When neither ever
+        # happens it can never get a gradient, and a trainable parameter without one
+        # lets composable replicate (find_unused_parameters=False) desync the ranks.
+        tokens = self.grid_size**2 + 1
+        if max(1, int(tokens * (1 - drop))) >= tokens and not chance:
+            _ = self.fusion.mask_token.requires_grad_(False)
         self.x_embedder = nn.Conv2d(
             config.in_channels,
             config.hidden_size,
