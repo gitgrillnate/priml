@@ -44,14 +44,7 @@ from priml.timer import CheckpointableStepTimer
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-
-def _pair_key(relative: Path) -> str:
-    """Normalize either the reference or priml preparer's image naming."""
-    match = re.fullmatch(r"img(?:-latents-)?(\d{8})", relative.stem)
-    stem = f"img{match.group(1)}" if match else relative.stem
-    return (relative.parent / stem).as_posix()
+    from collections.abc import Iterable, Mapping
 
 
 class PairedImageLatentDataset(Dataset[dict[str, Tensor]]):
@@ -107,15 +100,15 @@ class PairedImageLatentDataset(Dataset[dict[str, Tensor]]):
             )
         self.latent_shape = config.autoencoder.latent_shape()
         labels = read_labels(latent_root / LABELS)
-        images = {
-            _pair_key(path.relative_to(image_root)): path
-            for path in image_root.rglob("*")
-            if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".npy"}
-        }
-        latents = {
-            _pair_key(path.relative_to(latent_root)): path
-            for path in latent_root.rglob("*.npy")
-        }
+        images = _index(
+            image_root,
+            (
+                path
+                for path in image_root.rglob("*")
+                if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".npy"}
+            ),
+        )
+        latents = _index(latent_root, latent_root.rglob("*.npy"))
         if not latents or not latents.keys() <= images.keys():
             raise ValueError(
                 f"{latent_root} needs latents, each with an image in {image_root}",
@@ -136,6 +129,13 @@ class PairedImageLatentDataset(Dataset[dict[str, Tensor]]):
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         image_path, latent_path, label = self.records[index]
         image = read_image(image_path)
+        # A ``.npy`` image is read as stored; the teacher rescales from [0, 255]
+        # itself, so a float image in [0, 1] would be scaled a second time.
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[0] != 3:
+            raise ValueError(
+                f"{image_path} holds a {image.dtype} {list(image.shape)} image; the "
+                "teacher reads [3, H, W] uint8.",
+            )
         stored = load_stored(latent_path, self.codec.stored_dtype)
         if stored.ndim == 4 and stored.shape[0] == 1:
             stored = stored[0]
@@ -243,3 +243,21 @@ class SpeedrunImageNetData:
         self.timer_epoch.load_state_dict(
             cast(dict[str, object], state_dict["timer_epoch"]),
         )
+
+
+def _index(root: Path, paths: Iterable[Path]) -> dict[str, Path]:
+    """Key files by pair id, refusing two files that name one id."""
+    indexed: dict[str, Path] = {}
+    for path in paths:
+        key = _pair_key(path.relative_to(root))
+        if key in indexed:
+            raise ValueError(f"{indexed[key]} and {path} name the same pair {key}.")
+        indexed[key] = path
+    return indexed
+
+
+def _pair_key(relative: Path) -> str:
+    """Normalize either the reference or priml preparer's image naming."""
+    match = re.fullmatch(r"img(?:-latents-)?(\d{8})", relative.stem)
+    stem = f"img{match.group(1)}" if match else relative.stem
+    return (relative.parent / stem).as_posix()

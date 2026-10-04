@@ -99,7 +99,14 @@ class SpeedrunTrainStep(TrainStep):
                 "dataset's autoencoder, or set it on the step directly.",
             )
         super().__init__(config)
+        if getattr(self.optimizer, "requires_closure", False):
+            raise ValueError(
+                "SpeedrunTrainStep cannot drive a closure-based optimizer: its "
+                "objective draws fresh times and noise on every call, so a closure "
+                "would recompute a different loss.",
+            )
         self.config: SpeedrunTrainStep.Config = config
+        self.reference_samples = 0
         self.latent_norm: LatentNormalizer = config.latent_norm.make()
         self.teacher = (
             config.teacher.make().to(self.device).eval().requires_grad_(False)
@@ -134,12 +141,24 @@ class SpeedrunTrainStep(TrainStep):
                 enabled=self.config.dtype_autocast is not None,
             ),
         ):
-            teacher_features = cast(tuple[Tensor, ...], self.teacher(image))
+            teacher_features = cast("object", self.teacher(image))
+        # The slot takes any module, so its output is checked rather than cast: a
+        # bare tensor would otherwise fail later as an ambiguous tensor truth value.
+        if not isinstance(teacher_features, tuple):
+            raise TypeError(
+                "The teacher must return a tuple of feature maps; got "
+                f"{type(teacher_features).__name__}.",
+            )
         if evaluate:
             model = cast(Callable[..., ModelOutput], self.call_eval)
         else:
             model = cast(Callable[..., ModelOutput], self.__call__)
-        return self.objective(model, latent, label, teacher_features)
+        return self.objective(
+            model,
+            latent,
+            label,
+            cast("tuple[Tensor, ...]", teacher_features),
+        )
 
     @classmethod
     def _result(cls, terms: LossTerms) -> TrainStepOutput:
@@ -156,20 +175,45 @@ class SpeedrunTrainStep(TrainStep):
 
     @override
     def train_step(self, **preprocessed_batch: object) -> TrainStepOutput:
+        """Backpropagate one micro-batch, and update once ``accumulate_grad_batches`` ran.
+
+        The update's gradient is the sample-weighted mean over the micro-batches,
+        as one batch of them all would give, except that the contrastive term
+        pairs samples within each micro-batch.
+
+        Args:
+          **preprocessed_batch: ``image``, ``latent``, and ``label`` on device.
+
+        Returns:
+          output: Per-sample ``loss``, the student's velocity as ``model``, each
+            loss term's mean, and ``skipped_steps`` when non-finite gradients skip
+            updates.
+
+        """
         terms = self._terms(preprocessed_batch, evaluate=False)
-        terms.mean_loss.backward()
-        self.accumulated_samples += terms.velocity.numel()
+        samples = terms.velocity.numel()
+        if self.accumulation_steps == 0:
+            self.reference_samples = samples
+        # Weighted against the first micro-batch rather than divided by the total:
+        # a lone or equal-size micro-batch then backpropagates its own mean, bit for
+        # bit, while unequal ones still weigh by their sample counts.
+        (terms.mean_loss * (samples / self.reference_samples)).backward()
+        self.accumulated_samples += samples
         self.accumulation_steps += 1
         if self.accumulation_steps >= self.accumulate_grad_batches:
             _assert_uniform_microbatch_count(self.accumulated_samples)
-            if self.accumulation_steps > 1:
+            share = self.accumulated_samples / self.reference_samples
+            if share != 1:
                 for parameter in self.model.parameters():
                     if parameter.grad is not None:
-                        parameter.grad.div_(self.accumulation_steps)
+                        parameter.grad.div_(share)
             self.step()
             self.accumulation_steps = 0
             self.accumulated_samples = 0
-        return self._result(terms)
+        result = self._result(terms)
+        if self.skip_step_on_nonfinite_grad:
+            result.setdefault("metrics", {})["skipped_steps"] = self.skipped_steps
+        return result
 
     @override
     def train_loss(self, **preprocessed_batch: object) -> TrainStepOutput:

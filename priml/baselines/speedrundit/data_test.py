@@ -102,6 +102,32 @@ def test_reference_names_and_tensor_values(tmp_path: Path) -> None:
     assert order == [[11, 12], [6, 9], [7, 5], [14, 13], [8, 10]]
 
 
+def test_two_files_of_one_pair_id_are_refused(tmp_path: Path) -> None:
+    """Both namings map to one id; keeping either would silently drop the other."""
+    _corpus(tmp_path, _source(tmp_path), 2)
+    latent_dir = tmp_path / "vae-in" / "00000"
+    np.save(latent_dir / "img00000000.npy", np.zeros((1, 32, 2, 2), np.float32))
+    with pytest.raises(ValueError, match=r"img00000000\.npy"):
+        _ = _source(tmp_path).make()
+
+
+@pytest.mark.parametrize(
+    "array",
+    [np.ones((3, 3, 4), np.float32), np.ones((1, 3, 4), np.uint8)],
+)
+def test_an_image_that_is_not_three_channel_uint8_is_refused(
+    tmp_path: Path,
+    array: np.ndarray,
+) -> None:
+    _corpus(tmp_path, _source(tmp_path), 1)
+    image = tmp_path / "images" / "00000" / "img00000000.png"
+    image.unlink()
+    np.save(image.with_suffix(".npy"), array)
+    dataset = _source(tmp_path).make()
+    with pytest.raises(ValueError, match="uint8"):
+        _ = dataset[0]
+
+
 def test_a_corpus_without_a_receipt_is_refused(tmp_path: Path) -> None:
     _corpus(tmp_path, _source(tmp_path), 2)
     (tmp_path / "vae-in" / "corpus.json").unlink()

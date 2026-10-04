@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, override
+from functools import partial
+from typing import TYPE_CHECKING, cast, override
 
-from torch import nn
+import math
+
+from torch import Tensor, nn
 
 import pytest
 import torch
@@ -21,6 +24,7 @@ from priml.math.diffusion.time_shift import time_shift
 from priml.math.position_embedding import image_token_positions
 from priml.model.attention.rope import RoPE
 from priml.optimizers.muon import Muon
+from priml.train.parallelism import materialize_meta
 
 
 if TYPE_CHECKING:
@@ -50,6 +54,37 @@ def test_cost_counts_shared_projector_once() -> None:
     estimate = model.config.cost(batch_size=2, dtype=torch.float32)
     assert estimate.params == sum(parameter.numel() for parameter in model.parameters())
     assert estimate["flops", "primal", "matmul", torch.float32] > 0
+
+
+def test_cost_counts_the_projector_even_when_no_depth_projects() -> None:
+    config = tiny_model().config.copy_tree()
+    config.projection_depths = ()
+    model = config.make()
+    estimate = config.cost(batch_size=2, dtype=torch.float32)
+    assert estimate.params == sum(parameter.numel() for parameter in model.parameters())
+
+
+@pytest.mark.parametrize("reference_rope", [True, False])
+def test_meta_construction_materializes_to_the_eager_constants(
+    reference_rope: bool,
+) -> None:
+    """Every deterministic tensor matches an eager build; random ones are finite."""
+    config = tiny_model().config.copy_tree()
+    config.reference_rope = reference_rope
+    eager = config.make()
+    with torch.device("meta"):
+        model = config.make()
+    materialize_meta(model, torch.device("cpu"))
+    random = {
+        name
+        for name, module in eager.named_modules()
+        if isinstance(module, (nn.Linear, nn.Conv2d, nn.Embedding))
+        for name in (f"{name}.weight", f"{name}.bias")
+    }
+    for name, tensor in model.state_dict(keep_vars=False).items():
+        assert bool(torch.isfinite(tensor).all()), name
+        if name not in random:
+            torch.testing.assert_close(tensor, eager.state_dict()[name], msg=name)
 
 
 def test_rope_leaves_cls_untouched_and_uses_original_positions() -> None:
@@ -187,6 +222,13 @@ def test_shift_and_sampler_return_expected_latent_shapes() -> None:
         ({"projection_depths": (3, 2)}, "strictly increasing"),
         ({"projection_depths": (2, 7)}, "outside the model"),
         ({"patch_size": 3}, "divisible by patch_size"),
+        ({"encoder_blocks": 0}, "encoder_blocks"),
+        ({"drop_ratio": 0.0}, "drop_ratio"),
+        ({"drop_ratio": 1.0}, "drop_ratio"),
+        ({"drop_ratio": math.nan}, "drop_ratio"),
+        ({"path_drop_prob": -0.2}, "path_drop_prob"),
+        ({"path_drop_prob": 1.5}, "path_drop_prob"),
+        ({"path_drop_prob": math.nan}, "path_drop_prob"),
     ],
 )
 def test_inconsistent_geometry_is_rejected(
@@ -222,7 +264,12 @@ def test_forward_rejects_a_cls_token_of_the_wrong_width() -> None:
 
 
 def test_computed_rope_matches_the_reference_buffers() -> None:
+    """Weights are randomized: zero-initialized heads would hide attention entirely."""
     reference = tiny_model().eval()
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for parameter in reference.parameters():
+            parameter.copy_(0.2 * torch.randn(parameter.shape, generator=generator))
     config = reference.config.copy_tree()
     config.reference_rope = False
     computed = config.make().eval()
@@ -237,21 +284,46 @@ def test_computed_rope_matches_the_reference_buffers() -> None:
     with torch.no_grad():
         expected = reference(*args)
         actual = computed(*args)
+    assert expected.velocity.abs().amax() > 0
     assert torch.allclose(actual.velocity, expected.velocity)
     assert torch.allclose(actual.cls_velocity, expected.cls_velocity)
 
 
-def test_training_path_drop_broadcasts_the_coin_across_ranks(tmp_path: Path) -> None:
+def test_training_path_drop_broadcasts_the_coin_across_ranks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rank 0's coin decides: this rank's own coin, 0.5, would keep the branch."""
     config = tiny_model().config.copy_tree()
-    config.path_drop_prob = 1.0
+    config.path_drop_prob = 0.25
     model = config.make().train()
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.copy_(0.2 * torch.randn(parameter.shape, generator=generator))
     args = (
         # SpeedrunDiT.forward requires a square input_size x input_size latent.
-        torch.randn(3, 2, 4, 4),
-        torch.rand(3),
+        torch.randn(3, 2, 4, 4, generator=generator),
+        torch.rand(3, generator=generator),
         torch.tensor([0, 1, 2]),
-        torch.randn(3, 8),
+        torch.randn(3, 8, generator=generator),
     )
+    labels = torch.zeros(3, dtype=torch.bool)
+    kept = model(
+        *args,
+        route_tokens=False,
+        drop_sparse_path=False,
+        force_drop_labels=labels,
+    )
+    forced = model(
+        *args,
+        route_tokens=False,
+        drop_sparse_path=True,
+        force_drop_labels=labels,
+    )
+    assert not torch.equal(kept.velocity, forced.velocity)
+    monkeypatch.setattr(torch, "rand", partial(_coin, value=0.5))
+    monkeypatch.setattr(dist, "broadcast", partial(_broadcast_from_rank_zero, coin=0.0))
     dist.init_process_group(
         backend="gloo",
         init_method=(tmp_path / "gloo-rendezvous").resolve().as_uri(),
@@ -259,13 +331,24 @@ def test_training_path_drop_broadcasts_the_coin_across_ranks(tmp_path: Path) -> 
         world_size=1,
     )
     try:
-        torch.manual_seed(0)
-        dropped = model(*args, route_tokens=False)
+        dropped = model(*args, route_tokens=False, force_drop_labels=labels)
     finally:
         dist.destroy_process_group()
-    torch.manual_seed(0)
-    forced = model(*args, route_tokens=False, drop_sparse_path=True)
     assert torch.equal(dropped.velocity, forced.velocity)
+
+
+def _coin(*size: int, value: float, **kwargs: object) -> Tensor:
+    del size
+    return torch.full(
+        (),
+        value,
+        device=cast("torch.device | None", kwargs.get("device")),
+    )
+
+
+def _broadcast_from_rank_zero(tensor: Tensor, src: int, *, coin: float) -> None:
+    assert src == 0
+    _ = tensor.fill_(coin)
 
 
 def test_sampler_requires_two_steps() -> None:

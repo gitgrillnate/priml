@@ -10,6 +10,8 @@ from __future__ import annotations
 from functools import partial
 from typing import NamedTuple, override
 
+import math
+
 from configgle import Fig
 from torch import Tensor, nn
 
@@ -250,7 +252,6 @@ class SpeedrunDiT(nn.Module):
                     dtype=dtype,
                 )
             )
-            projected_once = False
             for index in range(self.depth):
                 length = sparse if self.encoder_blocks <= index < middle_end else dense
                 rows = batch_size * length
@@ -295,8 +296,17 @@ class SpeedrunDiT(nn.Module):
                         + linear(self.projector_hidden, self.projector_hidden, rows)
                         + linear(self.projector_hidden, self.cls_channels, rows)
                     )
-                    total += projection.tile(1, copies=int(not projected_once))
-                    projected_once = True
+                    total += projection.tile(1, copies=0)
+            # One projector is shared by every depth, and built even with none.
+            projector = (
+                linear(width, self.projector_hidden, 1)
+                + linear(self.projector_hidden, self.projector_hidden, 1)
+                + linear(self.projector_hidden, self.cls_channels, 1)
+            )
+            total += Cost(
+                params=projector.params,
+                params_active=projector.params if self.projection_depths else 0,
+            )
             total += cost(
                 SparseDenseFusion.Config(channels=width),
                 seq_len=dense,
@@ -330,6 +340,22 @@ class SpeedrunDiT(nn.Module):
             raise ValueError("projection depth outside the model")
         if config.input_size % config.patch_size:
             raise ValueError("input_size must be divisible by patch_size")
+        # Each leaves parameters that never receive a gradient, which composable
+        # replicate (find_unused_parameters=False) lets drift apart across ranks.
+        if config.encoder_blocks < 1:
+            raise ValueError(
+                "encoder_blocks must be at least 1: every later block's v1_lambda "
+                "blends in the first dense block's values.",
+            )
+        drop = config.drop_ratio
+        if math.isnan(drop) or drop <= 0 or drop >= 1:
+            raise ValueError(
+                f"drop_ratio must lie strictly between 0 and 1; got {drop}. Without "
+                "dropped tokens fusion.mask_token is never trained.",
+            )
+        chance = config.path_drop_prob
+        if math.isnan(chance) or chance < 0 or chance > 1:
+            raise ValueError(f"path_drop_prob must be a probability; got {chance}.")
         self.config = config
         self.grid_size = config.input_size // config.patch_size
         # Match the reference module registration order. Global gradient
@@ -351,15 +377,7 @@ class SpeedrunDiT(nn.Module):
             dropout=config.class_dropout_prob,
         ).make()
         self.pos_embed: Tensor
-        self.register_buffer(
-            "pos_embed",
-            sincos_position_table(
-                config.hidden_size,
-                self.grid_size,
-                compute_dtype=config.position_compute_dtype,
-            ).unsqueeze(0),
-            persistent=True,
-        )
+        self.register_buffer("pos_embed", self._position_table(), persistent=True)
         ratios = [
             config.mlp_ratio_min
             + (config.mlp_ratio_max - config.mlp_ratio_min)
@@ -406,7 +424,12 @@ class SpeedrunDiT(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """Apply the reference SiT and adaLN-Zero initialization."""
+        """Apply the reference SiT and adaLN-Zero initialization to every tensor.
+
+        Also rewrites what the constructors set without randomness (norm scales,
+        the mask token, value-residual blends, position tables), so a model built
+        on the meta device materializes to the eager one.
+        """
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -435,16 +458,26 @@ class SpeedrunDiT(nn.Module):
             if module.bias is None:
                 raise ValueError("final projections must include a bias")
             nn.init.zeros_(module.bias)
-
-    def _project(
-        self,
-        x: Tensor,
-        layer: int,
-        ids: Tensor | None,
-        projections: list[Projection],
-    ) -> None:
-        if layer in self.config.projection_depths:
-            projections.append(Projection(self.projector(x), ids))
+        # After every random draw, so the draws keep their order and an eager
+        # build's weights are unchanged.
+        nn.init.zeros_(self.fusion.mask_token)
+        for module in self.modules():
+            if isinstance(module, (nn.RMSNorm, RMSNorm)) and module.weight is not None:
+                nn.init.ones_(module.weight)
+            # ValueResidualAttention starts its blend at an even mix.
+            if (
+                isinstance(module, ValueResidualAttention)
+                and module.v1_lambda is not None
+            ):
+                nn.init.constant_(module.v1_lambda, 0.5)
+        with torch.no_grad():
+            _ = self.pos_embed.copy_(self._position_table())
+            if self.config.reference_rope:
+                cos, sin = self.rope(
+                    image_token_positions(self.grid_size, self.pos_embed.device),
+                )
+                _ = self.reference_rope_cos.copy_(cos)
+                _ = self.reference_rope_sin.copy_(sin)
 
     @override
     def forward(
@@ -458,7 +491,27 @@ class SpeedrunDiT(nn.Module):
         drop_sparse_path: bool = False,
         route_tokens: bool | None = None,
     ) -> ModelOutput:
-        """Predict latent and CLS velocities plus intermediate DINO projections."""
+        """Predict latent and CLS velocities plus intermediate DINO projections.
+
+        Args:
+          x: ``[B, in_channels, input_size, input_size]`` noisy latents.
+          t: ``[B]`` flow times.
+          y: ``[B]`` class labels.
+          cls_token: ``[B, cls_channels]`` noisy DINO CLS features.
+          force_drop_labels: ``[B]`` booleans replacing labels by the
+            classifier-free token; ``None`` drops them at random in training.
+          drop_sparse_path: Remove the sparse branch, as path-drop guidance does.
+          route_tokens: Run the middle blocks on SPRINT's kept tokens; ``None``
+            routes in training only.
+
+        Returns:
+          output: Latent velocity, CLS velocity, and one projection per
+            ``projection_depths`` entry.
+
+        Raises:
+          ValueError: ``x`` or ``cls_token`` does not match the configuration.
+
+        """
         cfg = self.config
         batch, channels, height, width = x.shape
         if (channels, height, width) != (
@@ -535,6 +588,24 @@ class SpeedrunDiT(nn.Module):
             .reshape(batch, channels, height, width)
         )
         return ModelOutput(velocity, cls_velocity, tuple(projections))
+
+    def _project(
+        self,
+        x: Tensor,
+        layer: int,
+        ids: Tensor | None,
+        projections: list[Projection],
+    ) -> None:
+        if layer in self.config.projection_depths:
+            projections.append(Projection(self.projector(x), ids))
+
+    def _position_table(self) -> Tensor:
+        """Return the fixed ``[1, tokens, hidden_size]`` sin-cos position table."""
+        return sincos_position_table(
+            self.config.hidden_size,
+            self.grid_size,
+            compute_dtype=self.config.position_compute_dtype,
+        ).unsqueeze(0)
 
 
 def _linear_cost(

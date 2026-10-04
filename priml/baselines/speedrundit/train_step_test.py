@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from typing import Final, override
+
+import math
 
 from configgle import Fig
 from torch import Tensor, nn
@@ -14,9 +17,12 @@ import torch
 import torch.distributed as dist
 
 from priml.baselines.speedrundit.experiments import exp_smoke
+from priml.baselines.speedrundit.model import ModelOutput
 from priml.baselines.speedrundit.model_test import tiny_model
+from priml.baselines.speedrundit.objective import LossTerms
 from priml.baselines.speedrundit.train_step import SpeedrunTrainStep
 from priml.model.vision_ae.latent_norm import ScaleLatents
+from priml.optimizers.newton import Newton
 from priml.testing.bfb import assert_bfb_against_golden
 from priml.train.ema import NoEMA
 from priml.train.parallelism import NoParallel
@@ -135,6 +141,94 @@ def test_accumulation_averages_micro_batch_gradients_before_stepping(
     assert first.keys() == seen.keys()
     assert all(torch.allclose(seen[name], grad) for name, grad in first.items())
     assert (step.accumulation_steps, step.accumulated_samples) == (0, 0)
+
+
+def test_accumulation_weights_unequal_micro_batches_by_their_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One sample at target 1 and three at target 3 average to target 2.5."""
+    config = _small_step_config()
+    config.accumulate_grad_batches = 2
+    step = config.make()
+    parameter = next(step.model.parameters())
+    monkeypatch.setattr(step, "_terms", partial(_squared_error, parameter=parameter))
+    seen: list[Tensor] = []
+    monkeypatch.setattr(step, "step", partial(_record_grad, parameter, seen=seen))
+    _ = step.train_step(target=torch.tensor([1.0]))
+    _ = step.train_step(target=torch.tensor([3.0, 3.0, 3.0]))
+    offset = float(parameter.detach().sum())
+    expected = torch.full_like(parameter, 2 * (offset - 2.5))
+    torch.testing.assert_close(seen[0], expected)
+
+
+def _record_grad(parameter: nn.Parameter, *, seen: list[Tensor]) -> None:
+    assert parameter.grad is not None
+    seen.append(parameter.grad.clone())
+
+
+def _squared_error(
+    batch: dict[str, object],
+    *,
+    evaluate: bool,
+    parameter: nn.Parameter,
+) -> LossTerms:
+    del evaluate
+    target = batch["target"]
+    assert isinstance(target, Tensor)
+    loss = (parameter.sum() - target).square()
+    output = ModelOutput(
+        velocity=loss.detach(),
+        cls_velocity=loss.detach(),
+        projections=(),
+    )
+    return LossTerms(
+        loss=loss,
+        mean_loss=loss.mean(),
+        velocity=loss,
+        cls=loss,
+        projection=loss,
+        cfm=loss.mean(),
+        output=output,
+    )
+
+
+def test_a_skipped_update_reports_the_skip_count() -> None:
+    config = _small_step_config()
+    config.skip_step_on_nonfinite_grad = True
+    step = config.make()
+    batch = _small_batch(step)
+    latent = batch["latent"]
+    assert isinstance(latent, Tensor)
+    result = step.train_step(**{**batch, "latent": torch.full_like(latent, math.nan)})
+    assert result.get("metrics", {})["skipped_steps"] == 1
+
+
+def test_a_closure_based_optimizer_is_refused_at_construction() -> None:
+    config = _small_step_config()
+    config.optimizer = Newton.Config()
+    with pytest.raises(ValueError, match="closure"):
+        _ = config.make()
+
+
+def test_a_teacher_must_return_its_feature_maps() -> None:
+    config = _small_step_config()
+    config.teacher = _TensorTeacher.Config()
+    step = config.make()
+    with pytest.raises(TypeError, match="tuple of feature maps"):
+        _ = step.train_step(**_small_batch(step))
+
+
+class _TensorTeacher(nn.Module):
+    class Config(Fig["_TensorTeacher"]):
+        """No parameters."""
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        del config
+
+    @override
+    def forward(self, image: Tensor) -> Tensor:
+        return torch.ones(image.shape[0], 17, 8)
 
 
 def test_train_and_eval_losses_report_every_term_without_updating() -> None:

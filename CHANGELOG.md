@@ -57,6 +57,20 @@ All notable priml changes are documented here. This project follows
   composable `replicate` model, so every distributed run failed at its first
   EMA update. EMA state saved under the old default does not load into it.
 
+### Fixed
+
+- SpeedrunDiT: gradient accumulation weights micro-batches by their sample
+  counts, the step reports `skipped_steps`, refuses a closure-based optimizer
+  its stochastic objective cannot serve, and names a teacher that returns no
+  feature tuple.
+- SpeedrunDiT: the model refuses `encoder_blocks < 1`, a `drop_ratio` outside
+  `(0, 1)`, and a `path_drop_prob` outside `[0, 1]`; the first two left
+  parameters untrained, which replicated ranks let drift apart. A model built
+  on the meta device initializes every tensor, and its cost counts the
+  projector when no depth projects.
+- SpeedrunDiT: the corpus loader refuses two files naming one pair, and an
+  image that is not `[3, H, W]` uint8.
+
 ## 0.1.5 - 2026-10-03
 
 ### Changed
