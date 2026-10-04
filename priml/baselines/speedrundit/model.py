@@ -74,9 +74,13 @@ class SiTBlock(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         """Apply attention and feedforward updates under adaLN conditioning."""
         s1, a1, g1, s2, a2, g2 = self.adaLN_modulation(condition).chunk(6, dim=-1)
-        attention, raw_v = self.attn(modulate(self.norm1(x), s1, a1), rope_factors, v1)
+        attention, raw_v = self.attn(
+            modulate(self.norm1(x), shift=s1, scale=a1),
+            rope_factors=rope_factors,
+            v1=v1,
+        )
         x = x + g1[:, None] * attention
-        x = x + g2[:, None] * self.mlp(modulate(self.norm2(x), s2, a2))
+        x = x + g2[:, None] * self.mlp(modulate(self.norm2(x), shift=s2, scale=a2))
         return x, raw_v
 
 
@@ -103,7 +107,7 @@ class FinalLayer(nn.Module):
     def forward(self, x: Tensor, condition: Tensor) -> tuple[Tensor, Tensor]:
         """Return patch and CLS velocities."""
         shift, scale = self.adaLN_modulation(condition).chunk(2, dim=-1)
-        x = modulate(self.norm_final(x), shift, scale)
+        x = modulate(self.norm_final(x), shift=shift, scale=scale)
         return self.linear(x[:, 1:]), self.linear_cls(x[:, 0])
 
 
@@ -127,10 +131,10 @@ class SpeedrunDiT(nn.Module):
 
     class Config(Fig["SpeedrunDiT"]):
         input_size: int = 16
-        """Spatial side of the latent grid; the dataset's autoencoder must produce it."""
+        """Latent grid side; the dataset's autoencoder must produce it."""
 
         in_channels: int = 32
-        """Latent channels (INVAE's 32 by default); the dataset's autoencoder must produce them."""
+        """Latent channels (INVAE's 32); the dataset's autoencoder must produce them."""
 
         patch_size: int = 1
         """Latent cells in each patch side."""
@@ -218,10 +222,10 @@ class SpeedrunDiT(nn.Module):
             total = (
                 linear(
                     self.in_channels * self.patch_size**2,
-                    width,
-                    batch_size * (dense - 1),
+                    channels_out=width,
+                    rows=batch_size * (dense - 1),
                 )
-                + linear(self.cls_channels, width, batch_size)
+                + linear(self.cls_channels, channels_out=width, rows=batch_size)
                 + cost(
                     RMSNorm.Config(channels_in=width, elementwise_affine=True),
                     seq_len=1,
@@ -279,9 +283,9 @@ class SpeedrunDiT(nn.Module):
                         batch_size=2 * batch_size,
                         dtype=dtype,
                     )
-                    + linear(width, hidden, rows)
-                    + linear(hidden, width, rows)
-                    + linear(width, 6 * width, batch_size)
+                    + linear(width, channels_out=hidden, rows=rows)
+                    + linear(hidden, channels_out=width, rows=rows)
+                    + linear(width, channels_out=6 * width, rows=batch_size)
                     + elementwise_cost(
                         primal=18 * rows * width + 5 * batch_size * width,
                         adjoint=18 * rows * width + 5 * batch_size * width,
@@ -292,16 +296,28 @@ class SpeedrunDiT(nn.Module):
                 )
                 if index + 1 in self.projection_depths:
                     projection = (
-                        linear(width, self.projector_hidden, rows)
-                        + linear(self.projector_hidden, self.projector_hidden, rows)
-                        + linear(self.projector_hidden, self.cls_channels, rows)
+                        linear(width, channels_out=self.projector_hidden, rows=rows)
+                        + linear(
+                            self.projector_hidden,
+                            channels_out=self.projector_hidden,
+                            rows=rows,
+                        )
+                        + linear(
+                            self.projector_hidden,
+                            channels_out=self.cls_channels,
+                            rows=rows,
+                        )
                     )
                     total += projection.tile(1, copies=0)
             # One projector is shared by every depth, and built even with none.
             projector = (
-                linear(width, self.projector_hidden, 1)
-                + linear(self.projector_hidden, self.projector_hidden, 1)
-                + linear(self.projector_hidden, self.cls_channels, 1)
+                linear(width, channels_out=self.projector_hidden, rows=1)
+                + linear(
+                    self.projector_hidden,
+                    channels_out=self.projector_hidden,
+                    rows=1,
+                )
+                + linear(self.projector_hidden, channels_out=self.cls_channels, rows=1)
             )
             total += Cost(
                 params=projector.params,
@@ -321,13 +337,13 @@ class SpeedrunDiT(nn.Module):
                     batch_size=batch_size,
                     dtype=dtype,
                 )
-                + linear(width, 2 * width, batch_size)
+                + linear(width, channels_out=2 * width, rows=batch_size)
                 + linear(
                     width,
-                    self.patch_size**2 * self.in_channels,
-                    batch_size * (dense - 1),
+                    channels_out=self.patch_size**2 * self.in_channels,
+                    rows=batch_size * (dense - 1),
                 )
-                + linear(width, self.cls_channels, batch_size)
+                + linear(width, channels_out=self.cls_channels, rows=batch_size)
             )
 
     def __init__(self, config: Config) -> None:
@@ -362,7 +378,7 @@ class SpeedrunDiT(nn.Module):
         # happens it can never get a gradient, and a trainable parameter without one
         # lets composable replicate (find_unused_parameters=False) desync the ranks.
         tokens = self.grid_size**2 + 1
-        if max(1, int(tokens * (1 - drop))) >= tokens and not chance:
+        if max(1, int(tokens * (1 - drop))) >= tokens and chance == 0:
             _ = self.fusion.mask_token.requires_grad_(False)
         self.x_embedder = nn.Conv2d(
             config.in_channels,
@@ -391,8 +407,8 @@ class SpeedrunDiT(nn.Module):
         self.blocks = nn.ModuleList(
             SiTBlock(
                 config.hidden_size,
-                config.num_heads,
-                ratio,
+                heads=config.num_heads,
+                mlp_ratio=ratio,
                 qk_norm=config.qk_norm,
                 value_residual=i > 0,
                 reference_rope=config.reference_rope,
@@ -408,9 +424,9 @@ class SpeedrunDiT(nn.Module):
         )
         self.final_layer = FinalLayer(
             config.hidden_size,
-            config.patch_size,
-            config.in_channels,
-            config.cls_channels,
+            patch_size=config.patch_size,
+            out_channels=config.in_channels,
+            cls_channels=config.cls_channels,
         )
         self.cls_projector = nn.Linear(config.cls_channels, config.hidden_size)
         self.wg_norm = nn.RMSNorm(config.hidden_size, eps=1e-6)
@@ -418,7 +434,7 @@ class SpeedrunDiT(nn.Module):
         self.rope = RoPE.Config(channels_head=(axis_channels, axis_channels)).make()
         if config.reference_rope:
             factors = self.rope(
-                image_token_positions(self.grid_size, torch.device("cpu")),
+                image_token_positions(self.grid_size, device=torch.device("cpu")),
             )
             self.reference_rope_cos: Tensor
             self.reference_rope_sin: Tensor
@@ -467,7 +483,6 @@ class SpeedrunDiT(nn.Module):
         for module in self.modules():
             if isinstance(module, (nn.RMSNorm, RMSNorm)) and module.weight is not None:
                 nn.init.ones_(module.weight)
-            # ValueResidualAttention starts its blend at an even mix.
             if (
                 isinstance(module, ValueResidualAttention)
                 and module.v1_lambda is not None
@@ -477,7 +492,7 @@ class SpeedrunDiT(nn.Module):
             _ = self.pos_embed.copy_(self._position_table())
             if self.config.reference_rope:
                 cos, sin = self.rope(
-                    image_token_positions(self.grid_size, self.pos_embed.device),
+                    image_token_positions(self.grid_size, device=self.pos_embed.device),
                 )
                 _ = self.reference_rope_cos.copy_(cos)
                 _ = self.reference_rope_sin.copy_(sin)
@@ -531,7 +546,7 @@ class SpeedrunDiT(nn.Module):
         rope_factors = (
             (self.reference_rope_cos, self.reference_rope_sin)
             if cfg.reference_rope
-            else self.rope(image_token_positions(self.grid_size, x.device))
+            else self.rope(image_token_positions(self.grid_size, device=x.device))
         )
         condition = self.t_embedder(t) + self.y_embedder(
             y,
@@ -540,22 +555,29 @@ class SpeedrunDiT(nn.Module):
         projections: list[Projection] = []
         first_v: Tensor | None = None
         for i in range(cfg.encoder_blocks):
-            x, raw_v = self.blocks[i](x, condition, rope_factors, first_v)
+            x, raw_v = self.blocks[i](
+                x,
+                condition=condition,
+                rope_factors=rope_factors,
+                v1=first_v,
+            )
             if first_v is None:
                 first_v = raw_v
-            self._project(x, i + 1, None, projections)
+            self._project(x, layer=i + 1, ids=None, projections=projections)
         dense = x
         if route_tokens is None:
             route_tokens = self.training
         sparse, kept = (
-            select_tokens(dense, cfg.drop_ratio) if route_tokens else (dense, None)
+            select_tokens(dense, drop_ratio=cfg.drop_ratio)
+            if route_tokens
+            else (dense, None)
         )
         if kept is None:
             sparse_rope_factors = rope_factors
         else:
             sparse_rope_factors = (
-                _select_factor(rope_factors[0], kept, batch=batch),
-                _select_factor(rope_factors[1], kept, batch=batch),
+                _select_factor(rope_factors[0], kept=kept, batch=batch),
+                _select_factor(rope_factors[1], kept=kept, batch=batch),
             )
         sparse_v = (
             first_v.gather(
@@ -572,25 +594,44 @@ class SpeedrunDiT(nn.Module):
         )
         middle_end = cfg.depth - cfg.decoder_blocks
         for i in range(cfg.encoder_blocks, middle_end):
-            sparse, _ = self.blocks[i](sparse, condition, sparse_rope_factors, sparse_v)
-            self._project(sparse, i + 1, kept, projections)
+            sparse, _ = self.blocks[i](
+                sparse,
+                condition=condition,
+                rope_factors=sparse_rope_factors,
+                v1=sparse_v,
+            )
+            self._project(sparse, layer=i + 1, ids=kept, projections=projections)
         if self.training and cfg.path_drop_prob:
             coin = torch.rand((), device=x.device)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.broadcast(coin, 0)
             drop_sparse_path = drop_sparse_path or bool(coin < cfg.path_drop_prob)
-        x = self.fusion(dense, sparse, kept, drop_path=drop_sparse_path)
+        x = self.fusion(
+            dense,
+            sparse=sparse,
+            ids_keep=kept,
+            drop_path=drop_sparse_path,
+        )
         for i in range(middle_end, cfg.depth):
-            x, _ = self.blocks[i](x, condition, rope_factors, first_v)
-            self._project(x, i + 1, None, projections)
-        patches, cls_velocity = self.final_layer(x, condition)
+            x, _ = self.blocks[i](
+                x,
+                condition=condition,
+                rope_factors=rope_factors,
+                v1=first_v,
+            )
+            self._project(x, layer=i + 1, ids=None, projections=projections)
+        patches, cls_velocity = self.final_layer(x, condition=condition)
         p = cfg.patch_size
         velocity = (
             patches.reshape(batch, self.grid_size, self.grid_size, p, p, channels)
             .permute(0, 5, 1, 3, 2, 4)
             .reshape(batch, channels, height, width)
         )
-        return ModelOutput(velocity, cls_velocity, tuple(projections))
+        return ModelOutput(
+            velocity=velocity,
+            cls_velocity=cls_velocity,
+            projections=tuple(projections),
+        )
 
     def _project(
         self,
@@ -600,13 +641,13 @@ class SpeedrunDiT(nn.Module):
         projections: list[Projection],
     ) -> None:
         if layer in self.config.projection_depths:
-            projections.append(Projection(self.projector(x), ids))
+            projections.append(Projection(tokens=self.projector(x), ids_keep=ids))
 
     def _position_table(self) -> Tensor:
         """Return the fixed ``[1, tokens, hidden_size]`` sin-cos position table."""
         return sincos_position_table(
             self.config.hidden_size,
-            self.grid_size,
+            grid=self.grid_size,
             compute_dtype=self.config.position_compute_dtype,
         ).unsqueeze(0)
 

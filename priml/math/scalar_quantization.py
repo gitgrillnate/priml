@@ -90,16 +90,16 @@ def lloyd_max(
     total = torch.cat([zero, x.cumsum(0)])
     total_sq = torch.cat([zero, (x * x).cumsum(0)])
     levels = init.detach().to(device=x.device, dtype=torch.float64).sort().values
-    previous = _distortion(x, levels, total, total_sq)
+    # The INITIAL distortion, not infinity: ``inf - d <= tol * inf`` holds, which
+    # stopped the loop after one step.
+    previous = _distortion(x, levels=levels, total=total, total_sq=total_sq)
     if math.isnan(previous) or math.isinf(previous):
         raise ValueError("lloyd_max needs finite initial levels.")
     for _ in range(max_iterations):
-        bounds = _cell_bounds(x, levels)
-        levels = _centroids(levels, bounds, total)
-        levels = _split_empty_cells(levels, x, total, total_sq)
-        distortion = _distortion(x, levels, total, total_sq)
-        # Measured from the INITIAL distortion, not from infinity: ``inf - d <= tol *
-        # inf`` holds, which stopped the loop after one step.
+        bounds = _cell_bounds(x, levels=levels)
+        levels = _centroids(levels, bounds=bounds, total=total)
+        levels = _split_empty_cells(levels, x=x, total=total, total_sq=total_sq)
+        distortion = _distortion(x, levels=levels, total=total, total_sq=total_sq)
         if distortion == 0 or previous - distortion <= tolerance * previous:
             break
         previous = distortion
@@ -201,7 +201,7 @@ def gaussian_levels(num_levels: int, *, num_points: int = 1 << 20) -> Tensor:
     start = 3**0.5 * torch.special.ndtri(
         (torch.arange(num_levels, dtype=torch.float64) + 0.5) / num_levels,
     )
-    return lloyd_max(points, start, max_iterations=2_000, tolerance=1e-12)
+    return lloyd_max(points, init=start, max_iterations=2_000, tolerance=1e-12)
 
 
 def midpoints(levels: Tensor) -> Tensor:
@@ -252,14 +252,13 @@ def dequantize(indices: Tensor, levels: Tensor) -> Tensor:
       values: ``[R, M]`` in ``levels``' dtype.
 
     """
-    return torch.gather(levels.to(indices.device), 1, indices.long())
+    return torch.gather(levels.to(indices.device), dim=-1, index=indices.long())
 
 
-# Cell k holds the samples at or below boundary k and above boundary k-1, matching
-# :func:`quantize`'s lower-cell tie rule; ``right=True`` counts ties into the lower
-# cell.
 def _cell_bounds(x: Tensor, levels: Tensor) -> Tensor:
     """Return the sample index each cell starts at, plus the end."""
+    # Cell k holds the samples at or below boundary k and above boundary k-1;
+    # ``right=True`` counts ties into the lower cell, matching :func:`quantize`.
     cut = torch.searchsorted(x, midpoints(levels), right=True)
     ends = x.new_tensor([x.numel()], dtype=torch.int64)
     return torch.cat([cut.new_zeros(1), cut, ends])
@@ -273,8 +272,6 @@ def _centroids(levels: Tensor, bounds: Tensor, total: Tensor) -> Tensor:
     return torch.where(counts > 0, means, levels)
 
 
-# A level whose cell is empty codes nothing, so it is moved where it earns the most:
-# into the cell with the largest squared error, split at its median.
 def _split_empty_cells(
     levels: Tensor,
     x: Tensor,
@@ -284,12 +281,12 @@ def _split_empty_cells(
     """Re-seat every empty cell's level inside the worst cell, then re-sort."""
     levels = levels.clone()
     for _ in range(levels.numel()):
-        bounds = _cell_bounds(x, levels)
+        bounds = _cell_bounds(x, levels=levels)
         counts = bounds[1:] - bounds[:-1]
         empty = (counts == 0).nonzero()
         if empty.numel() == 0:
             return levels
-        error = _cell_errors(bounds, total, total_sq)
+        error = _cell_errors(bounds, total=total, total_sq=total_sq)
         error = torch.where(counts > 1, error, error.new_tensor(-1.0))
         worst = int(error.argmax())
         if error[worst] <= 0:
@@ -298,6 +295,8 @@ def _split_empty_cells(
         middle = (start + end) // 2
         lower = (total[middle] - total[start]) / (middle - start)
         upper = (total[end] - total[middle]) / (end - middle)
+        # An empty cell's level codes nothing, so it moves where it earns the
+        # most: into the cell with the largest squared error, split at its median.
         levels[worst] = lower
         levels[int(empty[0])] = upper
         levels = levels.sort().values
@@ -314,7 +313,7 @@ def _cell_errors(bounds: Tensor, total: Tensor, total_sq: Tensor) -> Tensor:
 
 def _distortion(x: Tensor, levels: Tensor, total: Tensor, total_sq: Tensor) -> float:
     """Return the mean squared error of coding ``x`` to its nearest level."""
-    bounds = _cell_bounds(x, levels)
+    bounds = _cell_bounds(x, levels=levels)
     counts = (bounds[1:] - bounds[:-1]).to(torch.float64)
     sums = total[bounds[1:]] - total[bounds[:-1]]
     squares = total_sq[bounds[1:]] - total_sq[bounds[:-1]]

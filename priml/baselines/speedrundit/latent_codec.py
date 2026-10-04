@@ -108,7 +108,8 @@ class FloatCodec:
             torch.float64,
         }:
             raise ValueError(
-                f"FloatCodec stores float16, bfloat16, float32 or float64; got {config.dtype}.",
+                "FloatCodec stores float16, bfloat16, float32 or float64; got "
+                f"{config.dtype}.",
             )
         self.stored_dtype = config.dtype
 
@@ -173,7 +174,7 @@ class LloydMaxFit:
         """
         return lloyd_max(
             values,
-            high_resolution_levels(values, NUM_LEVELS),
+            init=high_resolution_levels(values, num_levels=NUM_LEVELS),
             max_iterations=self.config.max_iterations,
             tolerance=self.config.tolerance,
         )
@@ -278,7 +279,7 @@ class ChannelGroups(Protocol):
     """Decides which channels share one table, from each channel's scale."""
 
     def __call__(self, scale: Tensor, /) -> Tensor:
-        """Return ``[C]`` int64 group ids for ``[C]`` per-channel standard deviations."""
+        """Return ``[C]`` int64 group ids for ``[C]`` channel standard deviations."""
         ...
 
 
@@ -433,7 +434,9 @@ class ScalarTableCodec:
             raise ValueError(
                 f"levels must be [C, {NUM_LEVELS}]; got {tuple(levels.shape)}.",
             )
-        if not bool(torch.isfinite(levels).all()) or bool((levels.diff() < 0).any()):
+        if (
+            not bool(torch.isfinite(levels).all()) or bool((levels.diff() < 0).any())
+        ):  # house-ignore[tensor-value-guard] -- Checked once per table fit or load, never per batch.
             raise ValueError("levels must be finite and non-decreasing in every row.")
         self.levels = levels
         self.thresholds = midpoints(levels)
@@ -450,7 +453,10 @@ class ScalarTableCodec:
         """
         _, thresholds = self._fitted()
         rows = latent.movedim(-3, 0)
-        indices = quantize(rows.reshape(rows.shape[0], -1).float(), thresholds)
+        indices = quantize(
+            rows.reshape(rows.shape[0], -1).float(),
+            thresholds=thresholds,
+        )
         return indices.to(torch.uint8).reshape(rows.shape).movedim(0, -3)
 
     def decode(self, stored: Tensor, /) -> Tensor:
@@ -465,7 +471,7 @@ class ScalarTableCodec:
         """
         levels, _ = self._fitted()
         rows = stored.movedim(-3, 0)
-        values = dequantize(rows.reshape(rows.shape[0], -1), levels)
+        values = dequantize(rows.reshape(rows.shape[0], -1), levels=levels)
         return values.reshape(rows.shape).movedim(0, -3)
 
     def saturated(self, latent: Tensor, /) -> Tensor:

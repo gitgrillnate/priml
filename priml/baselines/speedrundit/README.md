@@ -13,9 +13,9 @@ trained on the latents of a pretrained vision autoencoder.
 | `exp004` | `exp003` | The same RAE latents stored as uint8 Lloyd-Max indices |
 | `exp_smoke` | `exp000` | `exp000` mechanisms at a tiny width and five updates |
 
-`source_parity_test.py` checks a tiny `exp000`-mechanism model's forward
-outputs, kept token ids, three losses, and final weights against
-`reg_source.pt`. That golden was minted after the same run of the REG commit's
+`source_parity_test.py` checks a tiny `exp000`-mechanism model's initial
+weights, three training losses, and final weights against `reg_source.pt`.
+That golden was minted after the same run of the REG commit's
 own code was shown bit-for-bit equal to it, so the test does not need the REG
 repository or `timm` at runtime. The CPU check does not establish bitwise
 identity across different GPU kernels or distributed launches.

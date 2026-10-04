@@ -189,13 +189,13 @@ def evaluate(
             codec.fit(fit_sample)
         stored = codec.encode(eval_sample)
         decoded = codec.decode(stored)
-        metrics = latent_metrics(eval_sample, decoded, normalizer)
+        metrics = latent_metrics(eval_sample, decoded=decoded, normalizer=normalizer)
         metrics["bits_per_scalar"] = float(bits_per_scalar(codec))
         if stored.dtype == torch.uint8:
             metrics["index_entropy_bits"] = entropy_bits(stored)
         if decode is not None and reference is not None:
             images = decode(decoded)
-            metrics["image_psnr_db"] = psnr(reference, images)
+            metrics["image_psnr_db"] = psnr(reference, other=images)
             if perceptual is not None:
                 metrics["image_lpips"] = perceptual(reference, images)
         report[name] = metrics
@@ -229,7 +229,11 @@ def fit_stability(
         codec = ScalarTableCodec.Config().make()
         codec.fit(fit_sample[:size])
         decoded = codec.decode(codec.encode(eval_sample))
-        result[size] = latent_metrics(eval_sample, decoded, normalizer)["nmse"]
+        result[size] = latent_metrics(
+            eval_sample,
+            decoded=decoded,
+            normalizer=normalizer,
+        )["nmse"]
     return result
 
 
@@ -278,7 +282,10 @@ def run(
     config = dataset_config(experiment)
     root = Path(config.working_dir if directory is None else directory)
     listed = records(imagenet)
-    chosen = fit_sample_indices(len(listed), num_fit_images + num_eval_images)
+    chosen = fit_sample_indices(
+        len(listed),
+        num_images=num_fit_images + num_eval_images,
+    )
     if len(chosen) != num_fit_images + num_eval_images:
         raise ValueError(
             "The corpus is too small for disjoint fitting and evaluation sets.",
@@ -286,7 +293,7 @@ def run(
     size = config.autoencoder.image_size
     ensure_image_source(
         root,
-        identity=image_source_identity(imagenet, listed, size=size),
+        identity=image_source_identity(imagenet, listed=listed, size=size),
     )
     # Shuffle before partitioning: the source order is grouped by ImageNet class.
     random.Random(FIT_SAMPLE_SEED).shuffle(chosen)  # noqa: S311 -- Selects benchmark images, not secrets.
@@ -298,7 +305,7 @@ def run(
     fit_sample, eval_sample = (
         _encode_all(
             autoencoder,
-            chosen_records,
+            listed=chosen_records,
             root=root,
             size=size,
             device=device,
@@ -311,8 +318,13 @@ def run(
     decode = None
     perceptual = None
     if decode_images:
-        decode = _decoder(autoencoder, device, batch_size)
-        perceptual = _lpips(device, batch_size)
+        decode = partial(
+            _decode,
+            autoencoder=autoencoder,
+            device=device,
+            batch_size=batch_size,
+        )
+        perceptual = _lpips(device, batch_size=batch_size)
     sizes = [n for n in (256, 1_024, 4_096, 16_384) if n <= fit_sample.shape[0]]
     return {
         "experiment": experiment,
@@ -320,13 +332,18 @@ def run(
         "eval_images": eval_sample.shape[0],
         "codecs": evaluate(
             candidates(),
-            fit_sample,
-            eval_sample,
-            normalizer,
+            fit_sample=fit_sample,
+            eval_sample=eval_sample,
+            normalizer=normalizer,
             decode=decode,
             perceptual=perceptual,
         ),
-        "fit_stability_nmse": fit_stability(fit_sample, eval_sample, normalizer, sizes),
+        "fit_stability_nmse": fit_stability(
+            fit_sample,
+            eval_sample=eval_sample,
+            normalizer=normalizer,
+            sizes=sizes,
+        ),
     }
 
 
@@ -359,7 +376,7 @@ def main() -> int:
         parser.error("--output must lie outside --source and the corpus root.")
     report = run(
         flags.experiment,
-        flags.source,
+        imagenet=flags.source,
         num_fit_images=flags.fit_images,
         num_eval_images=flags.eval_images,
         device=flags.device,
@@ -404,26 +421,17 @@ def _encode_all(
         [
             encode_latents(
                 autoencoder,
-                images,
+                images=images,
                 device=device,
                 latent_shape=latent_shape,
             )
-            for _, images in batches(listed, root, size, batch_size)
+            for _, images in batches(
+                listed,
+                root=root,
+                size=size,
+                batch_size=batch_size,
+            )
         ],
-    )
-
-
-def _decoder(
-    autoencoder: Autoencoder,
-    device: str,
-    batch_size: int,
-) -> Callable[[Tensor], Tensor]:
-    """Return raw latents to CPU ``[0, 1]`` images, decoded in batches."""
-    return partial(
-        _decode,
-        autoencoder=autoencoder,
-        device=device,
-        batch_size=batch_size,
     )
 
 

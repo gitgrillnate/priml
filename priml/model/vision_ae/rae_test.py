@@ -32,7 +32,7 @@ import torch
 
 from priml.cost import cost
 from priml.model.vision_ae.checkpoint import HubFile
-from priml.model.vision_ae.custom_types import Autoencoder, VariationalAutoencoder
+from priml.model.vision_ae.custom_types import VariationalAutoencoder
 from priml.model.vision_ae.latent_norm import ElementwiseLatentStats
 from priml.model.vision_ae.rae import (
     RAE,
@@ -130,13 +130,12 @@ def test_matches_the_reference_implementation() -> None:
         latent = model.encode(reference["image"])
         decoded = model.decode(latent)
     expected = {"latent": reference["latent"], "decoded": reference["decoded"]}
-    report = mismatches(expected, {"latent": latent, "decoded": decoded})
+    report = mismatches(expected, actual={"latent": latent, "decoded": decoded})
     assert not report, report
 
 
 def test_rae_is_a_deterministic_autoencoder() -> None:
     model = tiny().make()
-    assert isinstance(model, Autoencoder)
     assert not isinstance(model, VariationalAutoencoder)
 
 

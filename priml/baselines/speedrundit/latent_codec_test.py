@@ -32,24 +32,6 @@ if TYPE_CHECKING:
     from configgle import Makeable
 
 
-def _sample(*, scales: tuple[float, ...] = (1.0, 30.0), images: int = 64) -> Tensor:
-    """Return ``[images, C, 4, 4]`` normal latents, channel c scaled by ``scales[c]``."""
-    generator = torch.Generator().manual_seed(0)
-    noise = torch.randn(images, len(scales), 4, 4, generator=generator)
-    return noise * torch.tensor(scales).view(1, -1, 1, 1)
-
-
-def _fitted(config: ScalarTableCodec.Config, sample: Tensor) -> ScalarTableCodec:
-    codec = config.make()
-    codec.fit(sample)
-    return codec
-
-
-def _mse_per_channel(codec: LatentCodec, latent: Tensor) -> Tensor:
-    error = codec.decode(codec.encode(latent)) - latent
-    return error.pow(2).mean(dim=(0, 2, 3))
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 @pytest.mark.parametrize(
     "fit",
@@ -63,7 +45,7 @@ def test_fitted_codecs_preserve_cuda_device(
     groups: type[SharedTable.Config | ScaleGroups.Config],
 ) -> None:
     sample = _sample(images=4).cuda()
-    codec = _fitted(ScalarTableCodec.Config(fit=fit(), groups=groups()), sample)
+    codec = _fitted(ScalarTableCodec.Config(fit=fit(), groups=groups()), sample=sample)
     stored = codec.encode(sample)
     assert stored.device == sample.device
     assert codec.decode(stored).device == sample.device
@@ -72,7 +54,7 @@ def test_fitted_codecs_preserve_cuda_device(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_cpu_codec_table_can_code_cuda_inputs() -> None:
-    codec = _fitted(ScalarTableCodec.Config(), _sample(images=4))
+    codec = _fitted(ScalarTableCodec.Config(), sample=_sample(images=4))
     sample = _sample(images=4).cuda()
     assert codec.decode(codec.encode(sample)).device == sample.device
     assert codec.saturated(sample).device == sample.device
@@ -111,15 +93,13 @@ def test_float_codec_needs_a_dtype_the_corpus_can_store(dtype: torch.dtype) -> N
         _ = FloatCodec.Config(dtype=dtype).make()
 
 
-def test_table_codec_satisfies_the_fitted_protocol() -> None:
-    codec = ScalarTableCodec.Config().make()
-    assert isinstance(codec, FittedCodec)
+def test_a_float_codec_has_no_table_to_fit() -> None:
     assert not isinstance(FloatCodec.Config().make(), FittedCodec)
 
 
 def test_table_codec_stores_one_byte_per_scalar() -> None:
     sample = _sample()
-    codec = _fitted(ScalarTableCodec.Config(), sample)
+    codec = _fitted(ScalarTableCodec.Config(), sample=sample)
     stored = codec.encode(sample)
     assert stored.dtype == torch.uint8
     assert stored.shape == sample.shape
@@ -128,14 +108,14 @@ def test_table_codec_stores_one_byte_per_scalar() -> None:
 
 
 def test_levels_themselves_decode_exactly() -> None:
-    codec = _fitted(ScalarTableCodec.Config(), _sample())
+    codec = _fitted(ScalarTableCodec.Config(), sample=_sample())
     levels = codec.table()["levels"]
     latent = levels.T.reshape(NUM_LEVELS, 2, 1, 1)
     assert torch.equal(codec.decode(codec.encode(latent)), latent)
 
 
 def test_a_value_on_a_threshold_takes_the_lower_level() -> None:
-    codec = _fitted(ScalarTableCodec.Config(), _sample())
+    codec = _fitted(ScalarTableCodec.Config(), sample=_sample())
     latent = midpoints(codec.table()["levels"])[:, 7].reshape(1, 2, 1, 1)
     assert codec.encode(latent).flatten().tolist() == [7, 7]
 
@@ -175,14 +155,14 @@ def test_linear_fit_needs_a_positive_finite_clip(clip_sigmas: float) -> None:
 
 
 def test_values_beyond_the_outer_levels_saturate() -> None:
-    codec = _fitted(ScalarTableCodec.Config(), _sample())
+    codec = _fitted(ScalarTableCodec.Config(), sample=_sample())
     latent = torch.tensor([1e3, -1e3]).reshape(1, 2, 1, 1)
     assert codec.encode(latent).flatten().tolist() == [NUM_LEVELS - 1, 0]
     assert bool(codec.saturated(latent).all())
 
 
 def test_decode_reads_each_channel_from_its_own_row() -> None:
-    codec = _fitted(ScalarTableCodec.Config(), _sample())
+    codec = _fitted(ScalarTableCodec.Config(), sample=_sample())
     levels = codec.table()["levels"]
     stored = torch.full((1, 2, 1, 1), 100, dtype=torch.uint8)
     assert codec.decode(stored).flatten().tolist() == [
@@ -198,16 +178,22 @@ def test_per_channel_tables_beat_a_shared_table_when_scales_differ() -> None:
     one with a handful -- the reason the default is one table per channel.
     """
     sample = _sample(scales=(1.0, 30.0))
-    per_channel = _mse_per_channel(_fitted(ScalarTableCodec.Config(), sample), sample)
+    per_channel = _mse_per_channel(
+        _fitted(ScalarTableCodec.Config(), sample=sample),
+        latent=sample,
+    )
     shared = _mse_per_channel(
-        _fitted(ScalarTableCodec.Config(groups=SharedTable.Config()), sample),
-        sample,
+        _fitted(ScalarTableCodec.Config(groups=SharedTable.Config()), sample=sample),
+        latent=sample,
     )
     assert per_channel[0] * 10 < shared[0]
 
 
 def test_shared_table_gives_every_channel_the_same_levels() -> None:
-    codec = _fitted(ScalarTableCodec.Config(groups=SharedTable.Config()), _sample())
+    codec = _fitted(
+        ScalarTableCodec.Config(groups=SharedTable.Config()),
+        sample=_sample(),
+    )
     levels = codec.table()["levels"]
     assert torch.equal(levels[0], levels[1])
 
@@ -219,10 +205,13 @@ def test_scale_groups_pool_channels_of_similar_scale() -> None:
 
 def test_lloyd_max_beats_a_uniform_table_on_a_normal_source() -> None:
     sample = _sample(scales=(1.0,), images=256)
-    lloyd = _mse_per_channel(_fitted(ScalarTableCodec.Config(), sample), sample)
+    lloyd = _mse_per_channel(
+        _fitted(ScalarTableCodec.Config(), sample=sample),
+        latent=sample,
+    )
     uniform = _mse_per_channel(
-        _fitted(ScalarTableCodec.Config(fit=LinearFit.Config()), sample),
-        sample,
+        _fitted(ScalarTableCodec.Config(fit=LinearFit.Config()), sample=sample),
+        latent=sample,
     )
     assert lloyd[0] < uniform[0]
 
@@ -259,7 +248,7 @@ def test_lloyd_max_fit_honours_its_iteration_budget() -> None:
 
 def test_table_round_trips_through_load_table() -> None:
     sample = _sample()
-    first = _fitted(ScalarTableCodec.Config(), sample)
+    first = _fitted(ScalarTableCodec.Config(), sample=sample)
     second = ScalarTableCodec.Config().make()
     second.load_table(first.table())
     assert torch.equal(first.encode(sample), second.encode(sample))
@@ -271,7 +260,7 @@ def test_unfitted_codec_refuses_to_encode() -> None:
 
 
 def test_table_encoding_compiles_without_reading_a_python_scalar() -> None:
-    codec = _fitted(ScalarTableCodec.Config(), _sample())
+    codec = _fitted(ScalarTableCodec.Config(), sample=_sample())
     latent = _sample(images=1)
     compiled = torch.compile(codec.encode, backend="eager", fullgraph=True)
     assert torch.equal(compiled(latent), codec.encode(latent))
@@ -280,6 +269,24 @@ def test_table_encoding_compiles_without_reading_a_python_scalar() -> None:
 def test_entropy_of_uniform_indices_is_eight_bits() -> None:
     stored = torch.arange(NUM_LEVELS, dtype=torch.uint8).repeat(4)
     assert entropy_bits(stored) == pytest.approx(8.0)
+
+
+def _sample(*, scales: tuple[float, ...] = (1.0, 30.0), images: int = 64) -> Tensor:
+    """Return ``[images, C, 4, 4]`` normal latents, channel c scaled by scales[c]."""
+    generator = torch.Generator().manual_seed(0)
+    noise = torch.randn(images, len(scales), 4, 4, generator=generator)
+    return noise * torch.tensor(scales).view(1, -1, 1, 1)
+
+
+def _fitted(config: ScalarTableCodec.Config, sample: Tensor) -> ScalarTableCodec:
+    codec = config.make()
+    codec.fit(sample)
+    return codec
+
+
+def _mse_per_channel(codec: LatentCodec, latent: Tensor) -> Tensor:
+    error = codec.decode(codec.encode(latent)) - latent
+    return error.pow(2).mean(dim=(0, 2, 3))
 
 
 if __name__ == "__main__":

@@ -73,7 +73,10 @@ class PairedImageLatentDataset(Dataset[dict[str, Tensor]]):
 
         @override
         def finalize(self) -> Self:
-            self.working_dir = resolve_working_dir(self.base_dir, self.working_dir)
+            self.working_dir = resolve_working_dir(
+                self.base_dir,
+                working_dir=self.working_dir,
+            )
             return super().finalize()
 
     def __init__(self, config: Config) -> None:
@@ -82,7 +85,7 @@ class PairedImageLatentDataset(Dataset[dict[str, Tensor]]):
         latent_root = root / config.latent_subdir
         self.codec = config.codec.make()
         table_sha256 = (
-            load_table(latent_root, self.codec)
+            load_table(latent_root, codec=self.codec)
             if isinstance(self.codec, FittedCodec)
             else None
         )
@@ -102,14 +105,14 @@ class PairedImageLatentDataset(Dataset[dict[str, Tensor]]):
         labels = read_labels(latent_root / LABELS)
         images = _index(
             image_root,
-            (
+            paths=(
                 path
                 for path in image_root.rglob("*")
                 if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".npy"}
             ),
         )
-        latents = _index(latent_root, latent_root.rglob("*.npy"))
-        if not latents or not latents.keys() <= images.keys():
+        latents = _index(latent_root, paths=latent_root.rglob("*.npy"))
+        if not latents or latents.keys() - images.keys():
             raise ValueError(
                 f"{latent_root} needs latents, each with an image in {image_root}",
             )
@@ -136,7 +139,7 @@ class PairedImageLatentDataset(Dataset[dict[str, Tensor]]):
                 f"{image_path} holds a {image.dtype} {list(image.shape)} image; the "
                 "teacher reads [3, H, W] uint8.",
             )
-        stored = load_stored(latent_path, self.codec.stored_dtype)
+        stored = load_stored(latent_path, dtype=self.codec.stored_dtype)
         if stored.ndim == 4 and stored.shape[0] == 1:
             stored = stored[0]
         if tuple(stored.shape) != self.latent_shape:
@@ -185,7 +188,10 @@ class SpeedrunImageNetData:
 
         @override
         def finalize(self) -> Self:
-            self.working_dir = resolve_working_dir(self.base_dir, self.working_dir)
+            self.working_dir = resolve_working_dir(
+                self.base_dir,
+                working_dir=self.working_dir,
+            )
             if self.source.base_dir is None:
                 self.source.base_dir = self.working_dir
             return super().finalize()
@@ -194,37 +200,6 @@ class SpeedrunImageNetData:
         self.config = config
         self.dataset = config.source.make()
         self.timer_epoch = CheckpointableStepTimer()
-
-    def _loader(self, *, shuffle: bool) -> DataLoader[dict[str, Tensor]]:
-        sampler: DistributedSampler[dict[str, Tensor]] | None = None
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            sampler = DistributedSampler[dict[str, Tensor]](
-                self.dataset,
-                shuffle=shuffle,
-                drop_last=True,
-            )
-        if shuffle:
-            self.dataset.sampler = sampler
-        if self.config.num_workers:
-            return DataLoader(
-                self.dataset,
-                batch_size=self.config.batch_size,
-                shuffle=shuffle and sampler is None,
-                sampler=sampler,
-                num_workers=self.config.num_workers,
-                prefetch_factor=self.config.prefetch_factor,
-                pin_memory=self.config.pin_memory,
-                drop_last=True,
-            )
-        return DataLoader(
-            self.dataset,
-            batch_size=self.config.batch_size,
-            shuffle=shuffle and sampler is None,
-            sampler=sampler,
-            num_workers=0,
-            pin_memory=self.config.pin_memory,
-            drop_last=True,
-        )
 
     def train_dataloader(self) -> DataLoader[dict[str, Tensor]]:
         """Use torch's RandomSampler, matching the reference on one device."""
@@ -242,6 +217,30 @@ class SpeedrunImageNetData:
         """Restore the epoch timer from a checkpoint."""
         self.timer_epoch.load_state_dict(
             cast(dict[str, object], state_dict["timer_epoch"]),
+        )
+
+    def _loader(self, *, shuffle: bool) -> DataLoader[dict[str, Tensor]]:
+        sampler: DistributedSampler[dict[str, Tensor]] | None = None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            sampler = DistributedSampler[dict[str, Tensor]](
+                self.dataset,
+                shuffle=shuffle,
+                drop_last=True,
+            )
+        if shuffle:
+            self.dataset.sampler = sampler
+        return DataLoader(
+            self.dataset,
+            batch_size=self.config.batch_size,
+            shuffle=shuffle and sampler is None,
+            sampler=sampler,
+            num_workers=self.config.num_workers,
+            # DataLoader rejects a prefetch factor when it runs no workers.
+            prefetch_factor=self.config.prefetch_factor
+            if self.config.num_workers
+            else None,
+            pin_memory=self.config.pin_memory,
+            drop_last=True,
         )
 
 

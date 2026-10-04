@@ -109,7 +109,7 @@ so one it holds carries :func:`~priml.cost.set_cost`.
 # product and a sum of two operands each. Back, the sum passes its gradient
 # through and the product scales it by the saved noise for ``std``.
 def _posterior_sample_cost(*, channels: int, dtype: torch.dtype | None) -> Cost:
-    noise = traffic("primal", "elementwise", elements=channels, dtype=dtype)
+    noise = traffic("primal", kernel="elementwise", elements=channels, dtype=dtype)
     product = elementwise_cost(
         primal=channels,
         adjoint=channels,

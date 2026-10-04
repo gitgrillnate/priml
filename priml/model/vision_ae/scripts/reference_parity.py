@@ -87,6 +87,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 import torch
 
 from priml.hub import get_cache_dir
+from priml.lib.custom_json import DictCodec, loads
 from priml.model.vision_ae.checkpoint import (
     LocalFile,
 )
@@ -113,8 +114,6 @@ from priml.testing.golden import (
     write_tensors,
 )
 
-import priml
-
 
 if TYPE_CHECKING:
     from safetensors.torch import save_file
@@ -137,80 +136,9 @@ else:
     to_tensor = lazy_import("torchvision.transforms.functional", "to_tensor")
 
 
-_PRIML: Final = Path(priml.__file__).resolve().parent
+_THIS: Final = Path(__file__).resolve()
+_PRIML: Final = _THIS.parents[3]
 _TESTDATA: Final = _PRIML / "model" / "vision_ae" / "testdata"
-
-
-# What this run reads of each untyped reference, as karpathy_parity types its own.
-class _Posterior(Protocol):
-    mean: Tensor
-    logvar: Tensor
-    std: Tensor
-    var: Tensor
-
-    def sample(self) -> Tensor: ...
-
-    def mode(self) -> Tensor: ...
-
-
-class _Decoded(Protocol):
-    sample: Tensor
-
-
-class _TheirInvae(Protocol):
-    def encode(self, x: Tensor, /) -> _Posterior: ...
-
-    def decode(self, z: Tensor, /) -> _Decoded: ...
-
-
-class _InvaeModule(Protocol):
-    VAE_F16D32: Callable[[], nn.Module]
-
-
-class _HfEncoder(Protocol):
-    def set_attn_implementation(self, name: str, /) -> None: ...
-
-
-class _TheirDinov2(Protocol):
-    encoder: _HfEncoder
-
-
-class _TheirRae(Protocol):
-    encoder: _TheirDinov2
-    decoder: nn.Module
-
-    def encode(self, x: Tensor, /) -> Tensor: ...
-
-    def decode(self, z: Tensor, /) -> Tensor: ...
-
-
-class _Stage1Module(Protocol):
-    RAE: Callable[..., nn.Module]
-
-
-class _ViTMAEConfig(Protocol):
-    hidden_size: int
-    image_size: int
-
-
-class _DecoderUtilsModule(Protocol):
-    ViTMAEConfig: Callable[..., _ViTMAEConfig]
-
-
-class _DecoderModule(Protocol):
-    GeneralDecoder: Callable[..., nn.Module]
-    DinoV3PixelDecoder: Callable[..., nn.Module]
-
-
-class _TheirVtp(Protocol):
-    def get_reconstruction_latents(self, image: Tensor, /) -> Tensor: ...
-
-    def get_latents_decoded_images(self, latents: Tensor, /) -> Tensor: ...
-
-
-class _VtpHfModule(Protocol):
-    VTPModel: Callable[[object], nn.Module]
-    VTPConfig: Callable[..., object]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -255,7 +183,7 @@ class Reference:
     reference_calls: Mapping[str, tuple[tuple[int, ...], str]] = dataclasses.field(
         default_factory=dict[str, tuple[tuple[int, ...], str]],
     )
-    """Module names the reference calls more often -> its calls the port mirrors, and why."""
+    """Module names the reference calls more often -> (calls the port mirrors, why)."""
 
 
 _INVAE: Final = Reference(
@@ -521,9 +449,6 @@ _RAE: Final = Reference(
 _VTP_LAYERS: Final = "vtp/models/layers"
 _VTP_TEXT: Final = "The CLIP text and alignment side; reconstruction never reads it."
 _VTP_TRAINING: Final = "Training-only; the evaluation forward never runs it."
-_VTP_OTHER_BLOCK: Final = (
-    "Another architecture's block; the trunk and decoder use none."
-)
 
 _VTP: Final = Reference(
     url="https://github.com/MiniMax-AI/VTP.git",
@@ -924,9 +849,16 @@ class Definition:
     """One function, method, or class, and the body lines that are its own."""
 
     key: str
+    """``"<file>::<Qualified.name>"``, as the inventory spells it."""
+
     path: Path
+    """The file the definition is in."""
+
     function: bool
+    """True for a ``def``, False for a ``class``."""
+
     lines: frozenset[int]
+    """Body lines, less those of any definition nested inside it."""
 
 
 def definitions(root: Path, relative: str) -> list[Definition]:
@@ -944,29 +876,6 @@ def definitions(root: Path, relative: str) -> list[Definition]:
     path = root / relative
     tree = ast.parse(path.read_text())
     return list(_definitions(tree, path=path, prefix=f"{relative}::"))
-
-
-def _definitions(node: ast.AST, *, path: Path, prefix: str) -> Iterator[Definition]:
-    """Yield every definition below ``node``, through any compound statement."""
-    for child in ast.iter_child_nodes(node):
-        if not isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            yield from _definitions(child, path=path, prefix=prefix)
-            continue
-        key = f"{prefix}{child.name}"
-        own = set(range(child.body[0].lineno, (child.end_lineno or child.lineno) + 1))
-        for inner in ast.walk(child):
-            if inner is not child and isinstance(
-                inner,
-                ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
-            ):
-                own -= set(range(inner.lineno, (inner.end_lineno or inner.lineno) + 1))
-        yield Definition(
-            key=key,
-            path=path,
-            function=not isinstance(child, ast.ClassDef),
-            lines=frozenset(own),
-        )
-        yield from _definitions(child, path=path, prefix=f"{key}.")
 
 
 class Measured(Protocol):
@@ -1008,13 +917,15 @@ def inventory_problems(
     """
     problems: list[str] = []
     theirs = {
-        d.key: d for relative in reference.files for d in definitions(clone, relative)
+        d.key: d
+        for relative in reference.files
+        for d in definitions(clone, relative=relative)
     }
     ours: dict[str, Definition] = {}
     for keys in reference.paired.values():
         for key in keys:
             relative = key.split("::", 1)[0]
-            ours.update({d.key: d for d in definitions(_PRIML, relative)})
+            ours.update({d.key: d for d in definitions(_PRIML, relative=relative)})
 
     def not_ported(key: str) -> bool:
         return any(key == k or key.startswith(f"{k}.") for k in reference.not_ported)
@@ -1068,37 +979,6 @@ def inventory_problems(
     return problems
 
 
-def _branch_problems(
-    functions: Sequence[Definition],
-    *,
-    allowed: Mapping[str, str],
-    measured: Measured,
-) -> list[str]:
-    """Report each branch in ``functions`` not taken both ways, less the allowlist."""
-    problems: list[str] = []
-    used: set[str] = set()
-    for definition in functions:
-        source = definition.path.read_text().splitlines()
-        for line, (total, taken) in measured.branch_stats(str(definition.path)).items():
-            if line not in definition.lines or taken >= total:
-                continue
-            text = source[line - 1].strip()
-            # Keyed by the definition as well as the text: one entry must not
-            # silence the same line written in another function.
-            if f"{definition.key}::{text}" in allowed:
-                used.add(f"{definition.key}::{text}")
-                continue
-            problems.append(
-                f"{definition.key}:{line} takes {taken} of {total} exits: {text}",
-            )
-    problems.extend(
-        f"allowlisted branch now goes both ways, or no longer exists: {key}"
-        for key in allowed
-        if key not in used
-    )
-    return problems
-
-
 class PinnedRandom(TorchDispatchMode):
     """Serve ``randn`` from stored draws; refuse every other seeded random op.
 
@@ -1134,7 +1014,7 @@ class PinnedRandom(TorchDispatchMode):
     ) -> object:
         del types
         kwargs = kwargs or {}
-        if not _draws(func, args, kwargs):
+        if not _draws(func, args=args, kwargs=kwargs):
             return func(*args, **kwargs)
         if func.overloadpacket is not torch.ops.aten.randn:
             raise AssertionError(f"unpinned random op {func} was called")
@@ -1153,40 +1033,21 @@ class PinnedRandom(TorchDispatchMode):
         )
 
 
-def _draws(
-    func: OpOverload[..., object],
-    args: tuple[object, ...],
-    kwargs: dict[str, object],
-) -> bool:
-    """Whether ``func`` draws: seeded, and not attention with ``dropout_p == 0``."""
-    if torch.Tag.nondeterministic_seeded not in func.tags:
-        return False
-    names = [a.name for a in func._schema.arguments]  # noqa: SLF001 -- The harness reads the op schema to find the dropout argument.
-    if "dropout_p" not in names:
-        return True
-    index = names.index("dropout_p")
-    return kwargs.get("dropout_p", args[index] if index < len(args) else 0.0) != 0
-
-
-def _caller() -> str:
-    """Return ``file:line`` of the innermost frame outside torch and this file."""
-    torch_root = Path(torch.__file__).parent
-    frame = inspect.currentframe()
-    while frame is not None:
-        source = Path(frame.f_code.co_filename)
-        if source != Path(__file__) and not source.is_relative_to(torch_root):
-            return f"{source.name}:{frame.f_lineno}"
-        frame = frame.f_back
-    return "unknown"
-
-
 type Record = dict[str, list[list[Tensor]]]
 """Module name -> one entry per call -> that call's output tensors, in order."""
 
 
 @contextmanager
 def recorded(model: nn.Module) -> Generator[Record]:
-    """Record every submodule's tensor outputs, per call, by module name."""
+    """Record every submodule's tensor outputs, per call, by module name.
+
+    Args:
+      model: The module whose named submodules are hooked; the root is not.
+
+    Yields:
+      outputs: Filled as the model runs; the hooks come off on exit.
+
+    """
     outputs: Record = defaultdict(list)
     handles = [
         module.register_forward_hook(_recorder(outputs[name]))
@@ -1198,29 +1059,6 @@ def recorded(model: nn.Module) -> Generator[Record]:
     finally:
         for handle in handles:
             handle.remove()
-
-
-def _recorder(into: list[list[Tensor]]) -> Callable[[nn.Module, object, object], None]:
-    def hook(module: nn.Module, args: object, output: object) -> None:
-        del module, args
-        into.append([t.detach().clone() for t in _tensors(output)])
-
-    return hook
-
-
-def _tensors(value: object) -> list[Tensor]:
-    """Flatten a module output into its tensors, in order."""
-    if isinstance(value, Tensor):
-        return [value]
-    if isinstance(value, Mapping):
-        return [
-            t
-            for item in cast("Mapping[str, object]", value).values()
-            for t in _tensors(item)
-        ]
-    if isinstance(value, list | tuple):
-        return [t for item in cast("Sequence[object]", value) for t in _tensors(item)]
-    return []
 
 
 def compare(
@@ -1268,7 +1106,8 @@ def compare(
                 where = f"{label} {name} call {call} output {index}"
                 if a.dtype != b.dtype or a.shape != b.shape:
                     problems.append(
-                        f"{where}: {b.dtype}{list(b.shape)} vs {a.dtype}{list(a.shape)}",
+                        f"{where}: {b.dtype}{list(b.shape)} vs "
+                        f"{a.dtype}{list(a.shape)}",
                     )
                 elif not torch.equal(a, b):
                     problems.append(
@@ -1278,7 +1117,18 @@ def compare(
 
 
 def state_problems(label: str, theirs: nn.Module, ours: nn.Module) -> list[str]:
-    """Require identical state dicts: the same names, in order, with the same bits."""
+    """Report where two state dicts differ in names, order, dtype, or bits.
+
+    Args:
+      label: Prefix for each reported line.
+      theirs: The reference module.
+      ours: The port module.
+
+    Returns:
+      problems: One line if the names or their order differ, else one per
+        differing tensor.
+
+    """
     want, got = theirs.state_dict(), ours.state_dict()
     if list(want) != list(got):
         return [
@@ -1302,8 +1152,9 @@ def clone_upstream(reference: Reference, root: Path) -> Path:
       path: The clone's path.
 
     Raises:
-      RuntimeError: An existing clone is dirty or at another commit, so what
-        it contains is no longer the reference this comparison names.
+      RuntimeError: A git command fails, or an existing clone is dirty or at
+        another commit, so what it contains is no longer the reference this
+        comparison names.
 
     """
     if not (root / ".git").is_dir():
@@ -1323,35 +1174,21 @@ def clone_upstream(reference: Reference, root: Path) -> Path:
     return root.resolve()
 
 
-def _git(root: Path, *arguments: str) -> str:
-    """Run a git command in the clone and return its output.
-
-    Raises:
-      RuntimeError: git failed; the message carries its stderr.
-
-    """
-    completed = subprocess.run(  # noqa: S603 -- The parity harness runs fixed git subcommands against the pinned reference.
-        ["git", *arguments],  # noqa: S607 -- The parity harness runs fixed git subcommands against the pinned reference.
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode:
-        raise RuntimeError(
-            f"git {' '.join(arguments)} failed in {root}: {completed.stderr.strip()}",
-        )
-    return completed.stdout.strip()
-
-
 @dataclass(slots=True, kw_only=True)
 class Outcome:
     """What one model's comparison found."""
 
     problems: list[str]
+    """One line per mismatch."""
+
     compared: int = 0
-    sites: Counter[str] | None = None
-    golden: dict[str, Tensor] | None = None
+    """How many module names both sides recorded."""
+
+    sites: Counter[str] = dataclasses.field(default_factory=Counter[str])
+    """``file:line`` -> how many pinned ``torch.randn`` draws it took."""
+
+    golden: dict[str, Tensor] = dataclasses.field(default_factory=dict[str, Tensor])
+    """The record to mint or check against the checked-in golden; empty if none."""
 
 
 def run_invae(clone: Path, work: Path) -> Outcome:
@@ -1368,14 +1205,14 @@ def run_invae(clone: Path, work: Path) -> Outcome:
     _ = sys.modules.setdefault("dictdot", _dictdot_stub())
     sys.path.insert(0, str(clone))
     upstream = cast("_InvaeModule", importlib.import_module("models.invae"))
-    outcome = Outcome(problems=[], sites=Counter())
+    outcome = Outcome(problems=[])
 
     torch.manual_seed(0)
     theirs = upstream.VAE_F16D32()
     their_invae = cast("_TheirInvae", theirs)
     torch.manual_seed(0)
     unloaded = INVAE.Config(checkpoint=None).make()
-    outcome.problems += state_problems("invae init", theirs, unloaded)
+    outcome.problems += state_problems("invae init", theirs=theirs, ours=unloaded)
 
     checkpoint = work / "invae.pt"
     torch.save(theirs.state_dict(), checkpoint)
@@ -1395,7 +1232,8 @@ def run_invae(clone: Path, work: Path) -> Outcome:
             label = f"invae image {index} draw {draw}"
             with torch.no_grad(), host_agnostic_numerics():
                 with PinnedRandom([noise]) as pinned, recorded(theirs) as their_modules:
-                    # REG's own preprocessing: preprocessing/encoders.py, InvaeEncoder.encode.
+                    # REG's own preprocessing: preprocessing/encoders.py,
+                    # InvaeEncoder.encode.
                     upstream_posterior = their_invae.encode(
                         image.to(torch.float32) / 127.5 - 1,
                     )
@@ -1404,7 +1242,6 @@ def run_invae(clone: Path, work: Path) -> Outcome:
                     their_decoded = (
                         (their_invae.decode(their_sample).sample + 1) / 2
                     ).clamp(0, 1)
-                assert outcome.sites is not None
                 outcome.sites.update(pinned.sites)
                 with PinnedRandom([noise]) as pinned, recorded(ours) as our_modules:
                     our_sample = ours.encode(image)
@@ -1414,14 +1251,14 @@ def run_invae(clone: Path, work: Path) -> Outcome:
             fields = ("mean", "logvar", "std", "var")
             problems, compared = compare(
                 label,
-                {
+                theirs={
                     **their_modules,
                     **{f: [[getattr(upstream_posterior, f)]] for f in fields},
                     "mode": [[upstream_posterior.mode()]],
                     "sample": [[their_sample]],
                     "decoded": [[their_decoded]],
                 },
-                {
+                ours={
                     **our_modules,
                     **{f: [[getattr(our_posterior, f)]] for f in fields},
                     "mode": [[posterior_mode(our_posterior)]],
@@ -1433,18 +1270,6 @@ def run_invae(clone: Path, work: Path) -> Outcome:
             outcome.problems += problems
             outcome.compared = compared
     return outcome
-
-
-def _dictdot_stub() -> types.ModuleType:
-    """Supply ``dictdot.dictdot``: a dict whose keys read as attributes."""
-    module = types.ModuleType("dictdot")
-
-    class dictdot(dict[str, object]):  # noqa: N801 -- The name REG imports.
-        def __getattr__(self, name: str) -> object:
-            return self[name]
-
-    module.__dict__["dictdot"] = dictdot
-    return module
 
 
 def run_rae(clone: Path, work: Path) -> Outcome:
@@ -1472,7 +1297,7 @@ def run_rae(clone: Path, work: Path) -> Outcome:
         "_DecoderUtilsModule",
         importlib.import_module("stage1.decoders.utils"),
     )
-    outcome = Outcome(problems=[], sites=Counter())
+    outcome = Outcome(problems=[])
     encoder_dir, decoder_dir = work / "enc", work / "dec"
     encoder_dir.mkdir(parents=True, exist_ok=True)
     decoder_dir.mkdir(parents=True, exist_ok=True)
@@ -1509,14 +1334,14 @@ def run_rae(clone: Path, work: Path) -> Outcome:
                 "image_processor_type": "BitImageProcessor",
                 "image_std": [0.229, 0.224, 0.225],
                 "resample": 3,
-                "rescale_factor": 0.00392156862745098,
+                "rescale_factor": 1 / 255,
                 "size": {"shortest_edge": 256},
             },
         ),
     )
-    decoder_json = cast(
-        "dict[str, object]",
-        json.loads((clone / "configs/decoder/ViTXL/config.json").read_text()),
+    decoder_json = DictCodec.coerce(
+        loads((clone / "configs/decoder/ViTXL/config.json").read_text()),
+        default=None,
     )
     decoder_json.update(
         decoder_hidden_size=8,
@@ -1541,12 +1366,11 @@ def run_rae(clone: Path, work: Path) -> Outcome:
     torch.save({"mean": mean, "var": var}, work / "stats.pt")
     torch.save({"mean": None, "var": var}, work / "stats_var.pt")
 
-    generator = torch.Generator().manual_seed(0)
     large = torch.randint(
         0,
         256,
         (2, 3, 16, 16),
-        generator=generator,
+        generator=torch.Generator().manual_seed(0),
         dtype=torch.uint8,
     )
     exact = torch.randint(
@@ -1562,7 +1386,7 @@ def run_rae(clone: Path, work: Path) -> Outcome:
         # The one reference-side change: the kernel the port fixes, through HF's setter.
         their_rae = cast("_TheirRae", theirs)
         their_rae.encoder.encoder.set_attn_implementation("eager")
-        outcome.problems += state_problems("rae weights", theirs, ours)
+        outcome.problems += state_problems("rae weights", theirs=theirs, ours=ours)
         norm = None
         if stats is not None:
             norm = ElementwiseLatentStats.Config(
@@ -1582,12 +1406,16 @@ def run_rae(clone: Path, work: Path) -> Outcome:
                     )
             problems, compared = compare(
                 label,
-                {
+                theirs={
                     **their_modules,
                     "latent": [[their_latent]],
                     "decoded": [[their_decoded.clamp(0, 1)]],
                 },
-                {**our_modules, "latent": [[our_latent]], "decoded": [[our_decoded]]},
+                ours={
+                    **our_modules,
+                    "latent": [[our_latent]],
+                    "decoded": [[our_decoded]],
+                },
                 allowances=_RAE,
             )
             outcome.problems += problems
@@ -1629,67 +1457,16 @@ def run_rae(clone: Path, work: Path) -> Outcome:
         heads=2,
         patch_size=4,
     ).make()
-    outcome.problems += state_problems("rae decoder init", their_decoder, our_decoder)
+    outcome.problems += state_problems(
+        "rae decoder init",
+        theirs=their_decoder,
+        ours=our_decoder,
+    )
     return outcome
 
 
-def _their_rae(
-    stage1: _Stage1Module,
-    *,
-    work: Path,
-    decoder: Path | None = None,
-    stats: Path | None = None,
-) -> nn.Module:
-    """Build the reference RAE on the tiny encoder and decoder configs in ``work``."""
-    return stage1.RAE(
-        encoder_cls="Dinov2withNorm",
-        encoder_config_path=str(work / "enc"),
-        encoder_input_size=8,
-        encoder_params={"dinov2_path": str(work / "enc"), "normalize": True},
-        decoder_config_path=str(work / "dec"),
-        decoder_patch_size=4,
-        pretrained_decoder_path=None if decoder is None else str(decoder),
-        noise_tau=0.0,
-        reshape_to_2d=True,
-        normalization_stat_path=None if stats is None else str(stats),
-    )
-
-
-def _commit_tensor(reference: Reference) -> Tensor:
-    """Return the reference's pinned commit as bytes, the golden's provenance."""
-    return torch.frombuffer(bytearray(reference.commit.encode()), dtype=torch.uint8)
-
-
-def _rae_tiny() -> RAE.Config:
-    """Return ``rae_test.tiny``'s geometry, which the checked-in golden is minted at."""
-    config = RAE.Config()
-    encoder = config.encoder
-    assert isinstance(encoder, Dinov2WithRegisters.Config)
-    encoder.channels_hidden = 8
-    encoder.num_layers = 1
-    encoder.heads = 2
-    encoder.patch_size = 4
-    encoder.image_size = 12
-    config.encoder_image_size = 8
-    config.decoder.channels_hidden = 8
-    config.decoder.channels_hidden_mlp = 16
-    config.decoder.num_layers = 1
-    config.decoder.heads = 2
-    config.decoder.patch_size = 4
-    config.image_size = 8
-    return config
-
-
-def _randomize(module: nn.Module, *, seed: int) -> None:
-    """Draw every parameter from ``N(0, 0.3 ** 2)``: weights far from any init."""
-    generator = torch.Generator().manual_seed(seed)
-    with torch.no_grad():
-        for parameter in module.parameters():
-            parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.3)
-
-
 def run_vtp(clone: Path, work: Path) -> Outcome:
-    """Compare VTP with ``VTPModel``'s reconstruction path on ``vtp_test.tiny``'s geometry.
+    """Compare VTP with ``VTPModel``'s reconstruction on ``vtp_test.tiny``'s geometry.
 
     Args:
       clone: The VTP clone.
@@ -1710,7 +1487,7 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
     sys.path.insert(0, str(clone))
     decoders = cast("_DecoderModule", importlib.import_module("vtp.models.decoders"))
     hf = cast("_VtpHfModule", importlib.import_module("vtp.models.vtp_hf"))
-    outcome = Outcome(problems=[], sites=Counter())
+    outcome = Outcome(problems=[])
 
     # Initialization, at a geometry VTPModel builds natively: its decoder's
     # ffn ratio is 4 and its upscale the patch, 16.
@@ -1741,7 +1518,11 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
     native.image_size = 32
     native.checkpoint = None
     torch.manual_seed(0)
-    outcome.problems += state_problems("vtp init", their_init, native.make())
+    outcome.problems += state_problems(
+        "vtp init",
+        theirs=their_init,
+        ours=native.make(),
+    )
 
     golden = load_golden(_TESTDATA / "vtp.pt")
     state = golden["state_dict"]
@@ -1801,19 +1582,19 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
         numerics = host_agnostic_numerics() if autocast is None else nullcontext()
         with torch.no_grad(), numerics, PinnedRandom([]):
             with recorded(theirs) as their_modules:
-                expected = _their_round_trip(their_vtp, image, autocast=autocast)
+                expected = _their_round_trip(their_vtp, image=image, autocast=autocast)
             with recorded(model) as our_modules:
                 latent = model.encode(image)
                 got = {"latent": latent, "image": model.decode(latent)}
         # The raw pixels are the recorded ``pixel_decoder`` output on both sides.
         problems, compared = compare(
             label,
-            {
+            theirs={
                 **their_modules,
                 "latent": [[expected["latent"]]],
                 "image": [[expected["image"]]],
             },
-            {**our_modules, **{k: [[v]] for k, v in got.items()}},
+            ours={**our_modules, **{k: [[v]] for k, v in got.items()}},
             allowances=_VTP,
         )
         outcome.problems += problems
@@ -1824,57 +1605,6 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
                 **{k: v.float() for k, v in expected.items()},
             }
     return outcome
-
-
-def _their_round_trip(
-    their_vtp: _TheirVtp,
-    image: Tensor,
-    *,
-    autocast: torch.dtype | None,
-) -> dict[str, Tensor]:
-    """Reconstruct as the reference's evaluation, ``tools/test_reconstruction_hf.py``.
-
-    ToTensor and Normalize in, the encoder under autocast, the latent cast to
-    float32 for the decoder, then the inverse Normalize and a clamp out.
-    """
-    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-    normalize = Normalize(mean, std)
-    denormalize = Normalize(
-        [-m / s for m, s in zip(mean, std, strict=True)],
-        [1 / s for s in std],
-    )
-    pixels_in = torch.stack(
-        [normalize(to_tensor(img.permute(1, 2, 0).numpy())) for img in image],
-    )
-    cast_context = (
-        nullcontext() if autocast is None else torch.autocast("cpu", dtype=autocast)
-    )
-    with cast_context:
-        latent = their_vtp.get_reconstruction_latents(pixels_in)
-    pixels = their_vtp.get_latents_decoded_images(latent.float())
-    return {
-        "latent": latent,
-        "pixels": pixels,
-        "image": torch.clamp(denormalize(pixels), 0, 1),
-    }
-
-
-def _vtp_tiny() -> VTP.Config:
-    """Return ``vtp_test.tiny``'s geometry, which the checked-in golden is minted at."""
-    config = VTP.Config()
-    config.trunk.patch_size = 4
-    config.trunk.channels_hidden = 16
-    config.trunk.num_layers = 1
-    config.trunk.heads = 2
-    config.trunk.expansion = 1.0
-    config.trunk.channels_out = 4
-    config.pixel_decoder.channels_hidden = 16
-    config.pixel_decoder.num_layers = 1
-    config.pixel_decoder.heads = 2
-    config.pixel_decoder.expansion = 1.0
-    config.image_size = 8
-    config.checkpoint = None
-    return config
 
 
 def measure(
@@ -1916,13 +1646,6 @@ def measure(
     return outcome, measured
 
 
-_MODELS: Final = {
-    "invae": (_INVAE, run_invae, None),
-    "rae": (_RAE, run_rae, "rae_reference.pt"),
-    "vtp": (_VTP, run_vtp, "vtp_reference.pt"),
-}
-
-
 def main() -> int:
     """Run the selected comparisons and print every problem found.
 
@@ -1930,7 +1653,376 @@ def main() -> int:
       status: 0 when every selected port matches its reference, else 1.
 
     """
-    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n", 1)[0])
+    parser = argparse.ArgumentParser(
+        description=(__doc__ or "").split("\n", 2)[2],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_arguments(parser)
+    flags = cast("_Flags", parser.parse_args())
+    # Before the first matmul: pytest, which replays the goldens this mints, runs
+    # one math thread with MKL's kernel pinned (priml's conftest), and another
+    # reduction order or GEMM kernel can move a float64 result across a float32
+    # rounding boundary.
+    os.environ["MKL_CBWR"] = "COMPATIBLE"
+    torch.set_num_threads(1)
+
+    clones = {
+        name: clone_upstream(_MODELS[name][0], root=flags.clone_dir / name)
+        for name in flags.model
+    }
+    failed = False
+    with tempfile.TemporaryDirectory(prefix="reference-parity-") as scratch:
+        for name in flags.model:
+            reference, run, golden_name = _MODELS[name]
+            work = Path(scratch) / name
+            work.mkdir()
+            outcome, measured = measure(
+                reference,
+                run=run,
+                clone=clones[name],
+                work=work,
+            )
+            problems = list(outcome.problems)
+            if golden_name is not None and outcome.golden:
+                path = _TESTDATA / golden_name
+                if flags.mint:
+                    write_tensors(path, record=outcome.golden)
+                else:
+                    problems += [
+                        f"{golden_name}: {line}"
+                        for line in mismatches(
+                            read_tensors(path),
+                            actual=outcome.golden,
+                        )
+                    ]
+            problems += inventory_problems(
+                reference,
+                clone=clones[name],
+                measured=measured,
+            )
+            print(
+                f"== {name} at {reference.commit[:7]}: "
+                f"{outcome.compared} module outputs compared",
+            )
+            if outcome.sites:
+                print(f"   torch.randn call sites: {dict(outcome.sites)}")
+            for problem in problems:
+                print(f"   {problem}")
+            print(f"   {'FAIL' if problems else 'ok'}: {len(problems)} problems")
+            failed |= bool(problems)
+    return int(failed)
+
+
+def _definitions(node: ast.AST, *, path: Path, prefix: str) -> Iterator[Definition]:
+    """Yield every definition below ``node``, through any compound statement."""
+    for child in ast.iter_child_nodes(node):
+        if not isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            yield from _definitions(child, path=path, prefix=prefix)
+            continue
+        key = f"{prefix}{child.name}"
+        own = set(range(child.body[0].lineno, (child.end_lineno or child.lineno) + 1))
+        for inner in ast.walk(child):
+            if inner is not child and isinstance(
+                inner,
+                ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+            ):
+                own -= set(range(inner.lineno, (inner.end_lineno or inner.lineno) + 1))
+        yield Definition(
+            key=key,
+            path=path,
+            function=isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef),
+            lines=frozenset(own),
+        )
+        yield from _definitions(child, path=path, prefix=f"{key}.")
+
+
+def _branch_problems(
+    functions: Sequence[Definition],
+    *,
+    allowed: Mapping[str, str],
+    measured: Measured,
+) -> list[str]:
+    """Report each branch in ``functions`` not taken both ways, less the allowlist."""
+    problems: list[str] = []
+    used: set[str] = set()
+    for definition in functions:
+        source = definition.path.read_text().splitlines()
+        for line, (total, taken) in measured.branch_stats(str(definition.path)).items():
+            if line not in definition.lines or taken >= total:
+                continue
+            text = source[line - 1].strip()
+            # Keyed by the definition as well as the text: one entry must not
+            # silence the same line written in another function.
+            key = f"{definition.key}::{text}"
+            if key in allowed:
+                used.add(key)
+                continue
+            problems.append(
+                f"{definition.key}:{line} takes {taken} of {total} exits: {text}",
+            )
+    problems.extend(
+        f"allowlisted branch now goes both ways, or no longer exists: {key}"
+        for key in allowed
+        if key not in used
+    )
+    return problems
+
+
+def _draws(
+    func: OpOverload[..., object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> bool:
+    """Return whether ``func`` draws: seeded, and not attention at ``dropout_p == 0``."""
+    if torch.Tag.nondeterministic_seeded not in func.tags:
+        return False
+    names = [a.name for a in func._schema.arguments]  # noqa: SLF001 -- The harness reads the op schema to find the dropout argument.
+    if "dropout_p" not in names:
+        return True
+    index = names.index("dropout_p")
+    return kwargs.get("dropout_p", args[index] if index < len(args) else 0.0) != 0
+
+
+def _caller() -> str:
+    """Return ``file:line`` of the innermost frame outside torch and this file."""
+    torch_root = Path(torch.__file__).parent
+    frame = inspect.currentframe()
+    while frame is not None:
+        source = Path(frame.f_code.co_filename)
+        if source.resolve() != _THIS and not source.is_relative_to(torch_root):
+            return f"{source.name}:{frame.f_lineno}"
+        frame = frame.f_back
+    return "unknown"
+
+
+def _recorder(into: list[list[Tensor]]) -> Callable[[nn.Module, object, object], None]:
+    """Return a forward hook appending each call's detached output tensors to ``into``."""
+
+    def hook(module: nn.Module, args: object, output: object) -> None:
+        del module, args
+        into.append([t.detach().clone() for t in _tensors(output)])
+
+    return hook
+
+
+def _tensors(value: object) -> list[Tensor]:
+    """Flatten a module output into its tensors, in order."""
+    if isinstance(value, Tensor):
+        return [value]
+    if isinstance(value, Mapping):
+        return [
+            t
+            for item in cast("Mapping[str, object]", value).values()
+            for t in _tensors(item)
+        ]
+    if isinstance(value, list | tuple):
+        return [t for item in cast("Sequence[object]", value) for t in _tensors(item)]
+    return []
+
+
+def _git(root: Path, *arguments: str) -> str:
+    """Return a git command's output in ``root``; on failure, raise with its stderr."""
+    completed = subprocess.run(  # noqa: S603 -- The parity harness runs fixed git subcommands against the pinned reference.
+        ["git", *arguments],  # noqa: S607 -- The parity harness runs fixed git subcommands against the pinned reference.
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode:
+        raise RuntimeError(
+            f"git {' '.join(arguments)} failed in {root}: {completed.stderr.strip()}",
+        )
+    return completed.stdout.strip()
+
+
+def _dictdot_stub() -> types.ModuleType:
+    """Supply ``dictdot.dictdot``: a dict whose keys read as attributes."""
+    module = types.ModuleType("dictdot")
+
+    class dictdot(dict[str, object]):  # noqa: N801 -- The name REG imports.
+        def __getattr__(self, name: str) -> object:
+            return self[name]
+
+    module.__dict__["dictdot"] = dictdot
+    return module
+
+
+class _InvaeModule(Protocol):
+    VAE_F16D32: Callable[[], nn.Module]
+
+
+class _TheirInvae(Protocol):
+    def encode(self, x: Tensor, /) -> _Posterior: ...
+
+    def decode(self, z: Tensor, /) -> _Decoded: ...
+
+
+class _Posterior(Protocol):
+    mean: Tensor
+    logvar: Tensor
+    std: Tensor
+    var: Tensor
+
+    def sample(self) -> Tensor: ...
+
+    def mode(self) -> Tensor: ...
+
+
+class _Decoded(Protocol):
+    sample: Tensor
+
+
+def _randomize(module: nn.Module, *, seed: int) -> None:
+    """Draw every parameter from ``N(0, 0.3 ** 2)``: weights far from any init."""
+    generator = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for parameter in module.parameters():
+            parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.3)
+
+
+def _their_rae(
+    stage1: _Stage1Module,
+    *,
+    work: Path,
+    decoder: Path | None = None,
+    stats: Path | None = None,
+) -> nn.Module:
+    """Build the reference RAE on the tiny encoder and decoder configs in ``work``."""
+    return stage1.RAE(
+        encoder_cls="Dinov2withNorm",
+        encoder_config_path=str(work / "enc"),
+        encoder_input_size=8,
+        encoder_params={"dinov2_path": str(work / "enc"), "normalize": True},
+        decoder_config_path=str(work / "dec"),
+        decoder_patch_size=4,
+        pretrained_decoder_path=None if decoder is None else str(decoder),
+        noise_tau=0.0,
+        reshape_to_2d=True,
+        normalization_stat_path=None if stats is None else str(stats),
+    )
+
+
+def _rae_tiny() -> RAE.Config:
+    """Return ``rae_test.tiny``'s geometry, which the checked-in golden is minted at."""
+    config = RAE.Config()
+    encoder = config.encoder
+    assert isinstance(encoder, Dinov2WithRegisters.Config)
+    encoder.channels_hidden = 8
+    encoder.num_layers = 1
+    encoder.heads = 2
+    encoder.patch_size = 4
+    encoder.image_size = 12
+    config.encoder_image_size = 8
+    config.decoder.channels_hidden = 8
+    config.decoder.channels_hidden_mlp = 16
+    config.decoder.num_layers = 1
+    config.decoder.heads = 2
+    config.decoder.patch_size = 4
+    config.image_size = 8
+    return config
+
+
+def _commit_tensor(reference: Reference) -> Tensor:
+    """Return the reference's pinned commit as bytes, the golden's provenance."""
+    return torch.frombuffer(bytearray(reference.commit.encode()), dtype=torch.uint8)
+
+
+class _Stage1Module(Protocol):
+    RAE: Callable[..., nn.Module]
+
+
+class _DecoderModule(Protocol):
+    GeneralDecoder: Callable[..., nn.Module]
+    DinoV3PixelDecoder: Callable[..., nn.Module]
+
+
+class _DecoderUtilsModule(Protocol):
+    ViTMAEConfig: Callable[..., _ViTMAEConfig]
+
+
+class _ViTMAEConfig(Protocol):
+    hidden_size: int
+    image_size: int
+
+
+class _TheirRae(Protocol):
+    encoder: _TheirDinov2
+    decoder: nn.Module
+
+    def encode(self, x: Tensor, /) -> Tensor: ...
+
+    def decode(self, z: Tensor, /) -> Tensor: ...
+
+
+class _TheirDinov2(Protocol):
+    encoder: _HfEncoder
+
+
+class _HfEncoder(Protocol):
+    def set_attn_implementation(self, name: str, /) -> None: ...
+
+
+def _vtp_tiny() -> VTP.Config:
+    """Return ``vtp_test.tiny``'s geometry, which the checked-in golden is minted at."""
+    config = VTP.Config()
+    config.trunk.patch_size = 4
+    config.trunk.channels_hidden = 16
+    config.trunk.num_layers = 1
+    config.trunk.heads = 2
+    config.trunk.expansion = 1.0
+    config.trunk.channels_out = 4
+    config.pixel_decoder.channels_hidden = 16
+    config.pixel_decoder.num_layers = 1
+    config.pixel_decoder.heads = 2
+    config.pixel_decoder.expansion = 1.0
+    config.image_size = 8
+    config.checkpoint = None
+    return config
+
+
+def _their_round_trip(
+    their_vtp: _TheirVtp,
+    image: Tensor,
+    *,
+    autocast: torch.dtype | None,
+) -> dict[str, Tensor]:
+    """Reconstruct as the reference's evaluation, ``tools/test_reconstruction_hf.py``."""
+    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+    normalize = Normalize(mean, std)
+    denormalize = Normalize(
+        [-m / s for m, s in zip(mean, std, strict=True)],
+        [1 / s for s in std],
+    )
+    pixels_in = torch.stack(
+        [normalize(to_tensor(img.permute(1, 2, 0).numpy())) for img in image],
+    )
+    cast_context = (
+        nullcontext() if autocast is None else torch.autocast("cpu", dtype=autocast)
+    )
+    with cast_context:
+        latent = their_vtp.get_reconstruction_latents(pixels_in)
+    pixels = their_vtp.get_latents_decoded_images(latent.float())
+    return {
+        "latent": latent,
+        "pixels": pixels,
+        "image": torch.clamp(denormalize(pixels), 0, 1),
+    }
+
+
+class _VtpHfModule(Protocol):
+    VTPModel: Callable[[object], nn.Module]
+    VTPConfig: Callable[..., object]
+
+
+class _TheirVtp(Protocol):
+    def get_reconstruction_latents(self, image: Tensor, /) -> Tensor: ...
+
+    def get_latents_decoded_images(self, latents: Tensor, /) -> Tensor: ...
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register flags on ``parser``."""
     _ = parser.add_argument(
         "--model",
         nargs="+",
@@ -1949,53 +2041,23 @@ def main() -> int:
         action="store_true",
         help="Rewrite the checked-in reference goldens instead of checking them.",
     )
-    flags = parser.parse_args()
-    models = cast("list[str]", flags.model)
-    clone_dir = cast("Path", flags.clone_dir)
-    mint = cast("bool", flags.mint)
-    # Before the first matmul: pytest, which replays the goldens this mints, runs
-    # one math thread with MKL's kernel pinned (priml's conftest), and another
-    # reduction order or GEMM kernel can move a float64 result across a float32
-    # rounding boundary.
-    os.environ["MKL_CBWR"] = "COMPATIBLE"
-    torch.set_num_threads(1)
 
-    clones = {
-        name: clone_upstream(_MODELS[name][0], clone_dir / name) for name in models
-    }
-    failed = False
-    with tempfile.TemporaryDirectory() as scratch:
-        for name in models:
-            reference, run, golden_name = _MODELS[name]
-            work = Path(scratch) / name
-            work.mkdir()
-            outcome, measured = measure(reference, run, clone=clones[name], work=work)
-            problems = list(outcome.problems)
-            if golden_name is not None and outcome.golden is not None:
-                path = _TESTDATA / golden_name
-                if mint:
-                    write_tensors(path, outcome.golden)
-                else:
-                    problems += [
-                        f"{golden_name}: {line}"
-                        for line in mismatches(read_tensors(path), outcome.golden)
-                    ]
-            problems += inventory_problems(
-                reference,
-                clone=clones[name],
-                measured=measured,
-            )
-            print(
-                f"== {name} at {reference.commit[:7]}: {outcome.compared} module outputs compared",
-            )
-            if outcome.sites:
-                print(f"   torch.randn call sites: {dict(outcome.sites)}")
-            for problem in problems:
-                print(f"   {problem}")
-            print(f"   {'FAIL' if problems else 'ok'}: {len(problems)} problems")
-            failed |= bool(problems)
-    return int(failed)
+
+_MODELS: Final = {
+    "invae": (_INVAE, run_invae, None),
+    "rae": (_RAE, run_rae, "rae_reference.pt"),
+    "vtp": (_VTP, run_vtp, "vtp_reference.pt"),
+}
+
+
+class _Flags(Protocol):
+    """Parsed command-line flags."""
+
+    model: list[str]
+    clone_dir: Path
+    mint: bool
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
+# vim: ft=python

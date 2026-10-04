@@ -173,7 +173,10 @@ class Dinov2WithRegisters(nn.Module):
                 sha256="7a6f7b3b9fa4b8732e707476a03cd6cdce210048582f21aafb7991c17d98e362",
             ),
         )
-        """Published safetensors, final-norm affine included; ``None`` keeps the random initialization."""
+        """Published safetensors, final-norm affine included.
+
+        ``None`` keeps the random initialization.
+        """
 
         def cost(
             self,
@@ -295,7 +298,7 @@ class Dinov2WithRegisters(nn.Module):
                         (
                             traffic(
                                 phase,
-                                "elementwise",
+                                kernel="elementwise",
                                 elements=(positions + patches) * channels,
                                 dtype=cast_dtype,
                             )
@@ -310,6 +313,8 @@ class Dinov2WithRegisters(nn.Module):
                 batch_size=batch_size,
                 dtype=dtype,
             )
+            # The CLS and mask tokens, the registers, and the position table, whose
+            # first row is the CLS token's.
             tables = (3 + self.num_register_tokens + positions) * channels
             return (
                 patch
@@ -528,7 +533,10 @@ class ViTMAELayer(nn.Module):
 
         """
         hidden = self.attention(self.layernorm_before(hidden)) + hidden
-        return self.output(self.intermediate(self.layernorm_after(hidden)), hidden)
+        return self.output(
+            self.intermediate(self.layernorm_after(hidden)),
+            residual=hidden,
+        )
 
 
 class GeneralDecoder(nn.Module):
@@ -686,7 +694,10 @@ class GeneralDecoder(nn.Module):
         # Registration order is the reference's, trainable CLS token last.
         self.decoder_embed = nn.Linear(config.channels_in, config.channels_hidden)
         self.decoder_pos_embed = nn.Parameter(
-            sincos_position_table(config.channels_hidden, self.grid_size).unsqueeze(0),
+            sincos_position_table(
+                config.channels_hidden,
+                grid=self.grid_size,
+            ).unsqueeze(0),
             requires_grad=False,
         )
         self.decoder_layers = nn.ModuleList(
@@ -815,11 +826,11 @@ class RAE(nn.Module):
             grid = self.encoder_image_size // self.encoder.patch_size
             propagate_attr(
                 self.decoder,
-                "channels_in",
-                self.encoder.channels_hidden,
+                name="channels_in",
+                value=self.encoder.channels_hidden,
                 protocol=ChannelsIn,
             )
-            propagate_attr(self.decoder, "num_patches", grid * grid)
+            propagate_attr(self.decoder, name="num_patches", value=grid * grid)
             if self.decoder.patch_size * grid != self.image_size:
                 raise ValueError(
                     f"image_size {self.image_size} must be the decoder patch "
@@ -867,12 +878,12 @@ class RAE(nn.Module):
             # ``float() / 255`` as one map: uint8 in, float32 out.
             full = traffic(
                 "primal",
-                "elementwise",
+                kernel="elementwise",
                 elements=pixels,
                 dtype=torch.uint8,
             ) + traffic(
                 "primal",
-                "elementwise",
+                kernel="elementwise",
                 elements=pixels,
                 flops=pixels,
                 dtype=f32,
@@ -906,7 +917,12 @@ class RAE(nn.Module):
                     },
                 )
                 + cost(self.decoder, batch_size=batch_size, dtype=dtype, **kwargs)
-                + traffic("primal", "selection", elements=2 * pixels, dtype=dtype)
+                + traffic(
+                    "primal",
+                    kernel="selection",
+                    elements=2 * pixels,
+                    dtype=dtype,
+                )
                 + elementwise_cost(
                     primal=2 * pixels,
                     adjoint=0,
@@ -943,12 +959,12 @@ class RAE(nn.Module):
         self.encoder_std: Tensor
         self.register_buffer(
             "encoder_mean",
-            torch.tensor(config.encoder.pixel_mean).view(1, 3, 1, 1),
+            torch.tensor(mean).view(1, 3, 1, 1),
             persistent=False,
         )
         self.register_buffer(
             "encoder_std",
-            torch.tensor(config.encoder.pixel_std).view(1, 3, 1, 1),
+            torch.tensor(std).view(1, 3, 1, 1),
             persistent=False,
         )
         self.decoder = config.decoder.make()
@@ -1027,6 +1043,10 @@ def rae_dinov2_base() -> RAE.Config:
     return RAE.Config()
 
 
+# Two affine layer norms, separate query/key/value projections, the attention products,
+# the output projection, the MLP around ``activation`` (already costed by the caller),
+# two residual adds, and, with ``layer_scale``, the two per-channel LayerScale
+# multiplies DINOv2 applies before each add.
 def _vit_layer_cost(
     *,
     channels: int,
@@ -1039,13 +1059,7 @@ def _vit_layer_cost(
     activation: Cost,
     dtype: torch.dtype | None,
 ) -> Cost:
-    """Cost one pre-norm ViT block: HF's DINOv2 layer, or the port's ViTMAE one.
-
-    Two affine layer norms, separate query/key/value projections, the attention
-    products, the output projection, the MLP around ``activation`` (already
-    costed by the caller), two residual adds, and, with ``layer_scale``, the
-    two per-channel LayerScale multiplies DINOv2 applies before each add.
-    """
+    """Cost one pre-norm ViT block: HF's DINOv2 layer, or the port's ViTMAE one."""
     rows = seq_len * batch_size
     norms = cost(
         LayerNorm.Config(channels, elementwise_affine=True),
@@ -1114,21 +1128,19 @@ def _vit_layer_cost(
     return norms + qkv + attention + projections + activation + residual_adds + scales
 
 
+# Torch's exact-erf GELU -- the reference's, and HF's ``"gelu"`` -- is priced here at
+# eight operations each way, the count ``priml.baselines.sudoku`` gives exact GELU,
+# rather than registered on torch's function with :func:`~priml.cost.set_cost`:
+# registering would impose this module's count on every importer, and ``cost(gelu)``
+# would work only once this module had been imported. Any other activation must cost
+# itself.
 def _activation_cost(
     activation: TensorFn,
     *,
     channels: int,
     dtype: torch.dtype | None,
 ) -> Cost:
-    """Cost ``activation`` over ``channels`` elements.
-
-    Torch's exact-erf GELU -- the reference's, and HF's ``"gelu"`` -- is priced
-    here at eight operations each way, the count ``priml.baselines.sudoku``
-    gives exact GELU, rather than registered on torch's function with
-    :func:`~priml.cost.set_cost`: registering would impose this module's count
-    on every importer, and ``cost(gelu)`` would work only once this module had
-    been imported. Any other activation must cost itself.
-    """
+    """Cost ``activation`` over ``channels`` elements."""
     if activation is functional.gelu:
         return map_cost(primal=8, adjoint=8)(channels=channels, dtype=dtype)
     return cost(activation, channels=channels, dtype=dtype)
@@ -1136,14 +1148,19 @@ def _activation_cost(
 
 def _concatenate_cost(*, elements: int, dtype: torch.dtype | None) -> Cost:
     """Cost a concatenation writing ``elements``: a copy, and its split back."""
-    return traffic("primal", "selection", elements=2 * elements, dtype=dtype) + traffic(
-        "adjoint",
-        "selection",
+    return traffic(
+        "primal",
+        kernel="selection",
         elements=2 * elements,
         dtype=dtype,
-    )
+    ) + traffic("adjoint", kernel="selection", elements=2 * elements, dtype=dtype)
 
 
+# A width pass then a height pass, each output a weighted sum of ``taps`` inputs
+# (``taps`` multiplies, ``taps - 1`` adds). The cubic kernel spans four inputs;
+# antialiasing a downscale widens it by the scale, as torch's ``_upsample_bicubic2d_aa``
+# does. The adjoint scatters the same weights back, so it costs the same. Per-output
+# weights are not counted.
 def _bicubic_cost(
     *,
     planes: int,
@@ -1152,30 +1169,23 @@ def _bicubic_cost(
     antialias: bool,
     dtype: torch.dtype | None,
 ) -> Cost:
-    """Cost a separable bicubic resample of ``planes`` images and its transpose.
-
-    A width pass then a height pass, each output a weighted sum of ``taps``
-    inputs (``taps`` multiplies, ``taps - 1`` adds). The cubic kernel spans
-    four inputs; antialiasing a downscale widens it by the scale, as torch's
-    ``_upsample_bicubic2d_aa`` does. The adjoint scatters the same weights
-    back, so it costs the same. Per-output weights are not counted.
-    """
+    """Cost a separable bicubic resample of ``planes`` images and its transpose."""
     (height_in, width_in), (height_out, width_out) = grid_in, grid_out
-    taps_height = _bicubic_taps(height_in, height_out, antialias=antialias)
-    taps_width = _bicubic_taps(width_in, width_out, antialias=antialias)
+    taps_height = _bicubic_taps(height_in, size_out=height_out, antialias=antialias)
+    taps_width = _bicubic_taps(width_in, size_out=width_out, antialias=antialias)
     middle = planes * height_in * width_out
     out = planes * height_out * width_out
     flops = (2 * taps_width - 1) * middle + (2 * taps_height - 1) * out
     elements = planes * height_in * width_in + 2 * middle + out
     return traffic(
         "primal",
-        "elementwise",
+        kernel="elementwise",
         elements=elements,
         flops=flops,
         dtype=dtype,
     ) + traffic(
         "adjoint",
-        "elementwise",
+        kernel="elementwise",
         elements=elements,
         flops=flops,
         dtype=dtype,

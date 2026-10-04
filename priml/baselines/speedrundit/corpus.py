@@ -112,15 +112,16 @@ def save_stored(path: Path, stored: Tensor) -> None:
 
     """
     tensor = stored.detach().cpu().contiguous()
-    # A CPU tensor already, so reading its values costs no device synchronization.
-    if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all()):
+    if (
+        tensor.is_floating_point() and not bool(torch.isfinite(tensor).all())
+    ):  # house-ignore[tensor-value-guard] -- Host tensor checked once before publication; no device sync.
         raise ValueError(
             f"{path}: stored latents must be finite; the codec overflowed.",
         )
     if tensor.dtype == torch.bfloat16:
         tensor = tensor.view(torch.int16)
     array = tensor.numpy()
-    write_atomically(path, lambda stream: np.save(stream, array))
+    write_atomically(path, write=lambda stream: np.save(stream, array))
 
 
 def load_stored(path: Path, dtype: torch.dtype) -> Tensor:
@@ -216,7 +217,7 @@ def save_table(directory: Path, codec: FittedCodec) -> str:
     """
     path = table_path(directory)
     table = {name: value.detach().cpu() for name, value in codec.table().items()}
-    write_atomically(path, lambda stream: torch.save(table, stream))
+    write_atomically(path, write=lambda stream: torch.save(table, stream))
     return _sha256(path)
 
 
@@ -276,7 +277,11 @@ def write_receipt(
         "format": FORMAT_VERSION,
         "identity": {
             "autoencoder": autoencoder_identity(autoencoder),
-            "codec": codec_identity(codec_config, codec, table_sha256),
+            "codec": codec_identity(
+                codec_config,
+                codec=codec,
+                table_sha256=table_sha256,
+            ),
         },
         "config": {
             "autoencoder": pformat(autoencoder, hide_default_values=False),
@@ -290,7 +295,7 @@ def write_receipt(
     }
     text = json.dumps(receipt, indent=2, sort_keys=True, default=str)
     path = directory / RECEIPT
-    write_atomically(path, lambda stream: stream.write(text.encode()))
+    write_atomically(path, write=lambda stream: stream.write(text.encode()))
     return path
 
 
@@ -336,10 +341,14 @@ def verify_receipt(
     expected = _flatten(
         {
             "autoencoder": autoencoder_identity(autoencoder),
-            "codec": codec_identity(codec_config, codec, table_sha256),
+            "codec": codec_identity(
+                codec_config,
+                codec=codec,
+                table_sha256=table_sha256,
+            ),
         },
     )
-    problems = mismatches(_flatten(receipt["identity"]), expected)
+    problems = mismatches(_flatten(receipt["identity"]), expected=expected)
     if problems:
         raise CorpusMismatchError(
             f"{directory} was not produced by the configured autoencoder and codec:\n  "
@@ -375,8 +384,9 @@ def mismatches(
 
 def _qualified(config: object) -> str:
     """Return the dotted name of the class a config makes."""
-    made = cast("type", getattr(type(config), "parent_class", type(config)))  # pyright: ignore[reportAny] -- configgle stores the made class on the Config type.
-    return f"{made.__module__}.{made.__qualname__}"
+    made = getattr(type(config), "parent_class", None)
+    cls = made if isinstance(made, type) else type(config)
+    return f"{cls.__module__}.{cls.__qualname__}"
 
 
 def _encoding_identity(config: object) -> object:
@@ -410,12 +420,12 @@ def _encoding_identity(config: object) -> object:
 
 
 def _flatten(value: object, prefix: str = "") -> dict[str, object]:
-    """Key every leaf of nested mappings by its dotted path, so a diff names the leaf."""
+    """Key each leaf of nested mappings by dotted path, so a diff names the leaf."""
     if not isinstance(value, dict):
         return {prefix: value}
     flat: dict[str, object] = {}
     for key, child in cast("dict[str, object]", value).items():
-        flat |= _flatten(child, f"{prefix}.{key}" if prefix else key)
+        flat |= _flatten(child, prefix=f"{prefix}.{key}" if prefix else key)
     return flat
 
 

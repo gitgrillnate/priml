@@ -62,8 +62,11 @@ class SpeedrunTrainStep(TrainStep):
                 ),
             ),
         )
-        """Exponential moving average of student parameters, kept as parameter
-        shadows: a module-copy shadow cannot deepcopy a composable distributed model."""
+        """Exponential moving average of the student's parameters.
+
+        Kept as parameter shadows: a module-copy shadow cannot deepcopy a
+        composable distributed model.
+        """
 
         gradient_clip_norm: float = 1.0
         """Global gradient norm clipping threshold."""
@@ -128,54 +131,9 @@ class SpeedrunTrainStep(TrainStep):
         moved["latent"] = self.latent_norm.normalize(latent.float())
         return moved
 
-    def _terms(self, batch: dict[str, object], *, evaluate: bool) -> LossTerms:
-        image, latent, label = (batch["image"], batch["latent"], batch["label"])
-        assert isinstance(image, Tensor)
-        assert isinstance(latent, Tensor)
-        assert isinstance(label, Tensor)
-        with (
-            torch.no_grad(),
-            torch.autocast(
-                device_type=self.device.type,
-                dtype=self.config.dtype_autocast or torch.bfloat16,
-                enabled=self.config.dtype_autocast is not None,
-            ),
-        ):
-            teacher_features = cast("object", self.teacher(image))
-        # The slot takes any module, so its output is checked rather than cast: a
-        # bare tensor would otherwise fail later as an ambiguous tensor truth value.
-        if not isinstance(teacher_features, tuple):
-            raise TypeError(
-                "The teacher must return a tuple of feature maps; got "
-                f"{type(teacher_features).__name__}.",
-            )
-        if evaluate:
-            model = cast(Callable[..., ModelOutput], self.call_eval)
-        else:
-            model = cast(Callable[..., ModelOutput], self.__call__)
-        return self.objective(
-            model,
-            latent,
-            label,
-            cast("tuple[Tensor, ...]", teacher_features),
-        )
-
-    @classmethod
-    def _result(cls, terms: LossTerms) -> TrainStepOutput:
-        return {
-            "loss": terms.loss.detach(),
-            "model": terms.output.velocity.detach(),
-            "metrics": {
-                "velocity_loss": terms.velocity.mean().detach(),
-                "cls_loss": terms.cls.mean().detach(),
-                "projection_loss": terms.projection.mean().detach(),
-                "cfm_loss": terms.cfm.mean().detach(),
-            },
-        }
-
     @override
     def train_step(self, **preprocessed_batch: object) -> TrainStepOutput:
-        """Backpropagate one micro-batch, and update once ``accumulate_grad_batches`` ran.
+        """Backpropagate one micro-batch; step once ``accumulate_grad_batches`` ran.
 
         The update's gradient is the sample-weighted mean over the micro-batches,
         as one batch of them all would give, except that the contrastive term
@@ -223,3 +181,48 @@ class SpeedrunTrainStep(TrainStep):
     def eval_loss(self, **preprocessed_batch: object) -> TrainStepOutput:
         with torch.inference_mode():
             return self._result(self._terms(preprocessed_batch, evaluate=True))
+
+    def _terms(self, batch: dict[str, object], *, evaluate: bool) -> LossTerms:
+        image, latent, label = (batch["image"], batch["latent"], batch["label"])
+        assert isinstance(image, Tensor)
+        assert isinstance(latent, Tensor)
+        assert isinstance(label, Tensor)
+        with (
+            torch.no_grad(),
+            torch.autocast(
+                device_type=self.device.type,
+                dtype=self.config.dtype_autocast or torch.bfloat16,
+                enabled=self.config.dtype_autocast is not None,
+            ),
+        ):
+            teacher_features = cast("object", self.teacher(image))
+        # The slot takes any module, so its output is checked rather than cast: a
+        # bare tensor would otherwise fail later as an ambiguous tensor truth value.
+        if not isinstance(teacher_features, tuple):
+            raise TypeError(
+                "The teacher must return a tuple of feature maps; got "
+                f"{type(teacher_features).__name__}.",
+            )
+        if evaluate:
+            model = cast(Callable[..., ModelOutput], self.call_eval)
+        else:
+            model = cast(Callable[..., ModelOutput], self.__call__)
+        return self.objective(
+            model,
+            latents=latent,
+            labels=label,
+            teacher_features=cast("tuple[Tensor, ...]", teacher_features),
+        )
+
+    @classmethod
+    def _result(cls, terms: LossTerms) -> TrainStepOutput:
+        return {
+            "loss": terms.loss.detach(),
+            "model": terms.output.velocity.detach(),
+            "metrics": {
+                "velocity_loss": terms.velocity.mean().detach(),
+                "cls_loss": terms.cls.mean().detach(),
+                "projection_loss": terms.projection.mean().detach(),
+                "cfm_loss": terms.cfm.mean().detach(),
+            },
+        }

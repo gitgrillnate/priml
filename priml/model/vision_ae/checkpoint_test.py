@@ -17,8 +17,7 @@ from priml.model.vision_ae.custom_types import CheckpointFile
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
-
-    import urllib.request
+    from urllib import request
 
     from configgle import Makeable
 
@@ -203,8 +202,8 @@ def test_url_file_downloads_once_and_refuses_the_wrong_bytes(
     digest = hashlib.sha256(payload).hexdigest()
     urls: list[str] = []
 
-    def serve(request: urllib.request.Request) -> _Response:
-        urls.append(request.full_url)
+    def serve(http_request: request.Request) -> _Response:
+        urls.append(http_request.full_url)
         return _Response(payload)
 
     monkeypatch.setattr("urllib.request.urlopen", serve)
@@ -226,7 +225,7 @@ class _Response(io.BytesIO):
 
 
 def test_sha256_file_matches_hashlib(tmp_path: Path) -> None:
-    path, digest = _file(tmp_path, b"x" * 100_000)
+    path, digest = _file(tmp_path, payload=b"x" * 100_000)
     assert sha256_file(path) == digest
 
 

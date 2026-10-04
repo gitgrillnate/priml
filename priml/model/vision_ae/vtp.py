@@ -48,7 +48,7 @@ from priml.cost import (
 )
 from priml.math.basic import ceil_multiple
 from priml.math.pixel import rgb2float
-from priml.model import norm as priml_norm
+from priml.model import norm
 from priml.model.attention.kernel import attention_kernel_cost
 from priml.model.conv import conv_cost
 from priml.model.custom_types import ChannelsIn, TensorModule, propagate_attr
@@ -213,7 +213,7 @@ class SelfAttention(nn.Module):
         channels = self.qkv.in_features
         qkv = qkv.reshape(batch, tokens, 3, self.num_heads, channels // self.num_heads)
         q, k, v = (t.transpose(1, 2) for t in torch.unbind(qkv, 2))
-        q, k = self.apply_rope(q, k, rope)
+        q, k = self.apply_rope(q, k=k, rope=rope)
         x = functional.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2).reshape([batch, tokens, channels])
         return self.proj(x)
@@ -232,7 +232,8 @@ class SelfAttention(nn.Module):
           rope: ``(sin, cos)``, each ``[n, channels_head]`` with ``n <= N``.
 
         Returns:
-          rotated: Queries and keys, cast back to their own dtypes.
+          q: Rotated queries, cast back to their own dtype.
+          k: Rotated keys, cast back to their own dtype.
 
         """
         q_dtype, k_dtype = q.dtype, k.dtype
@@ -241,11 +242,11 @@ class SelfAttention(nn.Module):
         k = k.to(dtype=sin.dtype)
         prefix = q.shape[-2] - sin.shape[-2]
         q = torch.cat(
-            (q[:, :, :prefix, :], rope_apply(q[:, :, prefix:, :], sin, cos)),
+            (q[:, :, :prefix, :], rope_apply(q[:, :, prefix:, :], sin=sin, cos=cos)),
             dim=-2,
         )
         k = torch.cat(
-            (k[:, :, :prefix, :], rope_apply(k[:, :, prefix:, :], sin, cos)),
+            (k[:, :, :prefix, :], rope_apply(k[:, :, prefix:, :], sin=sin, cos=cos)),
             dim=-2,
         )
         return q.to(dtype=q_dtype), k.to(dtype=k_dtype)
@@ -292,16 +293,21 @@ class SelfAttentionBlock(nn.Module):
         self.norm1 = norm(dim)
         self.attn = SelfAttention(dim, num_heads=num_heads)
         self.norm2 = norm(dim)
-        self.mlp = SwiGLUFFN(dim, int(dim * expansion))
+        self.mlp = SwiGLUFFN(dim, hidden_features=int(dim * expansion))
 
     @override
     def forward(self, x: Tensor, rope: tuple[Tensor, Tensor]) -> Tensor:
-        x_attn = x + self.attn(self.norm1(x), rope)
+        x_attn = x + self.attn(self.norm1(x), rope=rope)
         return x_attn + self.mlp(self.norm2(x_attn))
 
 
 def init_weights_vit(module: nn.Module) -> None:
-    """Apply the reference's per-module initialization to one module."""
+    """Apply the reference's per-module initialization to one module.
+
+    Args:
+      module: Initialized in place; a type the reference skips is left as is.
+
+    """
     if isinstance(module, nn.Linear):
         nn.init.trunc_normal_(module.weight, std=0.02)
         if module.bias is not None:
@@ -315,6 +321,10 @@ def init_weights_post(module: nn.Module) -> None:
 
     Hugging Face's ``post_init`` runs it over the whole model after the trunk
     and decoder have initialized themselves, so its draws replace theirs.
+
+    Args:
+      module: Initialized in place; a type the reference skips is left as is.
+
     """
     if isinstance(module, nn.Linear):
         nn.init.trunc_normal_(module.weight, std=0.02)
@@ -451,7 +461,7 @@ class DinoVisionTransformerWithBottleneck(nn.Module):
                 phase="adjoint",
             )
             blocks = _transformer_cost(
-                norm=priml_norm.RMSNorm.Config(
+                norm_config=norm.RMSNorm.Config(
                     width,
                     eps=1e-5,
                     elementwise_affine=True,
@@ -525,7 +535,7 @@ class DinoVisionTransformerWithBottleneck(nn.Module):
         x = torch.cat([cls_token.expand(batch, -1, -1), x], dim=1)
         rope = self.rope_embed(height=height, width=width)
         for block in self.blocks:
-            x = block(x, rope)
+            x = block(x, rope=rope)
         x_norm_patch = self.norm(x)[:, 1:]
         num_patches = x_norm_patch.shape[1]
         patch_tokens = self.feature_bottleneck(x_norm_patch.reshape(-1, self.embed_dim))
@@ -613,7 +623,7 @@ class DinoV3PixelDecoder(nn.Module):
                 dtype=dtype,
             )
             blocks = _transformer_cost(
-                norm=priml_norm.LayerNorm.Config(
+                norm_config=norm.LayerNorm.Config(
                     width,
                     eps=1e-6,
                     elementwise_affine=True,
@@ -691,8 +701,7 @@ class DinoV3PixelDecoder(nn.Module):
         x = x.flatten(2).transpose(1, 2)
         rope = self.rope_embed(height=height, width=width)
         for block in self.blocks:
-            assert isinstance(block, SelfAttentionBlock)
-            x = block(x, rope)
+            x = block(x, rope=rope)
         x = self.norm(x)
         x = x.transpose(1, 2).reshape(batch, self.embed_dim, height, width)
         x = self.proj_out(x)
@@ -766,11 +775,15 @@ class VTP(nn.Module):
         def finalize(self) -> Self:
             propagate_attr(
                 self.pixel_decoder,
-                "channels_in",
-                self.trunk.channels_out,
+                name="channels_in",
+                value=self.trunk.channels_out,
                 protocol=ChannelsIn,
             )
-            propagate_attr(self.pixel_decoder, "upscale_factor", self.trunk.patch_size)
+            propagate_attr(
+                self.pixel_decoder,
+                name="upscale_factor",
+                value=self.trunk.patch_size,
+            )
             if self.image_size % self.trunk.patch_size:
                 raise ValueError(
                     f"image_size {self.image_size} must be divisible by "
@@ -828,26 +841,36 @@ class VTP(nn.Module):
                 latents = batch_size * math.prod(self.latent_shape())
                 full += traffic(
                     "primal",
-                    "elementwise",
+                    kernel="elementwise",
                     elements=latents,
                     dtype=autocast,
-                ) + traffic("primal", "elementwise", elements=latents, dtype=dtype)
+                ) + traffic(
+                    "primal",
+                    kernel="elementwise",
+                    elements=latents,
+                    dtype=dtype,
+                )
             pixels = batch_size * 3 * self.image_size**2
             channels = len(self.pixel_mean)
             # Each map reads the image and writes it once; the two subtracted or
             # divided maps also read one statistic per channel.
             pixel_maps = (
-                traffic("primal", "elementwise", elements=pixels, dtype=torch.uint8)
+                traffic(
+                    "primal",
+                    kernel="elementwise",
+                    elements=pixels,
+                    dtype=torch.uint8,
+                )
                 + traffic(
                     "primal",
-                    "elementwise",
+                    kernel="elementwise",
                     elements=7 * pixels + 2 * channels,
                     flops=3 * pixels,
                     dtype=torch.float32,
                 )
                 + traffic(
                     "primal",
-                    "elementwise",
+                    kernel="elementwise",
                     elements=6 * pixels + 2 * channels,
                     flops=4 * pixels,
                     dtype=torch.float32,
@@ -963,7 +986,12 @@ class VTP(nn.Module):
 
 
 def vtp_small() -> VTP.Config:
-    """Return VTP-Small-f16d64: 384 wide, 12 blocks, 6 heads in trunk and decoder."""
+    """Return VTP-Small-f16d64: 384 wide, 12 blocks, 6 heads in trunk and decoder.
+
+    Returns:
+      config: The architecture, published weights, and latent statistics.
+
+    """
     config = VTP.Config()
     config.trunk.channels_hidden = 384
     config.trunk.num_layers = 12
@@ -987,7 +1015,12 @@ def vtp_small() -> VTP.Config:
 
 
 def vtp_base() -> VTP.Config:
-    """Return VTP-Base-f16d64: 768 wide, 12 blocks, 12 heads in trunk and decoder."""
+    """Return VTP-Base-f16d64: 768 wide, 12 blocks, 12 heads in trunk and decoder.
+
+    Returns:
+      config: The architecture, published weights, and latent statistics.
+
+    """
     config = VTP.Config()
     config.trunk.channels_hidden = 768
     config.trunk.num_layers = 12
@@ -1057,12 +1090,17 @@ def _autoencoder_state(checkpoint: Mapping[str, Tensor]) -> dict[str, Tensor]:
 
 def _swiglu_channels_hidden(hidden_features: int) -> int:
     """Return SwiGLU's hidden width: ``2/3`` of nominal, aligned up to 8."""
-    return ceil_multiple(int(hidden_features * 2 / 3), 8)
+    return ceil_multiple(int(hidden_features * 2 / 3), multiple=8)
 
 
+# The sequence is ``prefix`` unrotated tokens then the ``side ** 2`` grid. Each block is
+# two norms, the biased ``qkv`` and ``proj`` projections, the rotation, the two
+# attention products, the biased split-gate SwiGLU, and two residual adds; the table is
+# built once and shared by every block. The norms and the residual adds run in
+# ``dtype_stream``, the rest in ``dtype``.
 def _transformer_cost(
     *,
-    norm: priml_norm.RMSNorm.Config | priml_norm.LayerNorm.Config,
+    norm_config: norm.RMSNorm.Config | norm.LayerNorm.Config,
     channels: int,
     heads: int,
     expansion: float,
@@ -1073,30 +1111,24 @@ def _transformer_cost(
     dtype: torch.dtype | None,
     dtype_stream: torch.dtype | None,
 ) -> Cost:
-    """Cost the rotary table, ``num_layers`` blocks, and the final norm.
-
-    The sequence is ``prefix`` unrotated tokens then the ``side ** 2`` grid.
-    Each block is two norms, the biased ``qkv`` and ``proj`` projections, the
-    rotation, the two attention products, the biased split-gate SwiGLU, and two
-    residual adds; the table is built once and shared by every block. The norms
-    and the residual adds run in ``dtype_stream``, the rest in ``dtype``.
-    """
+    """Cost the rotary table, ``num_layers`` blocks, and the final norm."""
     patches = side * side
     tokens = patches + prefix
     rows = batch_size * tokens
     channels_head = channels // heads
     ffn = SwiGLU.Config(
         channels,
-        channels,
+        channels_out=channels,
         channels_hidden=_swiglu_channels_hidden(int(channels * expansion)),
         bias=True,
         split_gate_projection=True,
     )
     block = (
-        norm.cost(seq_len=tokens, batch_size=batch_size, dtype=dtype_stream).tile(
-            2,
-            copies=2,
-        )
+        norm_config.cost(
+            seq_len=tokens,
+            batch_size=batch_size,
+            dtype=dtype_stream,
+        ).tile(2, copies=2)
         + matmul_cost(
             channels_in=channels,
             channels_out=3 * channels,
@@ -1137,7 +1169,7 @@ def _transformer_cost(
     return (
         _rope_table_cost(side=side, channels_head=channels_head)
         + block.tile(num_layers, copies=num_layers)
-        + norm.cost(seq_len=tokens, batch_size=batch_size, dtype=dtype_stream)
+        + norm_config.cost(seq_len=tokens, batch_size=batch_size, dtype=dtype_stream)
     )
 
 
@@ -1171,7 +1203,12 @@ def _rotation_cost(
         return rotation
     return sum(
         (
-            traffic(phase, "elementwise", elements=2 * rows * width, dtype=cast_dtype)
+            traffic(
+                phase,
+                kernel="elementwise",
+                elements=2 * rows * width,
+                dtype=cast_dtype,
+            )
             for phase in ("primal", "adjoint")
             for cast_dtype in (dt, torch.bfloat16)
         ),
@@ -1190,7 +1227,7 @@ def _rope_table_cost(*, side: int, channels_head: int) -> Cost:
     coordinates = 6 * side + 14 * positions + channels_head // 4
     return traffic(
         "primal",
-        "elementwise",
+        kernel="elementwise",
         elements=coordinates + angles // 2 + 4 * angles,
         flops=2 * side + 6 * positions + angles // 2 + 2 * angles,
         dtype=torch.bfloat16,

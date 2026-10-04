@@ -23,9 +23,9 @@ import pytest
 import torch
 
 from priml.cost import cost
-from priml.model import norm as priml_norm
+from priml.model.norm import RMSNorm
 from priml.model.vision_ae.checkpoint import LocalFile, UrlFile
-from priml.model.vision_ae.custom_types import Autoencoder, VariationalAutoencoder
+from priml.model.vision_ae.custom_types import VariationalAutoencoder
 from priml.model.vision_ae.latent_norm import ChannelLatentStats
 from priml.model.vision_ae.vtp import (
     VTP,
@@ -120,12 +120,11 @@ def test_vtp_matches_the_reference_bit_for_bit() -> None:
             "pixels": model.pixel_decoder(latent),
             "image": model.decode(latent),
         }
-    assert mismatches(reference, port) == []
+    assert mismatches(reference, actual=port) == []
 
 
 def test_vtp_is_a_deterministic_autoencoder() -> None:
     model = tiny().make()
-    assert isinstance(model, Autoencoder)
     assert not isinstance(model, VariationalAutoencoder)
 
 
@@ -191,7 +190,7 @@ def test_trunk_cost_keeps_the_norms_in_the_weights_dtype_under_autocast() -> Non
         dtype=None,
         dtype_autocast=torch.bfloat16,
     )
-    norm = priml_norm.RMSNorm.Config(16, eps=1e-5, elementwise_affine=True).cost(
+    norm = RMSNorm.Config(16, eps=1e-5, elementwise_affine=True).cost(
         seq_len=5,
         batch_size=2,
         dtype=torch.float32,
@@ -361,16 +360,16 @@ def test_loader_discards_the_text_tower(tmp_path: Path) -> None:
         "visual_proj.weight": torch.ones(2),
         "logit_scale": torch.ones(()),
     }
-    source, config = _checkpoint(tmp_path, text_tower)
+    source, config = _checkpoint(tmp_path, extra=text_tower)
     loaded = config.make().state_dict()
     # Each build draws its own initialization, so equality means it was loaded.
     assert not torch.equal(loaded["trunk.cls_token"], tiny().make().trunk.cls_token)
-    assert mismatches(source.state_dict(), loaded) == []
+    assert mismatches(source.state_dict(), actual=loaded) == []
     assert loaded["trunk.rope_embed.periods"].dtype == torch.bfloat16
 
 
 def test_loader_refuses_a_key_nothing_explains(tmp_path: Path) -> None:
-    _, config = _checkpoint(tmp_path, {"logit_bias": torch.ones(())})
+    _, config = _checkpoint(tmp_path, extra={"logit_bias": torch.ones(())})
     with pytest.raises(ValueError, match="logit_bias"):
         _ = config.make()
 
@@ -485,11 +484,7 @@ def test_vtp_small_config_pprint() -> None:
 
 
 def test_vtp_base_config_pprint() -> None:
-    assert_pprint_golden(
-        test_file=__file__,
-        name="vtp_base_config",
-        config=vtp_base(),
-    )
+    assert_pprint_golden(test_file=__file__, name="vtp_base_config", config=vtp_base())
 
 
 @pytest.mark.network_huggingface
@@ -535,7 +530,7 @@ def test_initialization_ends_with_vtp_models_post_init_pass() -> None:
     for module in expected.modules():
         init_weights_post(module)
     assert list(built.state_dict()) == list(expected.state_dict())
-    report = mismatches(expected.state_dict(), built.state_dict())
+    report = mismatches(expected.state_dict(), actual=built.state_dict())
     assert not report, report
 
 

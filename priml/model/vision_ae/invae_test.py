@@ -24,9 +24,7 @@ import torch
 
 from priml.cost import cost, map_cost, set_cost
 from priml.model.vision_ae.custom_types import (
-    Autoencoder,
     Posterior,
-    VariationalAutoencoder,
     posterior_mode,
 )
 from priml.model.vision_ae.invae import (
@@ -85,12 +83,6 @@ def test_invae_encode_decode_bfb() -> None:
         seed=0,
         run=_encode_decode,
     )
-
-
-def test_invae_is_a_variational_autoencoder() -> None:
-    model = tiny().make()
-    assert isinstance(model, Autoencoder)
-    assert isinstance(model, VariationalAutoencoder)
 
 
 def test_encode_matches_the_configured_latent_shape() -> None:

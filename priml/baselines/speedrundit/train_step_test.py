@@ -55,6 +55,14 @@ class FakeTeacher(nn.Module):
         return feature, feature, feature
 
 
+def test_train_step_updates_model_and_advances_budget() -> None:
+    step = _small_step_config().make()
+    result = step.train_step(**_small_batch(step))
+    assert step.global_step == 1
+    assert result["loss"].shape == (5,)
+    assert torch.isfinite(result["loss"]).all()
+
+
 def _small_step_config() -> SpeedrunTrainStep.Config:
     config = SpeedrunTrainStep.Config()
     config.model = tiny_model().config
@@ -62,7 +70,6 @@ def _small_step_config() -> SpeedrunTrainStep.Config:
     config.parallelism = NoParallel.Config(device="cpu")
     config.ema = NoEMA.Config()
     config.dtype_autocast = None
-    config.compile = None
     config.train_budget_steps = 2
     config.latent_norm = ScaleLatents.Config(scale=0.3099)
     return config
@@ -71,21 +78,11 @@ def _small_step_config() -> SpeedrunTrainStep.Config:
 def _small_batch(step: SpeedrunTrainStep) -> dict[str, object]:
     return step.preprocess_batch(
         {
-            # SpeedrunDiT.forward enforces cfg.in_channels and cfg.input_size.
             "image": torch.zeros(5, 3, 4, 4, dtype=torch.uint8),
-            # SpeedrunDiT.forward enforces cfg.in_channels and cfg.input_size.
             "latent": torch.randn(5, 2, 4, 4),
             "label": torch.tensor([0, 1, 2, 3, 0]),
         },
     )
-
-
-def test_train_step_updates_model_and_advances_budget() -> None:
-    step = _small_step_config().make()
-    result = step.train_step(**_small_batch(step))
-    assert step.global_step == 1
-    assert result["loss"].shape == (5,)
-    assert torch.isfinite(result["loss"]).all()
 
 
 def test_default_ema_supports_replicated_models(tmp_path: Path) -> None:
@@ -249,6 +246,24 @@ def test_train_and_eval_losses_report_every_term_without_updating() -> None:
     )
 
 
+@pytest.mark.compute_training
+def test_exp_smoke_three_steps_bfb() -> None:
+    """Freeze initialization, three forward/backward passes, and weight updates."""
+
+    def run(module: nn.Module, batch: dict[str, Tensor]) -> Tensor:
+        assert isinstance(module, _SmokeSteps)
+        return module(batch)
+
+    assert_bfb_against_golden(
+        golden_dir=_CWD / "testdata",
+        golden_name="exp_smoke",
+        build_module=_SmokeSteps,
+        build_input=_smoke_input,
+        seed=0,
+        run=run,
+    )
+
+
 class _SmokeSteps(nn.Module):
     """Expose three updates with the smoke recipe at small test dimensions."""
 
@@ -294,34 +309,15 @@ class _SmokeSteps(nn.Module):
         return torch.stack(losses)
 
 
-@pytest.mark.compute_training
-def test_exp_smoke_three_steps_bfb() -> None:
-    """Freeze initialization, three forward/backward passes, and weight updates."""
-
-    def build_input() -> dict[str, Tensor]:
-        return {
-            # SpeedrunDiT.forward enforces cfg.in_channels and cfg.input_size.
-            "image": torch.zeros(5, 3, 4, 4, dtype=torch.uint8),
-            # SpeedrunDiT.forward enforces cfg.in_channels and cfg.input_size.
-            "latent": torch.arange(5 * 2 * 4 * 4, dtype=torch.float32)
-            .reshape(5, 2, 4, 4)
-            .remainder(97)
-            .div(97),
-            "label": torch.tensor([0, 1, 2, 3, 0]),
-        }
-
-    def run(module: nn.Module, batch: dict[str, Tensor]) -> Tensor:
-        assert isinstance(module, _SmokeSteps)
-        return module(batch)
-
-    assert_bfb_against_golden(
-        golden_dir=_CWD / "testdata",
-        golden_name="exp_smoke",
-        build_module=_SmokeSteps,
-        build_input=build_input,
-        seed=0,
-        run=run,
-    )
+def _smoke_input() -> dict[str, Tensor]:
+    return {
+        "image": torch.zeros(5, 3, 4, 4, dtype=torch.uint8),
+        "latent": torch.arange(5 * 2 * 4 * 4, dtype=torch.float32)
+        .reshape(5, 2, 4, 4)
+        .remainder(97)
+        .div(97),
+        "label": torch.tensor([0, 1, 2, 3, 0]),
+    }
 
 
 if __name__ == "__main__":

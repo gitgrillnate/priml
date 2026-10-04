@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib import parse
 
 import hashlib
 import re
-import urllib.parse
 
 from configgle import Fig
 
@@ -59,7 +59,7 @@ class HubFile:
                 "HubFile needs a pinned revision, a 40-digit lowercase commit SHA; "
                 f"got {config.revision!r}.",
             )
-        _require_digest("HubFile", config.sha256)
+        _require_digest("HubFile", digest=config.sha256)
         self.config = config
 
     def path(self) -> Path:
@@ -79,7 +79,7 @@ class HubFile:
                 revision=self.config.revision,
             ),
         )
-        verify_sha256(path, self.config.sha256)
+        verify_sha256(path, expected=self.config.sha256)
         return path
 
     def identity(self) -> dict[str, str]:
@@ -114,10 +114,10 @@ class UrlFile:
             raise ValueError(
                 f"UrlFile needs an https URL and a sha256; got {config.url!r}.",
             )
-        _require_digest("UrlFile", config.sha256)
+        _require_digest("UrlFile", digest=config.sha256)
         # The cached copy is named for the URL path's last segment alone: a query
         # string can carry a token, or outrun the file-name limit.
-        self.filename = urllib.parse.urlsplit(config.url).path.rsplit("/", 1)[-1]
+        self.filename = parse.urlsplit(config.url).path.rsplit("/", 1)[-1]
         if self.filename in {"", ".", ".."}:
             raise ValueError(f"UrlFile needs a URL naming a file; got {config.url!r}.")
         self.config = config
@@ -172,7 +172,7 @@ class LocalFile:
     def __init__(self, config: Config) -> None:
         if not str(config.path):
             raise ValueError("LocalFile needs a path.")
-        _require_digest("LocalFile", config.sha256)
+        _require_digest("LocalFile", digest=config.sha256)
         self.config = config
 
     def path(self) -> Path:
@@ -189,7 +189,7 @@ class LocalFile:
         path = Path(self.config.path)
         if not path.is_file():
             raise FileNotFoundError(f"Checkpoint {path} does not exist.")
-        verify_sha256(path, self.config.sha256)
+        verify_sha256(path, expected=self.config.sha256)
         return path
 
     def identity(self) -> dict[str, str]:

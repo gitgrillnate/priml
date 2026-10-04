@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import TYPE_CHECKING, Final, cast
 
 import importlib
@@ -16,6 +16,7 @@ import torch
 
 from priml.model.vision_ae.scripts import reference_parity
 from priml.model.vision_ae.scripts.reference_parity import (
+    Outcome,
     PinnedRandom,
     Reference,
     clone_upstream,
@@ -24,16 +25,15 @@ from priml.model.vision_ae.scripts.reference_parity import (
     measure,
 )
 
-import priml
-
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from torch import Tensor
 
-    from priml.model.vision_ae.scripts.reference_parity import Outcome
 
-
-_PORT_ROOT: Final = Path(priml.__file__).resolve().parent
+_THIS: Final = Path(__file__).resolve()
+_PORT_ROOT: Final = _THIS.parents[3]
 
 
 def test_module_imports_without_test_only_or_optional_dependencies(
@@ -54,7 +54,7 @@ def test_pinned_random_refuses_a_draw_inside_a_native_kernel() -> None:
 
 
 def test_pinned_random_lets_attention_without_dropout_run() -> None:
-    """The fused attention kernels are seeded for their dropout; at zero they draw nothing."""
+    """Fused attention is seeded for its dropout; at zero it draws nothing."""
     q = torch.ones(1, 1, 2, 4)
     with PinnedRandom([]):
         _ = functional.scaled_dot_product_attention(q, q, q)
@@ -70,7 +70,7 @@ def test_pinned_random_serves_randn_however_it_is_spelled() -> None:
     assert drawn.dtype == torch.bfloat16
     assert torch.equal(drawn, second.bfloat16())
     assert sum(pinned.sites.values()) == 2
-    assert {site.split(":")[0] for site in pinned.sites} == {Path(__file__).name}
+    assert {site.split(":")[0] for site in pinned.sites} == {_THIS.name}
 
 
 def test_pinned_random_requires_every_draw_taken() -> None:
@@ -96,7 +96,7 @@ def test_definitions_reach_into_compound_statements(tmp_path: Path) -> None:
         "    def opened():\n"
         "        return 3\n",
     )
-    keys = [d.key for d in definitions(tmp_path, "module.py")]
+    keys = [d.key for d in definitions(tmp_path, relative="module.py")]
     assert keys == [
         "module.py::guarded",
         "module.py::Tried",
@@ -108,7 +108,7 @@ def test_definitions_reach_into_compound_statements(tmp_path: Path) -> None:
 def test_inventory_checks_branches_in_paired_math_helpers(tmp_path: Path) -> None:
     """``rgb2float`` is port code like any ``model/vision_ae`` function."""
     pixel = _PORT_ROOT / "math" / "pixel.py"
-    line = _line_of(pixel, "if unit_interval:")
+    line = _line_of(pixel, text="if unit_interval:")
     reference = _reference(tmp_path, paired=("math/pixel.py::rgb2float",))
     measured = _Measured({str(pixel): {line: (2, 1)}})
     problems = inventory_problems(reference, clone=tmp_path, measured=measured)
@@ -120,8 +120,8 @@ def test_inventory_checks_branches_in_paired_math_helpers(tmp_path: Path) -> Non
 def test_an_allowlist_entry_silences_only_its_own_definition(tmp_path: Path) -> None:
     """``Upsample`` tests ``if self.with_conv:`` twice; allowing one keeps the other."""
     invae = _PORT_ROOT / "model" / "vision_ae" / "invae.py"
-    built = _line_of(invae, "if self.with_conv:")
-    run = _line_of(invae, "if self.with_conv:", after=built + 1)
+    built = _line_of(invae, text="if self.with_conv:")
+    run = _line_of(invae, text="if self.with_conv:", after=built + 1)
     reference = _reference(
         tmp_path,
         paired=(
@@ -153,8 +153,8 @@ def test_each_comparison_is_measured_on_its_own(
         SimpleNamespace(Coverage=_Coverage),
     )
     first, second = _reference(tmp_path / "a"), _reference(tmp_path / "b")
-    _, measured_first = measure(first, _run, clone=tmp_path / "a", work=tmp_path)
-    _, measured_second = measure(second, _run, clone=tmp_path / "b", work=tmp_path)
+    _, measured_first = measure(first, run=_run, clone=tmp_path / "a", work=tmp_path)
+    _, measured_second = measure(second, run=_run, clone=tmp_path / "b", work=tmp_path)
     assert isinstance(measured_first, _Coverage)
     assert isinstance(measured_second, _Coverage)
     assert measured_first is not measured_second
@@ -171,14 +171,20 @@ def test_a_failed_git_command_reports_its_stderr(
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     (tmp_path / "clone" / ".git").mkdir(parents=True)
     with pytest.raises(RuntimeError, match="not a git repository"):
-        _ = clone_upstream(_reference(tmp_path), tmp_path / "clone")
+        _ = clone_upstream(_reference(tmp_path), root=tmp_path / "clone")
+
+
+def _line_of(path: Path, text: str, *, after: int = 1) -> int:
+    """Return the first line at or after ``after`` whose stripped text is ``text``."""
+    lines = path.read_text().splitlines()
+    return next(i for i in range(after, len(lines) + 1) if lines[i - 1].strip() == text)
 
 
 def _reference(
     clone: Path,
     *,
     paired: tuple[str, ...] = (),
-    port_unreached: dict[str, str] | None = None,
+    port_unreached: Mapping[str, str] = MappingProxyType({}),
 ) -> Reference:
     """Return a one-function reference in ``clone`` paired with ``paired``."""
     clone.mkdir(parents=True, exist_ok=True)
@@ -190,23 +196,9 @@ def _reference(
         paired={"ref.py::f": paired} if paired else {},
         not_ported={} if paired else {"ref.py::f": "Unused here."},
         reference_unreached={},
-        port_unreached=port_unreached or {},
+        port_unreached=port_unreached,
         extra_outputs={},
     )
-
-
-def _line_of(path: Path, text: str, *, after: int = 1) -> int:
-    """Return the first line at or after ``after`` whose stripped text is ``text``."""
-    lines = path.read_text().splitlines()
-    return next(i for i in range(after, len(lines) + 1) if lines[i - 1].strip() == text)
-
-
-class _Lines:
-    """Every file ran every line."""
-
-    def lines(self, filename: str) -> list[int] | None:
-        del filename
-        return list(range(1, 10_000))
 
 
 class _Measured:
@@ -220,6 +212,14 @@ class _Measured:
 
     def branch_stats(self, morf: str) -> dict[int, tuple[int, int]]:
         return self._branches.get(morf, {})
+
+
+class _Lines:
+    """Every file ran every line."""
+
+    def lines(self, filename: str) -> list[int] | None:
+        del filename
+        return list(range(1, 10_000))
 
 
 class _Coverage:
@@ -248,7 +248,7 @@ def _run(clone: Path, work: Path) -> Outcome:
     del clone, work
     assert _Coverage.running is not None
     _Coverage.running.events.append("run")
-    return reference_parity.Outcome(problems=[])
+    return Outcome(problems=[])
 
 
 if __name__ == "__main__":

@@ -52,7 +52,16 @@ def nonlinearity(x: Tensor) -> Tensor:
 
 
 def Normalize(in_channels: int, num_groups: int = 32) -> nn.GroupNorm:  # noqa: N802 -- The reference's name, which reference_parity.py pairs by.
-    """Build the reference's affine GroupNorm, epsilon 1e-6."""
+    """Build the reference's affine GroupNorm, epsilon 1e-6.
+
+    Args:
+      in_channels: Channels normalized.
+      num_groups: Groups the channels are split into; must divide ``in_channels``.
+
+    Returns:
+      norm: The GroupNorm module.
+
+    """
     return torch.nn.GroupNorm(
         num_groups=num_groups,
         num_channels=in_channels,
@@ -130,7 +139,7 @@ class ResnetBlock(nn.Module):
         self.out_channels = out_channels
         self.use_conv_shortcut = conv_shortcut
 
-        self.norm1 = Normalize(in_channels, num_groups)
+        self.norm1 = Normalize(in_channels, num_groups=num_groups)
         self.conv1 = torch.nn.Conv2d(
             in_channels,
             out_channels,
@@ -140,7 +149,7 @@ class ResnetBlock(nn.Module):
         )
         if temb_channels > 0:
             self.temb_proj = torch.nn.Linear(temb_channels, out_channels)
-        self.norm2 = Normalize(out_channels, num_groups)
+        self.norm2 = Normalize(out_channels, num_groups=num_groups)
         self.dropout = torch.nn.Dropout(dropout)
         self.conv2 = torch.nn.Conv2d(
             out_channels,
@@ -198,7 +207,7 @@ class AttnBlock(nn.Module):
         super().__init__()
         self.in_channels = in_channels
 
-        self.norm = Normalize(in_channels, num_groups)
+        self.norm = Normalize(in_channels, num_groups=num_groups)
         self.q = torch.nn.Conv2d(
             in_channels,
             in_channels,
@@ -236,7 +245,6 @@ class AttnBlock(nn.Module):
         k = self.k(h_)
         v = self.v(h_)
 
-        # Compute attention.
         b, c, h, w = q.shape
         q = q.reshape(b, c, h * w)
         q = q.permute(0, 2, 1)  # b,hw,c.
@@ -245,13 +253,10 @@ class AttnBlock(nn.Module):
         w_ = w_ * (int(c) ** (-0.5))
         w_ = torch.nn.functional.softmax(w_, dim=2)
 
-        # Attend to values.
         v = v.reshape(b, c, h * w)
         w_ = w_.permute(0, 2, 1)  # b,hw,hw (first hw of k, second of q)
-        h_ = torch.bmm(
-            v,
-            w_,
-        )  # `b`, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j].
+        # `b`, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j].
+        h_ = torch.bmm(v, w_)
         h_ = h_.reshape(b, c, h, w)
 
         h_ = self.proj_out(h_)
@@ -266,7 +271,7 @@ class Encoder(nn.Module):
         self,
         *,
         ch: int = 128,
-        out_ch: int = 3,  # noqa: ARG002 -- The reference's signature, which takes its whole ``ddconfig``.
+        out_ch: int = 3,
         ch_mult: tuple[int, ...] = (1, 1, 2, 2, 4),
         num_res_blocks: int = 2,
         attn_resolutions: tuple[int, ...] = (16,),
@@ -277,8 +282,10 @@ class Encoder(nn.Module):
         z_channels: int = 16,
         double_z: bool = True,
         num_groups: int = 32,
-        **ignore_kwargs: object,  # noqa: ARG002 -- The reference's signature, which takes its whole ``ddconfig``.
+        **ignore_kwargs: object,
     ) -> None:
+        # The reference's signature, which takes its whole ``ddconfig``.
+        del out_ch, ignore_kwargs
         super().__init__()
         self.ch = ch
         self.temb_ch = 0
@@ -287,7 +294,6 @@ class Encoder(nn.Module):
         self.resolution = resolution
         self.in_channels = in_channels
 
-        # Downsampling.
         self.conv_in = torch.nn.Conv2d(
             in_channels,
             self.ch,
@@ -317,16 +323,15 @@ class Encoder(nn.Module):
                 )
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(AttnBlock(block_in, num_groups))
+                    attn.append(AttnBlock(block_in, num_groups=num_groups))
             down = nn.Module()
             down.block = block
             down.attn = attn
             if i_level != self.num_resolutions - 1:
-                down.downsample = Downsample(block_in, resamp_with_conv)
+                down.downsample = Downsample(block_in, with_conv=resamp_with_conv)
                 curr_res = curr_res // 2
             self.down.append(down)
 
-        # Middle.
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(
             in_channels=block_in,
@@ -335,7 +340,7 @@ class Encoder(nn.Module):
             num_groups=num_groups,
             dropout=dropout,
         )
-        self.mid.attn_1 = AttnBlock(block_in, num_groups)
+        self.mid.attn_1 = AttnBlock(block_in, num_groups=num_groups)
         self.mid.block_2 = ResnetBlock(
             in_channels=block_in,
             out_channels=block_in,
@@ -344,8 +349,7 @@ class Encoder(nn.Module):
             dropout=dropout,
         )
 
-        # End.
-        self.norm_out = Normalize(block_in, num_groups)
+        self.norm_out = Normalize(block_in, num_groups=num_groups)
         self.conv_out = torch.nn.Conv2d(
             block_in,
             2 * z_channels if double_z else z_channels,
@@ -356,17 +360,15 @@ class Encoder(nn.Module):
 
     @override
     def forward(self, x: Tensor) -> Tensor:
-        # Timestep embedding.
         temb = None
 
-        # Downsampling.
         hs = [self.conv_in(x)]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
                 h = cast(
                     "ResnetBlock",
                     cast("_Stage", self.down[i_level]).block[i_block],
-                )(hs[-1], temb)
+                )(hs[-1], temb=temb)
                 if len(cast("_Stage", self.down[i_level]).attn) > 0:
                     h = cast(
                         "AttnBlock",
@@ -376,13 +378,11 @@ class Encoder(nn.Module):
             if i_level != self.num_resolutions - 1:
                 hs.append(cast("_DownStage", self.down[i_level]).downsample(hs[-1]))
 
-        # Middle.
         h = hs[-1]
-        h = cast("_Middle", self.mid).block_1(h, temb)
+        h = cast("_Middle", self.mid).block_1(h, temb=temb)
         h = cast("_Middle", self.mid).attn_1(h)
-        h = cast("_Middle", self.mid).block_2(h, temb)
+        h = cast("_Middle", self.mid).block_2(h, temb=temb)
 
-        # End.
         h = self.norm_out(h)
         h = nonlinearity(h)
         return self.conv_out(h)
@@ -406,8 +406,10 @@ class Decoder(nn.Module):
         z_channels: int = 16,
         give_pre_end: bool = False,
         num_groups: int = 32,
-        **ignore_kwargs: object,  # noqa: ARG002 -- The reference's signature, which takes its whole ``ddconfig``.
+        **ignore_kwargs: object,
     ) -> None:
+        # The reference's signature, which takes its whole ``ddconfig``.
+        del ignore_kwargs
         super().__init__()
         self.ch = ch
         self.temb_ch = 0
@@ -417,12 +419,10 @@ class Decoder(nn.Module):
         self.in_channels = in_channels
         self.give_pre_end = give_pre_end
 
-        # Compute block_in and curr_res at lowest res.
         block_in = ch * ch_mult[self.num_resolutions - 1]
         curr_res = resolution // 2 ** (self.num_resolutions - 1)
         self.z_shape = (1, z_channels, curr_res, curr_res)
 
-        # `z` to block_in.
         self.conv_in = torch.nn.Conv2d(
             z_channels,
             block_in,
@@ -431,7 +431,6 @@ class Decoder(nn.Module):
             padding=1,
         )
 
-        # Middle.
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(
             in_channels=block_in,
@@ -440,7 +439,7 @@ class Decoder(nn.Module):
             num_groups=num_groups,
             dropout=dropout,
         )
-        self.mid.attn_1 = AttnBlock(block_in, num_groups)
+        self.mid.attn_1 = AttnBlock(block_in, num_groups=num_groups)
         self.mid.block_2 = ResnetBlock(
             in_channels=block_in,
             out_channels=block_in,
@@ -449,7 +448,6 @@ class Decoder(nn.Module):
             dropout=dropout,
         )
 
-        # Upsampling.
         self.last_z_shape: torch.Size | None = None
         self.up = nn.ModuleList()
         for i_level in reversed(range(self.num_resolutions)):
@@ -468,17 +466,16 @@ class Decoder(nn.Module):
                 )
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(AttnBlock(block_in, num_groups))
+                    attn.append(AttnBlock(block_in, num_groups=num_groups))
             up = nn.Module()
             up.block = block
             up.attn = attn
             if i_level != 0:
-                up.upsample = Upsample(block_in, resamp_with_conv)
+                up.upsample = Upsample(block_in, with_conv=resamp_with_conv)
                 curr_res = curr_res * 2
             self.up.insert(0, up)  # Prepend to get consistent order.
 
-        # End.
-        self.norm_out = Normalize(block_in, num_groups)
+        self.norm_out = Normalize(block_in, num_groups=num_groups)
         self.conv_out = torch.nn.Conv2d(
             block_in,
             out_ch,
@@ -491,24 +488,20 @@ class Decoder(nn.Module):
     def forward(self, z: Tensor) -> Tensor:
         self.last_z_shape = z.shape
 
-        # Timestep embedding.
         temb = None
 
-        # `z` to block_in.
         h = self.conv_in(z)
 
-        # Middle.
-        h = cast("_Middle", self.mid).block_1(h, temb)
+        h = cast("_Middle", self.mid).block_1(h, temb=temb)
         h = cast("_Middle", self.mid).attn_1(h)
-        h = cast("_Middle", self.mid).block_2(h, temb)
+        h = cast("_Middle", self.mid).block_2(h, temb=temb)
 
-        # Upsampling.
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
                 h = cast(
                     "ResnetBlock",
                     cast("_Stage", self.up[i_level]).block[i_block],
-                )(h, temb)
+                )(h, temb=temb)
                 if len(cast("_Stage", self.up[i_level]).attn) > 0:
                     h = cast(
                         "AttnBlock",
@@ -517,7 +510,6 @@ class Decoder(nn.Module):
             if i_level != 0:
                 h = cast("_UpStage", self.up[i_level]).upsample(h)
 
-        # End.
         if self.give_pre_end:
             return h
 
@@ -660,50 +652,68 @@ class INVAE(nn.Module):
             pixels = batch_size * 3 * side * side
             latents = batch_size * math.prod(self.latent_shape())
 
-            encoder = layers.conv(3, ch, side, kernel_size=3)
+            encoder = layers.conv(3, channels_out=ch, side=side, kernel_size=3)
             block_in = ch
             for level, m_out in enumerate(mult):
                 block_in = ch * (mult[level - 1] if level else 1)
                 for _ in range(blocks):
-                    encoder += layers.resnet(block_in, ch * m_out, side)
+                    encoder += layers.resnet(
+                        block_in,
+                        channels_out=ch * m_out,
+                        side=side,
+                    )
                     block_in = ch * m_out
                     if side == _ATTENTION_SIDE:
-                        encoder += layers.attention(block_in, side)
+                        encoder += layers.attention(block_in, side=side)
                 if level != len(mult) - 1:
-                    encoder += layers.downsample(block_in, side)
+                    encoder += layers.downsample(block_in, side=side)
                     side //= 2
-            encoder += layers.middle(block_in, side) + layers.head(
+            encoder += layers.middle(block_in, side=side) + layers.head(
                 block_in,
-                2 * z,
-                side,
+                channels_out=2 * z,
+                side=side,
             )
 
             block_in = ch * mult[-1]
-            decoder = layers.conv(z, block_in, side, kernel_size=3)
-            decoder += layers.middle(block_in, side)
+            decoder = layers.conv(z, channels_out=block_in, side=side, kernel_size=3)
+            decoder += layers.middle(block_in, side=side)
             for level in reversed(range(len(mult))):
                 for _ in range(blocks + 1):
-                    decoder += layers.resnet(block_in, ch * mult[level], side)
+                    decoder += layers.resnet(
+                        block_in,
+                        channels_out=ch * mult[level],
+                        side=side,
+                    )
                     block_in = ch * mult[level]
                     if side == _ATTENTION_SIDE:
-                        decoder += layers.attention(block_in, side)
+                        decoder += layers.attention(block_in, side=side)
                 if level != 0:
-                    decoder += layers.upsample(block_in, side)
+                    decoder += layers.upsample(block_in, side=side)
                     side *= 2
-            decoder += layers.head(block_in, 3, side)
+            decoder += layers.head(block_in, channels_out=3, side=side)
 
             latent_side = self.latent_shape()[1]
             f32 = torch.float32
             wrapper = (
                 # ``image.float() / 127.5 - 1`` in.
-                traffic("primal", "elementwise", elements=pixels, dtype=torch.uint8)
-                + traffic("primal", "elementwise", elements=pixels, dtype=f32)
+                traffic(
+                    "primal",
+                    kernel="elementwise",
+                    elements=pixels,
+                    dtype=torch.uint8,
+                )
+                + traffic("primal", kernel="elementwise", elements=pixels, dtype=f32)
                 + _pointwise(pixels, flops=1, dtype=f32).tile(2)
                 # ``(x + 1) / 2`` and a two-sided clamp out.
                 + _pointwise(pixels, flops=1, dtype=dtype).tile(2)
                 + _pointwise(pixels, flops=2, dtype=dtype)
-                + layers.conv(2 * z, 2 * z, latent_side, kernel_size=1)
-                + layers.conv(z, z, latent_side, kernel_size=1)
+                + layers.conv(
+                    2 * z,
+                    channels_out=2 * z,
+                    side=latent_side,
+                    kernel_size=1,
+                )
+                + layers.conv(z, channels_out=z, side=latent_side, kernel_size=1)
                 # Clamp logvar; ``exp(0.5 * logvar)`` and ``exp(logvar)``.
                 + _pointwise(latents, flops=2, dtype=dtype)
                 + _pointwise(latents, flops=1, dtype=dtype).tile(3)
@@ -832,7 +842,20 @@ class _Layers:
         stride: int = 1,
         padding: int | None = None,
     ) -> Cost:
-        """Cost a biased convolution on a square grid; ``None`` pads same."""
+        """Cost a biased convolution on a square grid.
+
+        Args:
+          channels_in: Input channels.
+          channels_out: Output channels.
+          side: Input grid side.
+          kernel_size: Kernel side.
+          stride: Step between applications.
+          padding: Zero padding per side; ``None`` pads same.
+
+        Returns:
+          cost: The convolution's ledger.
+
+        """
         return conv_cost(
             channels_in=channels_in,
             channels_out=channels_out,
@@ -848,7 +871,16 @@ class _Layers:
         )
 
     def norm(self, channels: int, side: int) -> Cost:
-        """Cost ``Normalize``, an affine GroupNorm."""
+        """Cost ``Normalize``, an affine GroupNorm.
+
+        Args:
+          channels: Channels normalized.
+          side: Grid side.
+
+        Returns:
+          cost: The norm's ledger.
+
+        """
         return cost(
             GroupNorm2d.Config(
                 channels,
@@ -861,27 +893,64 @@ class _Layers:
         )
 
     def resnet(self, channels_in: int, channels_out: int, side: int) -> Cost:
-        """Cost ``ResnetBlock`` without a time embedding."""
+        """Cost ``ResnetBlock`` without a time embedding.
+
+        Args:
+          channels_in: Input channels.
+          channels_out: Output channels.
+          side: Grid side.
+
+        Returns:
+          cost: The block's ledger, its shortcut projection included.
+
+        """
         elements_in = self.batch_size * channels_in * side * side
         elements_out = self.batch_size * channels_out * side * side
         block = (
-            self.norm(channels_in, side)
+            self.norm(channels_in, side=side)
             + _swish(elements_in, dtype=self.dtype)
-            + self.conv(channels_in, channels_out, side, kernel_size=3)
-            + self.norm(channels_out, side)
+            + self.conv(
+                channels_in,
+                channels_out=channels_out,
+                side=side,
+                kernel_size=3,
+            )
+            + self.norm(channels_out, side=side)
             + _swish(elements_out, dtype=self.dtype)
-            + self.conv(channels_out, channels_out, side, kernel_size=3)
+            + self.conv(
+                channels_out,
+                channels_out=channels_out,
+                side=side,
+                kernel_size=3,
+            )
             + _pointwise(elements_out, flops=1, inputs=2, dtype=self.dtype)
         )
         if channels_in != channels_out:
-            block += self.conv(channels_in, channels_out, side, kernel_size=1)
+            block += self.conv(
+                channels_in,
+                channels_out=channels_out,
+                side=side,
+                kernel_size=1,
+            )
         return block
 
     def attention(self, channels: int, side: int) -> Cost:
-        """Cost ``AttnBlock``: single-head attention over the grid."""
+        """Cost ``AttnBlock``: single-head attention over the grid.
+
+        Args:
+          channels: Channels attended over.
+          side: Grid side.
+
+        Returns:
+          cost: The block's ledger.
+
+        """
         return (
-            self.norm(channels, side)
-            + self.conv(channels, channels, side, kernel_size=1).tile(4, copies=4)
+            self.norm(channels, side=side)
+            + self.conv(channels, channels_out=channels, side=side, kernel_size=1).tile(
+                4,
+                copies=4,
+            )
             + attention_kernel_cost(
                 seq_len=side * side,
                 batch_size=self.batch_size,
@@ -899,39 +968,79 @@ class _Layers:
 
     def middle(self, channels: int, side: int) -> Cost:
         """Cost the ``mid`` stage: block, attention, block."""
-        return self.resnet(channels, channels, side).tile(2, copies=2) + self.attention(
-            channels,
-            side,
-        )
+        return self.resnet(channels, channels_out=channels, side=side).tile(
+            2,
+            copies=2,
+        ) + self.attention(channels, side=side)
 
     def head(self, channels_in: int, channels_out: int, side: int) -> Cost:
-        """Cost ``norm_out``, swish, and ``conv_out``."""
+        """Cost ``norm_out``, swish, and ``conv_out``.
+
+        Args:
+          channels_in: Input channels.
+          channels_out: Output channels.
+          side: Grid side.
+
+        Returns:
+          cost: The head's ledger.
+
+        """
         return (
-            self.norm(channels_in, side)
+            self.norm(channels_in, side=side)
             + _swish(self.batch_size * channels_in * side * side, dtype=self.dtype)
-            + self.conv(channels_in, channels_out, side, kernel_size=3)
+            + self.conv(
+                channels_in,
+                channels_out=channels_out,
+                side=side,
+                kernel_size=3,
+            )
         )
 
     def downsample(self, channels: int, side: int) -> Cost:
-        """Cost ``Downsample``: a one-sided zero pad, then a stride-2 conv."""
+        """Cost ``Downsample``: a one-sided zero pad, then a stride-2 conv.
+
+        Args:
+          channels: Channels resampled.
+          side: Input grid side.
+
+        Returns:
+          cost: The pad's traffic and the convolution's ledger.
+
+        """
         elements = self.batch_size * channels * side * side
         padded = self.batch_size * channels * (side + 1) ** 2
         return traffic(
             "primal",
-            "elementwise",
+            kernel="elementwise",
             elements=elements + padded,
             dtype=self.dtype,
-        ) + self.conv(channels, channels, side + 1, kernel_size=3, stride=2, padding=0)
+        ) + self.conv(
+            channels,
+            channels_out=channels,
+            side=side + 1,
+            kernel_size=3,
+            stride=2,
+            padding=0,
+        )
 
     def upsample(self, channels: int, side: int) -> Cost:
-        """Cost ``Upsample``: nearest-neighbour doubling, then a conv."""
+        """Cost ``Upsample``: nearest-neighbour doubling, then a conv.
+
+        Args:
+          channels: Channels resampled.
+          side: Input grid side.
+
+        Returns:
+          cost: The interpolation's traffic and the convolution's ledger.
+
+        """
         elements = self.batch_size * channels * side * side
         return traffic(
             "primal",
-            "elementwise",
+            kernel="elementwise",
             elements=5 * elements,
             dtype=self.dtype,
-        ) + self.conv(channels, channels, 2 * side, kernel_size=3)
+        ) + self.conv(channels, channels_out=channels, side=2 * side, kernel_size=3)
 
 
 def _swish(elements: int, *, dtype: torch.dtype | None) -> Cost:

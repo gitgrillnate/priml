@@ -91,9 +91,8 @@ def exp000() -> SpeedrunTrainLoop:
     config.study_name = "speedrundit"
     config.experiment_name = "exp000"
     config.max_steps = config.step.train_budget_steps = 400_000
-    config.num_steps_eval = (
-        math.inf
-    )  # The reference evaluates generated images separately.
+    # The reference evaluates generated images separately.
+    config.num_steps_eval = math.inf
     config.eval_every_epoch = False
     config.seed = 0
     config.runtime = MultiProcess.Config(float32_matmul_precision="high")
@@ -106,8 +105,22 @@ def exp000() -> SpeedrunTrainLoop:
 def exp001() -> SpeedrunTrainLoop:
     """Keep exp000's algorithm with shared, simpler floating-point arithmetic.
 
-    The fixed position table is computed in float32 and Muon uses the shared
-    fused Newton-Schulz update. These are small numerical changes only.
+    The fixed position table is computed in float32, attention applies rotary
+    factors with the shared fused ``RoPE.rotate`` instead of REG's unfused
+    multiplication order, and Muon uses the shared fused Newton-Schulz update.
+
+    Hypothesis:
+      The three swaps are one change: each replaces REG's operation order with
+      priml's shared implementation of the same arithmetic. They differ only in
+      rounding, so the trained model matches exp000's within seed variance
+      while dropping REG-only code paths.
+
+    References:
+      https://kellerjordan.github.io/posts/muon/
+
+    Results:
+      TBD.
+
     """
     config = exp000()
     config.experiment_name = "exp001"
