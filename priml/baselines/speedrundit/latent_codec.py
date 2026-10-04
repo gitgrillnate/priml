@@ -100,8 +100,16 @@ class FloatCodec:
         """``float32`` is the identity; ``float16`` or ``bfloat16`` halve storage."""
 
     def __init__(self, config: Config) -> None:
-        if not config.dtype.is_floating_point:
-            raise ValueError(f"FloatCodec needs a floating dtype; got {config.dtype}.")
+        # The corpus stores ``.npy`` files; bfloat16 rides as its int16 bit pattern.
+        if config.dtype not in {
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        }:
+            raise ValueError(
+                f"FloatCodec stores float16, bfloat16, float32 or float64; got {config.dtype}.",
+            )
         self.stored_dtype = config.dtype
 
     def encode(self, latent: Tensor, /) -> Tensor:
@@ -236,8 +244,9 @@ class LinearFit:
         """Span ``mean +- clip_sigmas * std``; ``None`` spans min to max."""
 
     def __init__(self, config: Config) -> None:
-        if config.clip_sigmas is not None and config.clip_sigmas <= 0:
-            raise ValueError("clip_sigmas must be positive.")
+        clip = config.clip_sigmas
+        if clip is not None and (math.isnan(clip) or math.isinf(clip) or clip <= 0):
+            raise ValueError(f"clip_sigmas must be positive and finite; got {clip}.")
         self.clip_sigmas = config.clip_sigmas
 
     def __call__(self, values: Tensor, /) -> Tensor:
@@ -335,8 +344,8 @@ class ScalarTableCodec:
 
     Encoding picks each value's nearest level (ties to the lower one) and
     saturates past the outermost levels; decoding is a table lookup. Tables are
-    float32; the boundaries between levels are stored with them, so encoding
-    reproduces exactly the cells the fit used.
+    float32 levels; the boundaries between them are their midpoints, recomputed
+    on load, so encoding reproduces exactly the cells the fit used.
     """
 
     class Config(Fig["ScalarTableCodec"]):
@@ -368,11 +377,15 @@ class ScalarTableCodec:
           sample: ``[N, C, H, W]`` raw latents.
 
         Raises:
-          ValueError: The sample is not 4-D or not finite.
+          ValueError: The sample is not 4-D, holds fewer than two values per
+            channel (no spread to scale a table by), or yields non-finite levels.
 
         """
-        if sample.ndim != 4:
-            raise ValueError(f"fit expects [N, C, H, W]; got {tuple(sample.shape)}.")
+        if sample.ndim != 4 or sample[:, :1].numel() < 2:
+            raise ValueError(
+                "fit expects [N, C, H, W] with at least two values per channel; "
+                f"got {tuple(sample.shape)}.",
+            )
         channels = sample.shape[1]
         scale = torch.stack([sample[:, c].double().std() for c in range(channels)])
         groups = self.groups(scale)
@@ -386,42 +399,44 @@ class ScalarTableCodec:
             members = (groups == group).nonzero().flatten()
             values = sample[:, members].reshape(-1)
             levels[members] = self.fit_levels(values).float()
-        self.load_table({"levels": levels, "thresholds": midpoints(levels)})
+        self.load_table({"levels": levels})
 
     def table(self) -> dict[str, Tensor]:
         """Return the fitted table.
 
         Returns:
-          table: ``levels`` ``[C, 256]`` and ``thresholds`` ``[C, 255]``, float32.
+          table: ``levels``, ``[C, 256]`` float32.
 
         Raises:
           RuntimeError: The codec was never fitted or loaded.
 
         """
-        levels, thresholds = self._fitted()
-        return {"levels": levels.clone(), "thresholds": thresholds.clone()}
+        levels, _ = self._fitted()
+        return {"levels": levels.clone()}
 
     def load_table(self, table: Mapping[str, Tensor], /) -> None:
         """Restore a fitted table.
 
+        A table is restored once per fit or load, never per batch, so reading
+        its values here costs one synchronization, not one per kernel.
+
         Args:
-          table: Finite, sorted ``levels`` and their midpoint ``thresholds``,
-            as :meth:`table` returns them. Corpus I/O audits persisted values.
+          table: ``levels`` as :meth:`table` returns them.
 
         Raises:
-          ValueError: The table has incompatible shapes.
+          ValueError: The levels are not ``[C, 256]``, not finite, or decrease
+            within a row.
 
         """
         levels = table["levels"].float()
-        thresholds = table["thresholds"].float()
         if levels.ndim != 2 or levels.shape[1] != NUM_LEVELS:
             raise ValueError(
                 f"levels must be [C, {NUM_LEVELS}]; got {tuple(levels.shape)}.",
             )
-        if thresholds.shape != (levels.shape[0], NUM_LEVELS - 1):
-            raise ValueError("thresholds must be [C, 255], one row per level row.")
+        if not bool(torch.isfinite(levels).all()) or bool((levels.diff() < 0).any()):
+            raise ValueError("levels must be finite and non-decreasing in every row.")
         self.levels = levels
-        self.thresholds = thresholds
+        self.thresholds = midpoints(levels)
 
     def encode(self, latent: Tensor, /) -> Tensor:
         """Return each scalar's nearest-level index.

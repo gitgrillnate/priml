@@ -13,9 +13,9 @@ All notable priml changes are documented here. This project follows
   adds `posterior`; the latent a variational `encode` returns is the config's
   `latent_fn` (`posterior_sample` or `posterior_mode`). Implementations:
   `INVAE`, `VTP` (`vtp_small`, `vtp_base`, `vtp_large`), and `RAE`
-  (`rae_dinov2_base`),
-  each config defaulting to its published checkpoint. Checkpoints are config
-  nodes (`HubFile`, `UrlFile`, `LocalFile`) pinned to a revision and SHA-256;
+  (`rae_dinov2_base`), each config defaulting to its published checkpoint.
+  Checkpoints are config nodes (`HubFile` at a commit revision, `UrlFile`,
+  `LocalFile`), and every published default pins its SHA-256;
   each config's `latent_norm` holds its published normalizer
   (`ScaleLatents`, `ElementwiseLatentStats`, `ChannelLatentStats`), which
   keeps its reference's operation order.
@@ -32,7 +32,10 @@ All notable priml changes are documented here. This project follows
   table fits and channel grouping), a corpus receipt checked at load time,
   `prepare_data.py --experiment`, `benchmark_codec.py`, and experiments
   exp002 (VTP), exp003 (RAE, float16 storage), and exp004 (RAE, uint8
-  storage).
+  storage). The loader refuses a corpus whose preparation has not finished.
+  `images/source.json` binds the crops every corpus shares to their ImageNet
+  source, and a rerun resumes only with the same source, producers, seed, and
+  (for a seeded corpus) batch size.
 - `Attention` attends to a memory when called with `memory=`: the queries
   come from the input, the keys and values from the memory through the same
   `proj_qkv`. Its config's `cost` takes the memory's length as `memory_len`.
@@ -48,9 +51,14 @@ All notable priml changes are documented here. This project follows
   `latent_norm` slot, filled at loop finalize from the dataset's autoencoder
   (INVAE's is the same `* 0.3099`). `PairedImageLatentDataset.Config` gains
   `latent_subdir`, `autoencoder`, `codec`, and `seed`, and requires a
-  `corpus.json` receipt; record one for an existing REG corpus with
-  `prepare_data.py --receipt-only`. `prepare_data.py` takes `--experiment`
-  in place of `--output`, `--checkpoint`, and `--resolution`.
+  `corpus.json` receipt; record one for an existing REG corpus, and bind its
+  crops, with `prepare_data.py --receipt-only --source <imagenet>`.
+  `prepare_data.py` takes `--experiment` in place of `--output`,
+  `--checkpoint`, and `--resolution`.
+- SpeedrunDiT: `SpeedrunTrainStep.Config.ema` keeps parameter shadows
+  (`shadow_kind="param_dict"`); the module-copy default could not deepcopy the
+  composable `replicate` model, so every distributed run failed at its first
+  EMA update. EMA state saved under the old default does not load into it.
 - `SelfAttention` is renamed `Attention`, and its module
   `priml.model.attention.self_attention` is now
   `priml.model.attention.attention`. `GatedSelfAttention` is renamed

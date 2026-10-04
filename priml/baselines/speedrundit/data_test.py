@@ -115,7 +115,7 @@ def test_a_corpus_from_another_autoencoder_is_refused(tmp_path: Path) -> None:
     autoencoder = INVAE.Config(image_size=32)
     autoencoder.checkpoint = None
     config = _source(tmp_path, autoencoder=autoencoder)
-    with pytest.raises(CorpusMismatchError, match=r"autoencoder\.checkpoints"):
+    with pytest.raises(CorpusMismatchError, match=r"autoencoder\.encoding\.checkpoint"):
         _ = config.make()
 
 

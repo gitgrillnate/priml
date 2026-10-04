@@ -14,7 +14,7 @@ It answers whether a codec is safe to materialize a corpus with; whether it
 changes the trained model is a downstream experiment (exp003 against exp004).
 
 Examples:
-  benchmark_codec.py --experiment exp003 --source /datasets/imagenet --output codecs.json
+  benchmark_codec.py --experiment exp003 --source /datasets/imagenet --output /opt/scratch/artifacts/speedrundit/codecs.json
   benchmark_codec.py --experiment exp003 --source /datasets/imagenet --decode --device cuda
 
 '''
@@ -51,8 +51,10 @@ from priml.baselines.speedrundit.scripts.prepare_data import (
     encode_latents,
     ensure_image_source,
     fit_sample_indices,
+    image_source_identity,
     records,
 )
+from priml.paths import validated_output_path
 
 
 if TYPE_CHECKING:
@@ -125,12 +127,14 @@ def latent_metrics(
     error = normalizer.normalize(decoded).double() - target
     per_channel = error.pow(2).mean(dim=(0, 2, 3))
     signal = target.pow(2).mean(dim=(0, 2, 3))
-    snr = 10 * torch.log10(signal / per_channel.clamp(min=1e-300))
+    # Unclamped: an exact channel scores inf, an exact zero channel 0/0 = NaN, and a
+    # NaN reconstruction stays NaN rather than reading as perfect.
+    snr = 10 * torch.log10(signal / per_channel)
     tail = target.abs() > 3
     nmse = float(error.pow(2).sum() / target.pow(2).sum())
     return {
         "nmse": nmse,
-        "snr_db": -10 * math.log10(nmse) if nmse > 0 else math.inf,
+        "snr_db": math.inf if nmse == 0 else -10 * math.log10(nmse),
         "channel_snr_db_min": float(snr.min()),
         "channel_snr_db_p1": float(snr.quantile(0.01)),
         "channel_snr_db_median": float(snr.median()),
@@ -147,11 +151,11 @@ def psnr(reference: Tensor, other: Tensor) -> float:
       other: Images in ``[0, 1]``, same shape.
 
     Returns:
-      psnr: Decibels; infinite when identical.
+      psnr: Decibels; infinite when identical, NaN when ``other`` holds NaN.
 
     """
     mse = float((other.double() - reference.double()).pow(2).mean())
-    return -10 * math.log10(mse) if mse > 0 else math.inf
+    return math.inf if mse == 0 else -10 * math.log10(mse)
 
 
 def evaluate(
@@ -238,6 +242,7 @@ def run(
     device: str,
     batch_size: int,
     decode_images: bool,
+    directory: Path | None = None,
 ) -> dict[str, object]:
     """Encode both samples with the experiment's autoencoder and score every codec.
 
@@ -245,6 +250,10 @@ def run(
     image counts, while ``batch_size`` controls encoding device memory. Each
     float32 RAE latent (768 x 16 x 16) occupies 768 KiB, before fitting and
     metric temporaries; choose image counts that fit the available host RAM.
+
+    Crops are read from, and written to, the corpus root's shared ``images/``,
+    binding it to ``imagenet`` as :mod:`prepare_data` does; benchmark another
+    source in another ``directory``.
 
     Args:
       experiment: Factory in :mod:`~priml.baselines.speedrundit.experiments`.
@@ -254,22 +263,31 @@ def run(
       device: Device the autoencoder runs on.
       batch_size: Images per forward.
       decode_images: Also decode to pixels and score PSNR and LPIPS.
+      directory: Corpus root whose crops to share, replacing the experiment's.
 
     Returns:
       report: The codec table and the fitting-size curve.
 
+    Raises:
+      ValueError: An image count is not positive, or the source is too small
+        for disjoint sets of both sizes.
+
     """
-    config = dataset_config(experiment)
-    root = Path(config.working_dir)
-    listed = records(imagenet)
-    chosen = fit_sample_indices(len(listed), num_fit_images + num_eval_images)
     if num_fit_images < 1 or num_eval_images < 1:
         raise ValueError("Fitting and evaluation image counts must be positive.")
+    config = dataset_config(experiment)
+    root = Path(config.working_dir if directory is None else directory)
+    listed = records(imagenet)
+    chosen = fit_sample_indices(len(listed), num_fit_images + num_eval_images)
     if len(chosen) != num_fit_images + num_eval_images:
         raise ValueError(
             "The corpus is too small for disjoint fitting and evaluation sets.",
         )
-    ensure_image_source(root, imagenet, listed, config.autoencoder.image_size)
+    size = config.autoencoder.image_size
+    ensure_image_source(
+        root,
+        identity=image_source_identity(imagenet, listed, size=size),
+    )
     # Shuffle before partitioning: the source order is grouped by ImageNet class.
     random.Random(FIT_SAMPLE_SEED).shuffle(chosen)  # noqa: S311 -- Selects benchmark images, not secrets.
     fit_records = [listed[i] for i in chosen[:num_fit_images]]
@@ -277,7 +295,6 @@ def run(
     autoencoder = config.autoencoder.make()
     if isinstance(autoencoder, torch.nn.Module):
         _ = autoencoder.to(device)
-    size = config.autoencoder.image_size
     fit_sample, eval_sample = (
         _encode_all(
             autoencoder,
@@ -286,6 +303,7 @@ def run(
             size=size,
             device=device,
             batch_size=batch_size,
+            latent_shape=config.autoencoder.latent_shape(),
         )
         for chosen_records in (fit_records, eval_records)
     )
@@ -318,6 +336,9 @@ def main() -> int:
     Returns:
       exit_code: Zero on success.
 
+    Raises:
+      SystemExit: ``--output`` lies inside ``--source`` or the corpus root.
+
     """
     parser = argparse.ArgumentParser(
         description=(__doc__ or "").split("\n", 2)[2],
@@ -326,6 +347,16 @@ def main() -> int:
     _add_arguments(parser)
     flags = cast("Flags", parser.parse_args())
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    directory = (
+        None if flags.directory is None else validated_output_path(flags.directory)
+    )
+    output = None if flags.output is None else validated_output_path(flags.output)
+    root = directory or Path(dataset_config(flags.experiment).working_dir)
+    if output is not None and any(
+        output.resolve().is_relative_to(path.expanduser().resolve())
+        for path in (flags.source, root)
+    ):
+        parser.error("--output must lie outside --source and the corpus root.")
     report = run(
         flags.experiment,
         flags.source,
@@ -334,12 +365,13 @@ def main() -> int:
         device=flags.device,
         batch_size=flags.batch_size,
         decode_images=flags.decode,
+        directory=directory,
     )
     text = json.dumps(report, indent=2, sort_keys=True)
-    if flags.output is None:
+    if output is None:
         print(text)
     else:
-        _ = flags.output.write_text(text + "\n", encoding="utf-8")
+        _ = output.write_text(text + "\n", encoding="utf-8")
     return 0
 
 
@@ -348,6 +380,7 @@ class Flags(Protocol):
 
     experiment: str
     source: Path
+    directory: Path | None
     output: Path | None
     fit_images: int
     eval_images: int
@@ -364,11 +397,17 @@ def _encode_all(
     size: int,
     device: str,
     batch_size: int,
+    latent_shape: tuple[int, int, int],
 ) -> Tensor:
     """Encode records to one float32 CPU tensor."""
     return torch.cat(
         [
-            encode_latents(autoencoder, images, device)
+            encode_latents(
+                autoencoder,
+                images,
+                device=device,
+                latent_shape=latent_shape,
+            )
             for _, images in batches(listed, root, size, batch_size)
         ],
     )
@@ -406,7 +445,7 @@ def _decode(
 
 
 def _lpips(device: str, batch_size: int) -> Callable[[Tensor, Tensor], float]:
-    """Return the mean AlexNet LPIPS between two image batches."""
+    """Return the mean AlexNet LPIPS between two ``[0, 1]`` image batches."""
     network = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
     return partial(
         _lpips_distance,
@@ -424,7 +463,7 @@ def _lpips_distance(
     device: str,
     batch_size: int,
 ) -> float:
-    """Measure mean perceptual distance in bounded batches."""
+    """Measure mean perceptual distance between ``[0, 1]`` images in bounded batches."""
     scores: list[Tensor] = []
     with torch.inference_mode():
         for left, right in zip(
@@ -441,6 +480,11 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     """Register benchmark flags."""
     parser.add_argument("--experiment", default="exp003")
     parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument(
+        "--directory",
+        type=Path,
+        help="Corpus root whose crops to share, replacing the experiment's.",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--fit-images", type=int, default=4_096)
     parser.add_argument("--eval-images", type=int, default=1_000)

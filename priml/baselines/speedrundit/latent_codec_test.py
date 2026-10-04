@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from torch import Tensor
 
 import pytest
@@ -19,9 +21,15 @@ from priml.baselines.speedrundit.latent_codec import (
     ScalarTableCodec,
     ScaleGroups,
     SharedTable,
+    TableFit,
     bits_per_scalar,
     entropy_bits,
 )
+from priml.math.scalar_quantization import midpoints
+
+
+if TYPE_CHECKING:
+    from configgle import Makeable
 
 
 def _sample(*, scales: tuple[float, ...] = (1.0, 30.0), images: int = 64) -> Tensor:
@@ -97,9 +105,10 @@ def test_float_codec_preserves_the_floating_overflow_contract() -> None:
     assert codec.encode(torch.tensor([1e6])).isinf().all()
 
 
-def test_float_codec_needs_a_floating_dtype() -> None:
-    with pytest.raises(ValueError, match="floating"):
-        _ = FloatCodec.Config(dtype=torch.uint8).make()
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float8_e4m3fn])
+def test_float_codec_needs_a_dtype_the_corpus_can_store(dtype: torch.dtype) -> None:
+    with pytest.raises(ValueError, match="FloatCodec stores"):
+        _ = FloatCodec.Config(dtype=dtype).make()
 
 
 def test_table_codec_satisfies_the_fitted_protocol() -> None:
@@ -127,9 +136,42 @@ def test_levels_themselves_decode_exactly() -> None:
 
 def test_a_value_on_a_threshold_takes_the_lower_level() -> None:
     codec = _fitted(ScalarTableCodec.Config(), _sample())
-    table = codec.table()
-    latent = table["thresholds"][:, 7].reshape(1, 2, 1, 1)
+    latent = midpoints(codec.table()["levels"])[:, 7].reshape(1, 2, 1, 1)
     assert codec.encode(latent).flatten().tolist() == [7, 7]
+
+
+@pytest.mark.parametrize(
+    "levels",
+    [
+        torch.linspace(1, 0, NUM_LEVELS).unsqueeze(0),
+        torch.full((1, NUM_LEVELS), float("nan")),
+        torch.zeros(1, NUM_LEVELS - 1),
+    ],
+)
+def test_load_table_refuses_levels_it_cannot_code_with(levels: Tensor) -> None:
+    codec = ScalarTableCodec.Config().make()
+    with pytest.raises(ValueError, match="levels"):
+        codec.load_table({"levels": levels})
+    assert codec.levels is None
+
+
+@pytest.mark.parametrize("fit", [GaussianFit.Config(), LinearFit.Config(clip_sigmas=4)])
+def test_a_single_value_per_channel_cannot_fit_a_table(fit: Makeable[TableFit]) -> None:
+    with pytest.raises(ValueError, match="two values per channel"):
+        ScalarTableCodec.Config(fit=fit).make().fit(torch.ones(1, 1, 1, 1))
+
+
+@pytest.mark.parametrize("fit", [GaussianFit.Config(), LinearFit.Config(clip_sigmas=4)])
+def test_a_non_finite_sample_cannot_fit_a_table(fit: Makeable[TableFit]) -> None:
+    sample = torch.tensor([0.0, float("nan")]).reshape(2, 1, 1, 1)
+    with pytest.raises(ValueError, match="finite"):
+        ScalarTableCodec.Config(fit=fit).make().fit(sample)
+
+
+@pytest.mark.parametrize("clip_sigmas", [0.0, -1.0, float("nan"), float("inf")])
+def test_linear_fit_needs_a_positive_finite_clip(clip_sigmas: float) -> None:
+    with pytest.raises(ValueError, match="clip_sigmas"):
+        LinearFit.Config(clip_sigmas=clip_sigmas).make()
 
 
 def test_values_beyond_the_outer_levels_saturate() -> None:

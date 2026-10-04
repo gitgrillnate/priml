@@ -113,19 +113,20 @@ def sample_latents(
     guidance_low: float = 0.0,
     guidance_high: float = 1.0,
 ) -> tuple[Tensor, Tensor]:
-    """Sample raw INVAE and REG CLS latents with the reverse SDE.
+    """Sample diffusion-space and REG CLS latents with the reverse SDE.
 
     Path-drop guidance is intended for qualitative images only. The paper's
     reported quantitative metrics use ordinary sampling without it.
 
     Args:
       model: Velocity model supporting classifier-free guidance.
-      latents: Initial noisy INVAE latents.
+      latents: Initial noisy diffusion-space latents.
       cls_latents: Initial noisy REG CLS latents.
       labels: Conditional class labels.
       num_steps: Number of stochastic integration intervals.
-      cfg_scale: Classifier-free guidance scale for INVAE latents.
-      cls_cfg_scale: Classifier-free guidance scale for CLS latents.
+      cfg_scale: Classifier-free guidance scale for the image latents.
+      cls_cfg_scale: Classifier-free guidance scale for CLS latents. It acts
+        only when ``cfg_scale > 1``, which is what runs the unconditional branch.
       path: Linear or cosine probability path.
       shift_time: Whether to shift times for latent dimensionality.
       shift_base: Reference latent dimension for time shifting.

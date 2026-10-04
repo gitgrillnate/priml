@@ -109,11 +109,28 @@ def test_fewer_distinct_values_than_levels_returns_the_values() -> None:
     assert lloyd_max(values, torch.zeros(4)).tolist() == [1.0, 2.0, 3.0, 3.0]
 
 
-def test_non_finite_samples_propagate_or_are_refused_by_the_leaf() -> None:
-    levels = lloyd_max(torch.tensor([0.0, math.nan]), torch.zeros(2))
-    assert levels.isnan().any()
-    with pytest.raises(RuntimeError):
-        _ = high_resolution_levels(torch.tensor([0.0, math.inf]), 2)
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_non_finite_samples_are_refused(bad: float) -> None:
+    """Many distinct values, so the refusal is not the few-values early return."""
+    values = torch.cat([torch.arange(100, dtype=torch.float64), torch.tensor([bad])])
+    with pytest.raises(ValueError, match="finite"):
+        _ = lloyd_max(values, torch.linspace(0, 99, 4))
+    with pytest.raises(ValueError, match="finite"):
+        _ = high_resolution_levels(values, 4)
+
+
+def test_non_finite_initial_levels_are_refused() -> None:
+    values = torch.arange(100, dtype=torch.float64)
+    with pytest.raises(ValueError, match="finite initial"):
+        _ = lloyd_max(values, torch.tensor([0.0, math.nan, 50.0, 99.0]))
+
+
+def test_midpoints_of_finite_levels_never_overflow() -> None:
+    levels = torch.tensor([[40_000.0, 50_000.0]], dtype=torch.float16)
+    thresholds = midpoints(levels)
+    assert bool(thresholds.isfinite().all())
+    values = torch.tensor([[41_000.0, 49_000.0]], dtype=torch.float16)
+    assert quantize(values, thresholds).tolist() == [[0, 1]]
 
 
 def test_high_resolution_start_puts_levels_inside_the_sample() -> None:

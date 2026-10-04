@@ -18,6 +18,7 @@ from priml.model.vision_ae.latent_norm import ScaleLatents
 
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from torch import Tensor
@@ -123,12 +124,88 @@ def _config(config: object, experiment: str) -> object:
     return config
 
 
+def test_the_fit_and_eval_split_ignores_source_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source order is grouped by class, so evaluation must not be its tail."""
+    config = _source(tmp_path)
+    encoded: list[list[str]] = []
+    monkeypatch.setattr(benchmark_codec, "dataset_config", partial(_config, config))
+    monkeypatch.setattr(benchmark_codec, "candidates", dict)
+    monkeypatch.setattr(
+        benchmark_codec,
+        "_encode_all",
+        partial(_record_stems, encoded=encoded),
+    )
+    _ = benchmark_codec.run(
+        "test",
+        _imagenet(tmp_path, 8),
+        num_fit_images=4,
+        num_eval_images=4,
+        device="cpu",
+        batch_size=2,
+        decode_images=False,
+    )
+    assert sorted(encoded[1]) != [f"{index:08d}" for index in range(4, 8)]
+
+
+def _record_stems(
+    autoencoder: object,
+    listed: Sequence[prepare_data.Record],
+    *,
+    encoded: list[list[str]],
+    latent_shape: tuple[int, int, int],
+    **_: object,
+) -> Tensor:
+    del autoencoder
+    encoded.append([record.stem for record in listed])
+    return torch.zeros(len(listed), *latent_shape)
+
+
+@pytest.mark.parametrize(("fit", "evaluate"), [(0, 1), (1, -1), (2, 1)])
+def test_benchmark_needs_positive_counts_the_source_can_supply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fit: int,
+    evaluate: int,
+) -> None:
+    monkeypatch.setattr(
+        benchmark_codec,
+        "dataset_config",
+        partial(_config, _source(tmp_path)),
+    )
+    with pytest.raises(ValueError, match=r"positive|too small"):
+        benchmark_codec.run(
+            "test",
+            _imagenet(tmp_path, 2),
+            num_fit_images=fit,
+            num_eval_images=evaluate,
+            device="cpu",
+            batch_size=2,
+            decode_images=False,
+        )
+
+
+def test_nan_reconstructions_score_nan_rather_than_perfect() -> None:
+    latents = _latents(2, seed=0)
+    broken = torch.full_like(latents, float("nan"))
+    metrics = benchmark_codec.latent_metrics(
+        latents,
+        broken,
+        ScaleLatents.Config().make(),
+    )
+    assert math.isnan(metrics["snr_db"])
+    assert math.isnan(metrics["channel_snr_db_min"])
+    assert math.isnan(benchmark_codec.psnr(torch.zeros(1), torch.tensor([math.nan])))
+
+
 def test_benchmark_refuses_crops_from_another_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first = _imagenet(tmp_path / "first", 2)
-    second = _imagenet(tmp_path / "second", 2)
+    second = _imagenet(tmp_path / "second", 3)
     config = _source(tmp_path)
     prepare_data.prepare(config, first, device="cpu")
     monkeypatch.setattr(benchmark_codec, "dataset_config", partial(_config, config))
@@ -150,7 +227,7 @@ def test_preparation_refuses_crops_from_another_benchmarks_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first = _imagenet(tmp_path / "first", 2)
-    second = _imagenet(tmp_path / "second", 2)
+    second = _imagenet(tmp_path / "second", 3)
     config = _source(tmp_path)
     monkeypatch.setattr(benchmark_codec, "dataset_config", partial(_config, config))
     monkeypatch.setattr(benchmark_codec, "candidates", dict)
@@ -165,6 +242,26 @@ def test_preparation_refuses_crops_from_another_benchmarks_source(
     )
     with pytest.raises(CorpusMismatchError, match="image source"):
         prepare_data.prepare(config, second, device="cpu")
+
+
+def test_output_inside_an_input_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = _imagenet(tmp_path, 2)
+    monkeypatch.setattr(
+        benchmark_codec,
+        "dataset_config",
+        partial(_config, _source(tmp_path)),
+    )
+    target = raw / "train" / "report.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["benchmark_codec", "--source", str(raw), "--output", str(target)],
+    )
+    with pytest.raises(SystemExit):
+        _ = benchmark_codec.main()
+    assert not target.exists()
 
 
 def test_every_candidate_builds() -> None:

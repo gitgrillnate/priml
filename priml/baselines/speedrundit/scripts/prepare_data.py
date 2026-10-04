@@ -8,14 +8,15 @@ Crop extracted ImageNet and encode the latents an experiment trains on.
 The experiment names the autoencoder, the storage codec, and the corpus
 directory; this script builds exactly those and writes the corpus with its
 receipt. Adding an autoencoder never touches this file: a new experiment
-declares it. A fitted codec (uint8 tables) is fitted first on a subset of the
-images and its table is written before any latent. Re-running resumes: images
-and latents already on disk are kept.
+declares it. A fitted codec (uint8 tables) is fitted first on a sample of the
+images and its table is written before any latent. Re-running resumes, keeping
+the images and latents already on disk, when the source, producers, seed, and
+(for a seeded corpus) batch size are unchanged; anything else is refused.
 
 Examples:
   prepare_data.py --experiment exp000 --source /datasets/imagenet
   prepare_data.py --experiment exp003 --source /datasets/imagenet --device cuda
-  prepare_data.py --experiment exp000 --receipt-only
+  prepare_data.py --experiment exp000 --receipt-only --source /datasets/imagenet
 
 '''
 # fmt: on
@@ -37,23 +38,27 @@ from PIL import Image
 from priml.baselines.speedrundit import experiments
 from priml.baselines.speedrundit.corpus import (
     LABELS,
+    PREPARING,
     RECEIPT,
     CorpusMismatchError,
     load_table,
+    mismatches,
     save_stored,
     save_table,
     table_path,
     verify_receipt,
+    write_atomically,
     write_receipt,
 )
 from priml.baselines.speedrundit.latent_codec import FittedCodec, ScalarTableCodec
 from priml.data.processors.labels import ImagenetSynsetToIndex
 from priml.data.sources.extracted_imagenet import ExtractedImageNetSource
 from priml.lib.custom_json import DictCodec, loads
+from priml.paths import validated_output_path
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
 
     from torch import Tensor
 
@@ -76,8 +81,12 @@ FIT_SAMPLE_SEED: Final = 0
 """Seeds the choice of a fitted codec's images; part of the table's identity.
 
 Changing it changes every table fitted after, which the receipt's
-``indices_sha256`` records; a table already on disk is reused, never refitted.
+``indices_sha256`` records; a table already on disk is reused, never refitted,
+and its receipt keeps the fit's record across reruns.
 """
+
+IMAGE_SOURCE: Final = "source.json"
+"""The shared crops' binding to their image source, inside ``images/``."""
 
 
 def center_crop(image: Image.Image, size: int) -> Image.Image:
@@ -106,7 +115,7 @@ def center_crop(image: Image.Image, size: int) -> Image.Image:
     return image.crop((left, top, left + size, top + size))
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Record:
     """One training image and the identifier its corpus files take."""
 
@@ -135,12 +144,11 @@ def dataset_config(experiment: str) -> PairedImageLatentDataset.Config:
     return factory().copy_tree().finalize().dataset.source
 
 
-def records(imagenet: Path, *, limit: int | None = None) -> list[Record]:
+def records(imagenet: Path) -> list[Record]:
     """List training images in the extracted source's deterministic order.
 
     Args:
       imagenet: Extracted ImageNet directory.
-      limit: Keep only the first ``limit`` images.
 
     Returns:
       records: One per image, numbered in source order.
@@ -153,15 +161,13 @@ def records(imagenet: Path, *, limit: int | None = None) -> list[Record]:
     labels = ImagenetSynsetToIndex.Config().make()
     found: list[Record] = []
     for index, record in enumerate(labels(iter(source))):
-        if limit is not None and index >= limit:
-            break
         label = record.get("label")
         path = record.get("file_path")
         if not isinstance(label, int):
             raise TypeError(f"expected an integer ImageNet label: {record}")
         if not isinstance(path, str):
             raise TypeError(f"expected an ImageNet file path: {record}")
-        found.append(Record(path, label, f"{index:08d}"))
+        found.append(Record(source=path, label=label, stem=f"{index:08d}"))
     return found
 
 
@@ -193,6 +199,9 @@ def prepare(
 ) -> int:
     """Write images, stored latents, labels, and the receipt for one corpus.
 
+    A fitted codec is fitted on a sample of EVERY source image, not only the
+    first ``limit``: later runs reuse its table for the whole corpus.
+
     Args:
       config: Finalized latent source, as :func:`dataset_config` returns it.
       imagenet: Extracted ImageNet directory.
@@ -204,214 +213,259 @@ def prepare(
       count: Source records selected for this invocation. Previously encoded
         records outside ``limit`` remain in the corpus.
 
+    Raises:
+      ValueError: ``batch_size`` or ``limit`` is not positive, the source holds
+        no images, or the autoencoder returns latents the corpus cannot hold.
+      CorpusMismatchError: The shared crops, the receipt, or the preparation
+        settings belong to another producer, or latents exist without a receipt.
+
     """
+    if batch_size < 1 or (limit is not None and limit < 1):
+        raise ValueError(
+            f"batch_size and limit must be positive; got {batch_size} and {limit}.",
+        )
+    all_records = records(imagenet)
+    if not all_records:
+        raise ValueError(f"{imagenet} holds no training images.")
+    listed = all_records[:limit]
     root = Path(config.working_dir)
     latent_dir = root / config.latent_subdir
     latent_dir.mkdir(parents=True, exist_ok=True)
-    all_records = records(imagenet)
-    listed = all_records if limit is None else all_records[:limit]
-    if batch_size < 1 or not listed or (limit is not None and limit < 1):
-        raise ValueError(
-            "Preparation requires images and positive batch size and limit.",
-        )
-    source_identity = ensure_image_source(
+    size = config.autoencoder.image_size
+    latent_shape = config.autoencoder.latent_shape()
+    ensure_image_source(
         root,
-        imagenet,
-        all_records,
-        config.autoencoder.image_size,
+        identity=image_source_identity(imagenet, all_records, size=size),
     )
+    # Batch size fixes which posterior draw a seeded record gets; unseeded draws
+    # cannot be reproduced whatever the batching, so it binds only a seeded corpus.
     preparation = {
-        **source_identity,
         "seed": config.seed,
-        "batch_size": batch_size,
-        "device": device,
+        "batch_size": None if config.seed is None else batch_size,
     }
     codec = config.codec.make()
-    table_sha256 = None
-    if table_path(latent_dir).is_file() and not (latent_dir / RECEIPT).is_file():
-        raise CorpusMismatchError(
-            "The corpus contains an unreceipted codec table. Its producer is "
-            "unverified; prepare a new corpus directory.",
-        )
-    if isinstance(codec, FittedCodec) and table_path(latent_dir).is_file():
-        table_sha256 = load_table(latent_dir, codec)
-    if (latent_dir / RECEIPT).is_file():
-        verify_receipt(
-            latent_dir,
-            autoencoder=config.autoencoder,
-            codec_config=config.codec,
-            codec=codec,
-            table_sha256=table_sha256,
-        )
-        receipt = DictCodec.coerce(
-            loads((latent_dir / RECEIPT).read_text()),
-            default=None,
-        )
-        details = DictCodec.coerce(receipt["details"], default=None)
-        if details.get("preparation") != preparation:
+    table_sha256, previous = _resume(latent_dir, config, codec)
+    recorded = previous.get("preparation")
+    if recorded is not None:
+        problems = mismatches(DictCodec.coerce(recorded, default=None), preparation)
+        if problems:
             raise CorpusMismatchError(
-                "Corpus preparation settings changed or are unverified.",
+                f"{latent_dir} was prepared with other settings:\n  "
+                + "\n  ".join(problems),
             )
-    elif any(latent_dir.rglob("*.npy")):
-        raise FileNotFoundError(
-            f"{latent_dir} contains unreceipted latents; use --receipt-only to import them.",
-        )
-    if config.seed is not None:
-        torch.manual_seed(config.seed)
-    autoencoder = config.autoencoder.make()
+    # Seeded even when encoding is not: a checkpoint-free autoencoder's weights are
+    # random, and only a fixed construction lets a resumed run encode with the same.
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0 if config.seed is None else config.seed)
+        autoencoder = config.autoencoder.make()
     if isinstance(autoencoder, torch.nn.Module):
         _ = autoencoder.to(device)
-    fit: dict[str, object] | None = None
-    if isinstance(codec, FittedCodec):
-        table_sha256, fit = _fit_or_load(
+    if config.seed is not None:
+        torch.manual_seed(config.seed)
+    fit = previous.get("fit")
+    if isinstance(codec, FittedCodec) and table_sha256 is None:
+        table_sha256, fit = _fit(
             codec,
             autoencoder,
-            listed,
+            all_records,
             root=root,
             latent_dir=latent_dir,
-            size=config.autoencoder.image_size,
+            size=size,
             device=device,
             batch_size=batch_size,
+            latent_shape=latent_shape,
         )
-    # Pin producers before publishing any latent, including an interrupted run.
-    write_receipt(
+    details = {"preparation": preparation, "fit": fit}
+    # The loader refuses a PREPARING corpus, so an interrupted run's latents are
+    # tied to their producers yet never load as a finished corpus.
+    _ = write_receipt(
         latent_dir,
         autoencoder=config.autoencoder,
         codec_config=config.codec,
         codec=codec,
         table_sha256=table_sha256,
-        details={"provenance": "encoding", "preparation": preparation},
+        details={**details, "provenance": PREPARING},
     )
-    error = _ErrorTally()
-    pending = [r for r in listed if not _latent_path(latent_dir, r).is_file()]
-    encoding_records = [
-        record
-        for start in range(0, len(listed), batch_size)
-        if any(
-            not _latent_path(latent_dir, r).is_file()
-            for r in listed[start : start + batch_size]
-        )
-        for record in listed[start : start + batch_size]
+    pending = {r.stem for r in listed if not _latent_path(latent_dir, r).is_file()}
+    # Windows are fixed over the WHOLE source and encoded whole, so a seeded record
+    # gets the same draw however ``limit`` or an interruption split the runs. Every
+    # chosen window is full except possibly the source's last, so ``batches``
+    # re-chunks them unchanged.
+    windows = [
+        all_records[start : start + batch_size]
+        for start in range(0, len(all_records), batch_size)
     ]
-    # Keep original batch boundaries when resuming a partially completed batch.
-    # A stable per-batch seed also makes codec fitting independent of encoding.
-    for batch, images in batches(
-        encoding_records,
-        root,
-        config.autoencoder.image_size,
-        batch_size,
-    ):
+    encoding = [
+        record
+        for window in windows
+        if any(r.stem in pending for r in window)
+        for record in window
+    ]
+    error = _ErrorTally()
+    for batch, images in batches(encoding, root, size, batch_size):
         if config.seed is not None:
             torch.manual_seed(config.seed + int(batch[0].stem))
-        latents = encode_latents(autoencoder, images, device)
-        stored = codec.encode(latents)
-        error.add(latents, codec, stored)
-        for index, record in enumerate(batch):
-            path = _latent_path(latent_dir, record)
-            if path.is_file():
-                continue
+        latents = encode_latents(
+            autoencoder,
+            images,
+            device=device,
+            latent_shape=latent_shape,
+        )
+        keep = [index for index, r in enumerate(batch) if r.stem in pending]
+        stored = codec.encode(latents[keep])
+        error.add(latents[keep], codec, stored)
+        for row, index in enumerate(keep):
+            path = _latent_path(latent_dir, batch[index])
             path.parent.mkdir(parents=True, exist_ok=True)
-            save_stored(path, stored[index : index + 1])
+            save_stored(path, stored[row : row + 1])
     _write_labels(latent_dir, all_records)
-    write_receipt(
+    _ = write_receipt(
         latent_dir,
         autoencoder=config.autoencoder,
         codec_config=config.codec,
         codec=codec,
         table_sha256=table_sha256,
         details={
+            **details,
             "provenance": "encoded",
-            "preparation": preparation,
             "images": {
-                "source": str(imagenet),
+                "source": str(imagenet.resolve()),
                 "split": "train",
                 "selected": len(listed),
-                "resolution": config.autoencoder.image_size,
+                "resolution": size,
                 "crop": "adm_center_crop",
             },
             "encoding": {
-                "batch_size": batch_size,
-                "seed": config.seed,
                 "device": device,
                 "torch": torch.__version__,
                 "newly_encoded": len(pending),
             },
-            "error": error.summary(),
-            "fit": fit,
+            "error": error.summary() if pending else previous.get("error"),
         },
     )
     return len(listed)
 
 
-def ensure_image_source(
-    root: Path,
+def image_source_identity(
     imagenet: Path,
     listed: Sequence[Record],
+    *,
     size: int,
 ) -> dict[str, object]:
-    """Bind shared crops to their source before any caller reads or writes them.
+    """Return what makes two crop directories interchangeable.
+
+    Paths are taken relative to ``imagenet``, so the same images mounted
+    elsewhere keep one identity.
 
     Args:
-      root: Corpus root containing the shared ``images`` directory.
       imagenet: Extracted source directory.
       listed: Every source record, independent of invocation limits.
       size: ADM crop side length.
 
     Returns:
-      identity: Source catalog and preprocessing identity.
-
-    Raises:
-      CorpusMismatchError: Existing crops have another or unverified source.
+      identity: Digest of the source catalog, and the crop settings.
 
     """
-    identity: dict[str, object] = {
-        "source": str(imagenet.resolve()),
-        "records_sha256": hashlib.sha256(
-            "\n".join(f"{r.source}:{r.label}" for r in listed).encode(),
-        ).hexdigest(),
+    catalog = "\n".join(
+        f"{Path(r.source).relative_to(imagenet).as_posix()}:{r.label}" for r in listed
+    )
+    return {
+        "records_sha256": hashlib.sha256(catalog.encode()).hexdigest(),
         "resolution": size,
         "crop": "adm_center_crop",
     }
-    path = root / "images" / "source.json"
+
+
+def ensure_image_source(
+    root: Path,
+    *,
+    identity: Mapping[str, object],
+    adopt: bool = False,
+) -> None:
+    """Bind the shared crops to one image source, or refuse crops of another.
+
+    Args:
+      root: Corpus root containing the shared ``images`` directory.
+      identity: :func:`image_source_identity` of the source being read.
+      adopt: Bind existing crops that record no source to this one. Only the
+        operator can vouch for such crops; ``--receipt-only --source`` does.
+
+    Raises:
+      CorpusMismatchError: The crops are bound to another source, or exist
+        unbound and ``adopt`` is false.
+
+    """
+    path = root / "images" / IMAGE_SOURCE
     if path.is_file():
-        if DictCodec.coerce(loads(path.read_text()), default=None) != identity:
-            raise CorpusMismatchError("Shared image source or crop settings changed.")
-    else:
-        if any(path.parent.rglob("*.png")):
-            raise CorpusMismatchError("Shared image source is unverified.")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        staging = path.with_suffix(".json.partial")
-        staging.write_text(json.dumps(identity, sort_keys=True))
-        staging.replace(path)
-    return identity
+        bound = DictCodec.coerce(loads(path.read_text()), default=None)
+        problems = mismatches(bound, identity)
+        if problems:
+            raise CorpusMismatchError(
+                f"{path.parent} holds crops of another image source:\n  "
+                + "\n  ".join(problems),
+            )
+        return
+    if not adopt and any(path.parent.rglob("*.png")):
+        raise CorpusMismatchError(
+            f"{path.parent} holds crops that record no source. If they were cropped "
+            "from this source, record it with prepare_data.py --receipt-only "
+            "--source; otherwise delete them.",
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(dict(identity), sort_keys=True)
+    write_atomically(path, lambda stream: stream.write(text.encode()))
 
 
-def record_receipt(config: PairedImageLatentDataset.Config) -> int:
-    """Write a receipt for a corpus encoded elsewhere, e.g. an existing REG one.
+def record_receipt(
+    config: PairedImageLatentDataset.Config,
+    imagenet: Path | None = None,
+) -> int:
+    """Record what a corpus encoded elsewhere, e.g. an existing REG one, cannot state.
 
     Nothing is encoded or verified against pixels: the receipt only states that
     this corpus is taken to be the configured autoencoder's, which the loader
-    then holds it to.
+    then holds it to. An existing receipt is verified, never replaced.
 
     Args:
       config: Finalized latent source.
+      imagenet: The extracted source the shared crops were cut from; binds
+        crops that record no source. ``None`` leaves the crops as they are.
 
     Returns:
       count: Latent files found.
 
     Raises:
       FileNotFoundError: The latent directory, or a fitted codec's table, is missing.
+      CorpusMismatchError: An existing receipt or crop binding names another
+        producer.
 
     """
-    latent_dir = Path(config.working_dir) / config.latent_subdir
+    root = Path(config.working_dir)
+    latent_dir = root / config.latent_subdir
     if not latent_dir.is_dir():
         raise FileNotFoundError(f"{latent_dir} does not exist.")
+    if imagenet is not None:
+        identity = image_source_identity(
+            imagenet,
+            records(imagenet),
+            size=config.autoencoder.image_size,
+        )
+        ensure_image_source(root, identity=identity, adopt=True)
     codec = config.codec.make()
     table_sha256 = (
         load_table(latent_dir, codec) if isinstance(codec, FittedCodec) else None
     )
     count = sum(1 for _ in latent_dir.rglob("*.npy"))
-    write_receipt(
+    if (latent_dir / RECEIPT).is_file():
+        _ = verify_receipt(
+            latent_dir,
+            autoencoder=config.autoencoder,
+            codec_config=config.codec,
+            codec=codec,
+            table_sha256=table_sha256,
+        )
+        return count
+    _ = write_receipt(
         latent_dir,
         autoencoder=config.autoencoder,
         codec_config=config.codec,
@@ -441,9 +495,9 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     config = dataset_config(flags.experiment)
     if flags.directory is not None:
-        config.working_dir = flags.directory
+        config.working_dir = validated_output_path(flags.directory)
     if flags.receipt_only:
-        print(record_receipt(config))
+        print(record_receipt(config, flags.source))
         return 0
     if flags.source is None:
         parser.error("--source is required unless --receipt-only is given.")
@@ -475,10 +529,39 @@ class _Experiment(Protocol):
     def __call__(self) -> experiments.SpeedrunTrainLoop: ...
 
 
+def _resume(
+    latent_dir: Path,
+    config: PairedImageLatentDataset.Config,
+    codec: LatentCodec,
+) -> tuple[str | None, dict[str, object]]:
+    """Verify what an earlier run left; return its table digest and provenance."""
+    if not (latent_dir / RECEIPT).is_file():
+        if any(latent_dir.rglob("*.npy")):
+            raise CorpusMismatchError(
+                f"{latent_dir} holds latents with no receipt, so their producer is "
+                "unknown. Record them with --receipt-only, or delete them.",
+            )
+        # Only a run interrupted between saving its table and pinning it leaves a table
+        # without a receipt. No latent was coded against it, so it is refitted.
+        table_path(latent_dir).unlink(missing_ok=True)
+        return None, {}
+    table_sha256 = (
+        load_table(latent_dir, codec) if isinstance(codec, FittedCodec) else None
+    )
+    details = verify_receipt(
+        latent_dir,
+        autoencoder=config.autoencoder,
+        codec_config=config.codec,
+        codec=codec,
+        table_sha256=table_sha256,
+    )
+    return table_sha256, details
+
+
 # Fitted before any latent is written, so every stored index refers to the one table
 # saved beside it; an existing table is reused, never refitted, or latents already on
 # disk would decode against the wrong levels.
-def _fit_or_load(
+def _fit(
     codec: FittedCodec,
     autoencoder: Autoencoder,
     listed: Sequence[Record],
@@ -488,16 +571,20 @@ def _fit_or_load(
     size: int,
     device: str,
     batch_size: int,
+    latent_shape: tuple[int, int, int],
 ) -> tuple[str, dict[str, object]]:
-    """Load the corpus's codec table, or fit and save one; return its digest."""
-    if table_path(latent_dir).is_file():
-        return load_table(latent_dir, codec), {"reused": True}
+    """Fit and save the codec's table; return its digest and the fit's record."""
     chosen = fit_sample_indices(len(listed), codec.num_fit_images)
     subset = [listed[index] for index in chosen]
     logger.info("Fitting the codec on %d images.", len(subset))
     sample = torch.cat(
         [
-            encode_latents(autoencoder, images, device)
+            encode_latents(
+                autoencoder,
+                images,
+                device=device,
+                latent_shape=latent_shape,
+            )
             for _, images in batches(subset, root, size, batch_size)
         ],
     )
@@ -535,9 +622,7 @@ def _image(root: Path, record: Record, size: int) -> Tensor:
         with Image.open(record.source) as opened:
             cropped = center_crop(opened.convert("RGB"), size)
         path.parent.mkdir(parents=True, exist_ok=True)
-        staging = path.with_suffix(".png.partial")
-        cropped.save(staging, format="PNG")
-        staging.replace(path)
+        write_atomically(path, lambda stream: cropped.save(stream, format="PNG"))
     if cropped.size != (size, size):
         raise ValueError(
             f"{path} is {cropped.size}; this autoencoder needs {size}x{size} images.",
@@ -545,11 +630,37 @@ def _image(root: Path, record: Record, size: int) -> Tensor:
     return torch.from_numpy(np.asarray(cropped).copy()).permute(2, 0, 1)
 
 
-def encode_latents(autoencoder: Autoencoder, images: Tensor, device: str) -> Tensor:
-    """Encode and audit a uint8 batch before corpus publication or fitting."""
+def encode_latents(
+    autoencoder: Autoencoder,
+    images: Tensor,
+    *,
+    device: str,
+    latent_shape: tuple[int, int, int],
+) -> Tensor:
+    """Encode a uint8 batch to float32 CPU latents, refusing any a corpus cannot hold.
+
+    Args:
+      autoencoder: The experiment's autoencoder.
+      images: ``[B, 3, H, W]`` uint8.
+      device: Device the autoencoder encodes on.
+      latent_shape: The ``(C, H, W)`` its config declares.
+
+    Returns:
+      latents: ``[B, *latent_shape]`` float32 on the CPU.
+
+    Raises:
+      ValueError: The latents are not one ``latent_shape`` per image, or not finite.
+
+    """
     with torch.inference_mode():
         latents = autoencoder.encode(images.to(device)).float().cpu()
-    if not np.isfinite(latents.numpy()).all():
+    if latents.shape != (images.shape[0], *latent_shape):
+        raise ValueError(
+            f"The autoencoder returned {tuple(latents.shape)} latents for "
+            f"{images.shape[0]} images; its config declares {latent_shape}.",
+        )
+    # A CPU tensor already, so reading its values costs no device synchronization.
+    if not bool(torch.isfinite(latents).all()):
         raise ValueError("Autoencoder produced non-finite latents.")
     return latents
 
@@ -565,10 +676,8 @@ def _write_labels(latent_dir: Path, listed: Sequence[Record]) -> None:
         [_latent_path(latent_dir, r).relative_to(latent_dir).as_posix(), r.label]
         for r in listed
     ]
-    path = latent_dir / LABELS
-    staging = path.with_suffix(".json.partial")
-    _ = staging.write_text(json.dumps({"labels": labels}), encoding="utf-8")
-    staging.replace(path)
+    text = json.dumps({"labels": labels})
+    write_atomically(latent_dir / LABELS, lambda stream: stream.write(text.encode()))
 
 
 class _ErrorTally:
@@ -607,7 +716,14 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         default="exp000",
         help="Experiment in speedrundit.experiments whose corpus to prepare.",
     )
-    parser.add_argument("--source", type=Path, help="Extracted ImageNet directory.")
+    parser.add_argument(
+        "--source",
+        type=Path,
+        help=(
+            "Extracted ImageNet directory. With --receipt-only, binds existing "
+            "crops that record no source to it."
+        ),
+    )
     parser.add_argument(
         "--directory",
         type=Path,

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import field
+from functools import partial
 from pathlib import Path
 from typing import Final, cast, override
+
+import shutil
 
 from configgle import Fig, Makeable
 from PIL import Image
@@ -14,13 +17,18 @@ from torch.nn import functional
 import pytest
 import torch
 
-from priml.baselines.speedrundit.corpus import RECEIPT, CorpusMismatchError, table_path
+from priml.baselines.speedrundit.corpus import (
+    RECEIPT,
+    CorpusMismatchError,
+    save_stored,
+    table_path,
+)
 from priml.baselines.speedrundit.data import PairedImageLatentDataset
 from priml.baselines.speedrundit.latent_codec import FloatCodec, ScalarTableCodec
 from priml.baselines.speedrundit.scripts import prepare_data
 from priml.lib.custom_json import DictCodec, loads
 from priml.model.vision_ae.custom_types import LatentNormalizer, posterior_mode
-from priml.model.vision_ae.invae_test import tiny as tiny_invae
+from priml.model.vision_ae.invae_test import tiny
 from priml.model.vision_ae.latent_norm import ScaleLatents
 
 
@@ -106,8 +114,8 @@ def test_prepared_corpus_loads_back_as_the_encoder_wrote_it(tmp_path: Path) -> N
 def test_images_are_center_cropped_to_the_autoencoder_size(tmp_path: Path) -> None:
     config = _source(tmp_path)
     _ = prepare_data.prepare(config, _imagenet(tmp_path, 1), device="cpu")
-    image = Path(config.working_dir) / "images/00000/img00000000.png"
-    assert Image.open(image).size == (_SIZE, _SIZE)
+    with Image.open(Path(config.working_dir) / "images/00000/img00000000.png") as image:
+        assert image.size == (_SIZE, _SIZE)
 
 
 def test_a_rerun_keeps_what_is_already_encoded(tmp_path: Path) -> None:
@@ -134,7 +142,8 @@ def test_receipt_records_the_producers_and_error(tmp_path: Path) -> None:
     config = _source(tmp_path)
     _ = prepare_data.prepare(config, _imagenet(tmp_path, 2), device="cpu")
     receipt = _receipt(config)
-    autoencoder = DictCodec.coerce(receipt["autoencoder"], default=None)
+    identity = DictCodec.coerce(receipt["identity"], default=None)
+    autoencoder = DictCodec.coerce(identity["autoencoder"], default=None)
     assert autoencoder["latent_shape"] == [4, *_GRID]
     error = DictCodec.coerce(
         DictCodec.coerce(receipt["details"], default=None)["error"],
@@ -151,29 +160,111 @@ def test_fitted_codec_writes_its_table_before_the_latents(tmp_path: Path) -> Non
     assert latent.dtype == torch.float32
 
 
-def test_interrupted_fit_cannot_relabel_an_unreceipted_table(
+def test_a_table_left_without_a_receipt_is_refitted_for_its_new_producer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _source(tmp_path, codec=ScalarTableCodec.Config(num_fit_images=2))
-    config.autoencoder = tiny_invae()
+    config.autoencoder = tiny()
     raw = _imagenet(tmp_path, 3)
-
-    def interrupted_receipt(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise OSError("interrupted before receipt publication")
-
     with monkeypatch.context() as scoped:
-        scoped.setattr(prepare_data, "write_receipt", interrupted_receipt)
+        scoped.setattr(prepare_data, "write_receipt", _interrupted)
         with pytest.raises(OSError, match="interrupted"):
             prepare_data.prepare(config, raw, device="cpu")
     directory = Path(config.working_dir) / config.latent_subdir
-    before = table_path(directory).read_bytes()
+    orphan = table_path(directory).read_bytes()
     config.autoencoder.latent_fn = posterior_mode
-    with pytest.raises(CorpusMismatchError, match=r"unreceipted.*table"):
-        prepare_data.prepare(config, raw, device="cpu")
-    assert table_path(directory).read_bytes() == before
-    assert not (directory / RECEIPT).exists()
+    _ = prepare_data.prepare(config, raw, device="cpu")
+    assert table_path(directory).read_bytes() != orphan
+    assert len(config.make()) == 3
+
+
+def _interrupted(*args: object, **kwargs: object) -> None:
+    del args, kwargs
+    raise OSError("interrupted")
+
+
+def test_an_interrupted_preparation_never_loads_as_a_finished_corpus(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = _imagenet(tmp_path, 6)
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(config, raw, device="cpu", limit=2)
+    saves: list[Path] = []
+    with monkeypatch.context() as scoped:
+        scoped.setattr(prepare_data, "save_stored", partial(_save_twice, saves=saves))
+        with pytest.raises(OSError, match="interrupted"):
+            prepare_data.prepare(config, raw, device="cpu", batch_size=2)
+    with pytest.raises(CorpusMismatchError, match="unfinished"):
+        _ = config.make()
+    _ = prepare_data.prepare(config, raw, device="cpu", batch_size=2)
+    assert len(config.make()) == 6
+
+
+def _save_twice(path: Path, stored: Tensor, *, saves: list[Path]) -> None:
+    if len(saves) == 2:
+        raise OSError("interrupted")
+    saves.append(path)
+    save_stored(path, stored)
+
+
+def test_latents_without_a_receipt_are_refused(tmp_path: Path) -> None:
+    config = _source(tmp_path)
+    latent = Path(config.working_dir) / config.latent_subdir / "00000/x.npy"
+    latent.parent.mkdir(parents=True)
+    save_stored(latent, torch.zeros(1))
+    with pytest.raises(CorpusMismatchError, match="no receipt"):
+        prepare_data.prepare(config, _imagenet(tmp_path, 1), device="cpu")
+
+
+@pytest.mark.parametrize("limits", [{"batch_size": 0}, {"limit": 0}])
+def test_preparation_needs_positive_batch_size_and_limit(
+    tmp_path: Path,
+    limits: dict[str, int],
+) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        prepare_data.prepare(_source(tmp_path), tmp_path, device="cpu", **limits)
+
+
+def test_a_limited_run_fits_the_table_on_the_whole_source(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, 4)
+    codec = ScalarTableCodec.Config(num_fit_images=4)
+    limited = _source(tmp_path / "limited", codec=codec)
+    full = _source(tmp_path / "full", codec=codec.copy_tree())
+    _ = prepare_data.prepare(limited, raw, device="cpu", limit=1)
+    _ = prepare_data.prepare(full, raw, device="cpu")
+    tables = [
+        table_path(Path(c.working_dir) / c.latent_subdir).read_bytes()
+        for c in (limited, full)
+    ]
+    assert tables[0] == tables[1]
+
+
+def test_a_rerun_keeps_the_fit_record(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, 3)
+    config = _source(tmp_path, codec=ScalarTableCodec.Config(num_fit_images=2))
+    _ = prepare_data.prepare(config, raw, device="cpu")
+    fit = DictCodec.coerce(_receipt(config)["details"], default=None)["fit"]
+    _ = prepare_data.prepare(config, raw, device="cpu")
+    assert DictCodec.coerce(_receipt(config)["details"], default=None)["fit"] == fit
+    assert DictCodec.coerce(fit, default=None)["num_images"] == 2
+
+
+def test_latents_of_the_wrong_shape_are_refused_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_MeanAutoencoder, "encode", _three_channel_encode)
+    config = _source(tmp_path)
+    with pytest.raises(ValueError, match="declares"):
+        prepare_data.prepare(config, _imagenet(tmp_path, 1), device="cpu")
+    assert not any((Path(config.working_dir) / config.latent_subdir).rglob("*.npy"))
+
+
+def _three_channel_encode(model: nn.Module, images: Tensor) -> Tensor:
+    del model
+    return torch.zeros(images.shape[0], 3, *_GRID)
 
 
 def test_fit_sample_is_distinct_sorted_and_in_range() -> None:
@@ -216,23 +307,62 @@ def test_rerun_refuses_to_relabel_another_producers_bytes(tmp_path: Path) -> Non
     assert receipt.read_bytes() == before
 
 
+def test_receipt_only_never_replaces_a_receipt(tmp_path: Path) -> None:
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(config, _imagenet(tmp_path, 2), device="cpu")
+    receipt = Path(config.working_dir) / config.latent_subdir / RECEIPT
+    before = receipt.read_bytes()
+    config.codec = FloatCodec.Config(dtype=torch.float16)
+    with pytest.raises(CorpusMismatchError):
+        prepare_data.record_receipt(config)
+    assert receipt.read_bytes() == before
+
+
 def test_rerun_refuses_changed_encoding_seed(tmp_path: Path) -> None:
     raw = _imagenet(tmp_path, 2)
     config = _source(tmp_path)
-    config.autoencoder = tiny_invae()
+    config.autoencoder = tiny()
     config.seed = 1
     prepare_data.prepare(config, raw, device="cpu", limit=1)
     config.seed = 2
-    with pytest.raises(CorpusMismatchError, match="preparation"):
+    with pytest.raises(CorpusMismatchError, match=r"other settings:\n  seed"):
         prepare_data.prepare(config, raw, device="cpu")
 
 
+def test_resume_ignores_device_and_an_unseeded_batch_size(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, 3)
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(config, raw, device="cpu", batch_size=2, limit=1)
+    _ = prepare_data.prepare(config, raw, device="cpu:0", batch_size=3)
+    assert len(config.make()) == 3
+
+
 def test_shared_images_refuse_a_different_source(tmp_path: Path) -> None:
-    first, second = _imagenet(tmp_path / "first", 2), _imagenet(tmp_path / "second", 2)
+    first, second = _imagenet(tmp_path / "first", 2), _imagenet(tmp_path / "second", 3)
     prepare_data.prepare(_source(tmp_path), first, device="cpu")
     other = _source(tmp_path, latent_subdir="other")
-    with pytest.raises(CorpusMismatchError, match="image source"):
+    with pytest.raises(CorpusMismatchError, match="records_sha256"):
         prepare_data.prepare(other, second, device="cpu")
+
+
+def test_shared_images_accept_the_same_source_at_another_path(tmp_path: Path) -> None:
+    first = _imagenet(tmp_path / "first", 2)
+    second = Path(shutil.copytree(first, tmp_path / "second"))
+    prepare_data.prepare(_source(tmp_path), first, device="cpu")
+    other = _source(tmp_path, latent_subdir="other")
+    assert prepare_data.prepare(other, second, device="cpu") == 2
+
+
+def test_crops_that_record_no_source_are_refused_until_adopted(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, 2)
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(config, raw, device="cpu")
+    (Path(config.working_dir) / "images" / prepare_data.IMAGE_SOURCE).unlink()
+    other = _source(tmp_path, latent_subdir="other")
+    with pytest.raises(CorpusMismatchError, match="record no source"):
+        prepare_data.prepare(other, raw, device="cpu")
+    assert prepare_data.record_receipt(config, raw) == 2
+    assert prepare_data.prepare(other, raw, device="cpu") == 2
 
 
 def test_lower_limit_preserves_labels_for_existing_latents(tmp_path: Path) -> None:
@@ -260,19 +390,55 @@ def _non_finite_encode(model: nn.Module, images: Tensor) -> Tensor:
 
 
 def test_seeded_posterior_is_stable_after_resume(tmp_path: Path) -> None:
-    raw = _imagenet(tmp_path, 2)
+    """A limit inside a window still encodes the whole window, as a full run does.
+
+    At 4px the latent has 8 values, below the size where torch's CPU normal
+    sampler draws a batch's first rows identically to a smaller batch.
+    """
+    raw = _imagenet(tmp_path, 3)
     full, resumed = _source(tmp_path / "full"), _source(tmp_path / "resumed")
-    full.autoencoder = tiny_invae()
-    resumed.autoencoder = tiny_invae()
+    full.autoencoder = tiny()
+    full.autoencoder.image_size = 4
+    resumed.autoencoder = full.autoencoder.copy_tree()
     full.seed = resumed.seed = 7
-    prepare_data.prepare(full, raw, device="cpu", batch_size=1)
-    prepare_data.prepare(resumed, raw, device="cpu", batch_size=1, limit=1)
-    prepare_data.prepare(resumed, raw, device="cpu", batch_size=1)
-    for index in range(2):
+    prepare_data.prepare(full, raw, device="cpu", batch_size=2)
+    prepare_data.prepare(resumed, raw, device="cpu", batch_size=2, limit=1)
+    prepare_data.prepare(resumed, raw, device="cpu", batch_size=2)
+    for index in range(3):
         assert torch.equal(
             full.make()[index]["latent"],
             resumed.make()[index]["latent"],
         )
+
+
+def test_an_unseeded_resume_encodes_with_the_same_random_weights(
+    tmp_path: Path,
+) -> None:
+    """``posterior_mode`` is deterministic, so only the weights can differ."""
+    raw = _imagenet(tmp_path, 2)
+    full, resumed = _source(tmp_path / "full"), _source(tmp_path / "resumed")
+    full.autoencoder = tiny()
+    full.autoencoder.latent_fn = posterior_mode
+    resumed.autoencoder = full.autoencoder.copy_tree()
+    prepare_data.prepare(full, raw, device="cpu", batch_size=1)
+    prepare_data.prepare(resumed, raw, device="cpu", batch_size=1, limit=1)
+    _ = torch.rand(1)
+    prepare_data.prepare(resumed, raw, device="cpu", batch_size=1)
+    assert torch.equal(full.make()[1]["latent"], resumed.make()[1]["latent"])
+
+
+def test_resume_keeps_latents_already_saved_in_a_reencoded_window(
+    tmp_path: Path,
+) -> None:
+    """Every save renames a new file into place, so a rewrite changes the inode."""
+    raw = _imagenet(tmp_path, 2)
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(config, raw, device="cpu", batch_size=2, limit=1)
+    latent = Path(config.working_dir) / config.latent_subdir / "00000"
+    before = (latent / "img-latents-00000000.npy").stat().st_ino
+    _ = prepare_data.prepare(config, raw, device="cpu", batch_size=2)
+    assert (latent / "img-latents-00000000.npy").stat().st_ino == before
+    assert (latent / "img-latents-00000001.npy").is_file()
 
 
 def test_dataset_config_is_the_experiments_resolved_corpus() -> None:

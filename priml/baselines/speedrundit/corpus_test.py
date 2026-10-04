@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from functools import partial
 from typing import TYPE_CHECKING
+
+import json
 
 import pytest
 import torch
@@ -16,6 +18,7 @@ from priml.baselines.speedrundit.corpus import (
     save_stored,
     save_table,
     verify_receipt,
+    write_atomically,
     write_receipt,
 )
 from priml.baselines.speedrundit.latent_codec import (
@@ -23,14 +26,16 @@ from priml.baselines.speedrundit.latent_codec import (
     FloatCodec,
     ScalarTableCodec,
 )
-from priml.lib.custom_json import ListCodec
+from priml.lib.custom_json import DictCodec, loads
 from priml.model.vision_ae.custom_types import posterior_mode
 from priml.model.vision_ae.invae import INVAE
 from priml.model.vision_ae.latent_norm import ScaleLatents
 from priml.model.vision_ae.rae import RAE, rae_dinov2_base
+from priml.model.vision_ae.vtp import VTP
 
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from typing import BinaryIO
 
 
@@ -69,11 +74,10 @@ def test_non_finite_latents_are_refused_before_publication(
 def test_identity_collects_only_encoding_checkpoints() -> None:
     """Raw encoding depends on the encoder, independently of decoding and normalization."""
     identity = autoencoder_identity(rae_dinov2_base())
-    files = ListCodec.mappings(identity["checkpoints"])
-    names = {str(entry["filename"]) for entry in files}
-    assert names == {
-        "model.safetensors",
-    }
+    encoding = DictCodec.coerce(identity["encoding"], default=None)
+    assert "decoder" not in encoding
+    assert "latent_norm" not in encoding
+    assert "model.safetensors" in json.dumps(encoding)
     assert identity["latent_shape"] == [768, 16, 16]
 
 
@@ -91,6 +95,15 @@ def test_normalization_and_decoding_do_not_change_raw_identity() -> None:
     assert autoencoder_identity(config) == before
 
 
+def test_vtp_pixel_decoder_does_not_change_raw_identity() -> None:
+    config = VTP.Config()
+    before = autoencoder_identity(config)
+    config.pixel_decoder.num_layers = 1
+    assert autoencoder_identity(config) == before
+    config.trunk.patch_size = 8
+    assert autoencoder_identity(config) != before
+
+
 def test_interrupted_save_does_not_publish_partial_latent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -99,15 +112,12 @@ def test_interrupted_save_does_not_publish_partial_latent(
     monkeypatch.setattr("priml.baselines.speedrundit.corpus.np.save", _interrupted_save)
     with pytest.raises(OSError, match="interrupted"):
         save_stored(path, torch.zeros(1))
-    assert not path.exists()
+    assert not any(tmp_path.iterdir())
 
 
-def _interrupted_save(destination: Path | BinaryIO, array: object) -> None:
+def _interrupted_save(stream: BinaryIO, array: object) -> None:
     del array
-    if isinstance(destination, Path):
-        destination.write_bytes(b"\\x93NUMPY")
-    else:
-        destination.write(b"\\x93NUMPY")
+    _ = stream.write(b"\x93NUMPY")
     raise OSError("interrupted")
 
 
@@ -166,9 +176,50 @@ def test_a_table_is_pinned_by_its_digest(tmp_path: Path) -> None:
 
 def test_load_table_refuses_decreasing_persisted_levels(tmp_path: Path) -> None:
     levels = torch.linspace(1, 0, NUM_LEVELS).unsqueeze(0)
-    torch.save({"levels": levels, "thresholds": levels[:, 1:]}, tmp_path / "codec.pt")
+    torch.save({"levels": levels}, tmp_path / "codec.pt")
     with pytest.raises(ValueError, match="non-decreasing"):
         load_table(tmp_path, ScalarTableCodec.Config().make())
+
+
+def test_a_receipt_of_another_format_is_refused(tmp_path: Path) -> None:
+    codec_config = FloatCodec.Config()
+    path = write_receipt(
+        tmp_path,
+        autoencoder=INVAE.Config(),
+        codec_config=codec_config,
+        codec=codec_config.make(),
+        table_sha256=None,
+        details={},
+    )
+    receipt = DictCodec.coerce(loads(path.read_text()), default=None)
+    _ = path.write_text(json.dumps({**receipt, "format": 1}))
+    with pytest.raises(CorpusMismatchError, match="format 1"):
+        verify_receipt(
+            tmp_path,
+            autoencoder=INVAE.Config(),
+            codec_config=codec_config,
+            codec=codec_config.make(),
+            table_sha256=None,
+        )
+
+
+def test_a_lambda_cannot_identify_a_corpus() -> None:
+    config = INVAE.Config(latent_fn=lambda posterior: posterior.mode())
+    with pytest.raises(ValueError, match="module-level function"):
+        _ = autoencoder_identity(config)
+
+
+def test_concurrent_writers_never_share_a_staging_file(tmp_path: Path) -> None:
+    """A second writer finishing inside the first must not move the first's file."""
+    path = tmp_path / "shared.png"
+    write_atomically(path, partial(_write_around, path=path))
+    assert path.read_bytes() == b"outer"
+    assert [entry.name for entry in tmp_path.iterdir()] == ["shared.png"]
+
+
+def _write_around(stream: BinaryIO, *, path: Path) -> None:
+    write_atomically(path, lambda inner: inner.write(b"inner"))
+    _ = stream.write(b"outer")
 
 
 def test_a_fitted_codec_without_its_table_is_refused(tmp_path: Path) -> None:

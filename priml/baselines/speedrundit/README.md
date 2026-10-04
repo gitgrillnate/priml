@@ -36,9 +36,11 @@ beside one shared `images/` directory:
 ```
 
 Each latent directory holds one `.npy` per image, `dataset.json` (labels),
-`corpus.json` (the receipt), and, for a fitted codec, `codec.pt`. The loader
-compares the receipt's autoencoder, checkpoint digests, latent shape, codec,
-and table digest with the experiment's config and refuses a mismatch.
+`corpus.json` (the receipt), and, for a fitted codec, `codec.pt`;
+`images/source.json` binds the shared crops to their ImageNet source. The
+loader compares the receipt's autoencoder encoding config (checkpoints by
+digest), latent shape, codec, and table digest with the experiment's config,
+and refuses a mismatch or a corpus whose preparation has not finished.
 
 Prepare an experiment's corpus from extracted ImageNet:
 
@@ -47,13 +49,15 @@ uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_da
 ```
 
 The preparer builds exactly the autoencoder and codec the experiment declares,
-fits a fitted codec first on a subset of the images, and resumes an
-interrupted run. Autoencoder weights are pinned Hugging Face revisions with
-SHA-256 digests and download into the Hugging Face cache. An existing REG
-corpus is admitted without re-encoding:
+fits a fitted codec first on a sample of every source image, and resumes an
+interrupted run when the source, producers, seed, and (for a seeded corpus)
+batch size are unchanged. Autoencoder weights are pinned Hugging Face revisions
+with SHA-256 digests and download into the Hugging Face cache. An existing REG
+corpus is admitted without re-encoding; `--source` also binds crops that record
+no source, so other corpora can be prepared beside it:
 
 ```sh
-uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --experiment exp000 --receipt-only
+uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --experiment exp000 --receipt-only --source /datasets/imagenet
 ```
 
 ## Latent storage
@@ -78,7 +82,7 @@ variances span 1,120x across channels (and at most 3.2x across positions
 within one). Before a uint8 corpus replaces the float16 one, measure it:
 
 ```sh
-uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.benchmark_codec --experiment exp003 --source /datasets/imagenet --decode --device cuda --output codecs.json
+uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.benchmark_codec --experiment exp003 --source /datasets/imagenet --decode --device cuda --output /opt/scratch/artifacts/speedrundit/codecs.json
 ```
 
 It scores every candidate codec (float32, bfloat16, float16, and uint8 tables

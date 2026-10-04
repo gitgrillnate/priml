@@ -62,7 +62,8 @@ class SpeedrunTrainStep(TrainStep):
                 ),
             ),
         )
-        """Parameter shadows support distributed models that cannot be copied."""
+        """Exponential moving average of student parameters, kept as parameter
+        shadows: a module-copy shadow cannot deepcopy a composable distributed model."""
 
         gradient_clip_norm: float = 1.0
         """Global gradient norm clipping threshold."""

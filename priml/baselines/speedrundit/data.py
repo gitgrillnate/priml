@@ -25,6 +25,8 @@ import torch
 
 from priml.baselines.speedrundit.corpus import (
     LABELS,
+    PREPARING,
+    CorpusMismatchError,
     load_stored,
     load_table,
     verify_receipt,
@@ -91,13 +93,18 @@ class PairedImageLatentDataset(Dataset[dict[str, Tensor]]):
             if isinstance(self.codec, FittedCodec)
             else None
         )
-        verify_receipt(
+        details = verify_receipt(
             latent_root,
             autoencoder=config.autoencoder,
             codec_config=config.codec,
             codec=self.codec,
             table_sha256=table_sha256,
         )
+        if details.get("provenance") == PREPARING:
+            raise CorpusMismatchError(
+                f"{latent_root} is unfinished: scripts/prepare_data.py was "
+                "interrupted or is still running. Rerun it to complete the corpus.",
+            )
         self.latent_shape = config.autoencoder.latent_shape()
         labels = read_labels(latent_root / LABELS)
         images = {

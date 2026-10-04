@@ -6,19 +6,27 @@ which autoencoder, checkpoint, latent geometry, codec, and table produced it.
 The loader checks the receipt against its own config, so a corpus encoded by
 one autoencoder or codec is never silently read as another's.
 
-The check compares IDENTITIES -- class, checkpoint digests, latent shape,
-stored dtype, table digest -- not the full printed config, which also records
-defaults that can change without changing a single stored byte. The full
+The check compares what can change a stored byte: the autoencoder's ENCODING
+config tree, checkpoints by digest rather than by location, and the codec's
+class, stored dtype, and table digest. Decode-only fields (the decoder, the
+pixel decoder, and the latent normalizer) are left out, so a corpus survives
+re-normalization or a new decoder. Every encoding field counts, defaults
+included: a new field changes the identity even when it changes no byte, and
+``scripts/prepare_data.py --receipt-only`` re-records such a corpus. The full
 ``pformat`` is kept in the receipt for a reader, not compared.
 """
 
 from __future__ import annotations
 
 from dataclasses import fields, is_dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
 import hashlib
 import json
+import os
+import tempfile
+import types
 
 from configgle.pprinting import pformat
 
@@ -30,8 +38,8 @@ from priml.model.vision_ae.custom_types import CheckpointFile
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-    from pathlib import Path
+    from collections.abc import Callable, Mapping
+    from typing import BinaryIO
 
     from configgle import Makeable
     from numpy.typing import NDArray
@@ -53,9 +61,40 @@ LABELS: Final = "dataset.json"
 FORMAT_VERSION: Final = 2
 """Bumped when the receipt's schema changes meaning."""
 
+PREPARING: Final = "preparing"
+"""The provenance of a receipt pinned before preparation finished."""
+
+# Decode-only modules and diffusion normalization never produce raw latent bytes.
+_DECODE_FIELDS: Final = frozenset({"decoder", "pixel_decoder", "latent_norm"})
+
 
 class CorpusMismatchError(ValueError):
-    """A corpus was produced by a different autoencoder or codec than configured."""
+    """A corpus on disk does not match what the experiment or preparer declares."""
+
+
+def write_atomically(path: Path, write: Callable[[BinaryIO], object]) -> None:
+    """Write a file through a private sibling renamed into place.
+
+    An interrupted write leaves the old file or none, never a partial one, and
+    two processes writing one path never share a staging file.
+
+    Args:
+      path: Destination; its directory must exist.
+      write: Writes the content to the open binary stream it is given.
+
+    """
+    descriptor, staging = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".partial",
+    )
+    staged = Path(staging)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            _ = write(stream)
+        _ = staged.replace(path)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def save_stored(path: Path, stored: Tensor) -> None:
@@ -68,16 +107,20 @@ def save_stored(path: Path, stored: Tensor) -> None:
       path: Destination.
       stored: Tensor in a codec's stored dtype.
 
+    Raises:
+      ValueError: A floating ``stored`` holds a non-finite value.
+
     """
     tensor = stored.detach().cpu().contiguous()
-    if tensor.is_floating_point() and not np.isfinite(tensor.float().numpy()).all():
-        raise ValueError("Stored latents must be finite; the codec dtype overflowed.")
+    # A CPU tensor already, so reading its values costs no device synchronization.
+    if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all()):
+        raise ValueError(
+            f"{path}: stored latents must be finite; the codec overflowed.",
+        )
     if tensor.dtype == torch.bfloat16:
         tensor = tensor.view(torch.int16)
-    staging = path.with_suffix(".npy.partial")
-    with staging.open("wb") as stream:
-        np.save(stream, tensor.numpy())
-    staging.replace(path)
+    array = tensor.numpy()
+    write_atomically(path, lambda stream: np.save(stream, array))
 
 
 def load_stored(path: Path, dtype: torch.dtype) -> Tensor:
@@ -110,13 +153,16 @@ def autoencoder_identity(config: VisionAutoencoderConfig) -> dict[str, object]:
       config: The experiment's autoencoder config.
 
     Returns:
-      identity: Encoding configuration, shape, and encoding checkpoints.
+      identity: Class, latent shape, and the encoding config tree.
+
+    Raises:
+      ValueError: An encoding field holds a lambda or a closure, which print
+        alike whatever they compute.
 
     """
     return {
         "class": _qualified(config),
         "latent_shape": list(config.latent_shape()),
-        "checkpoints": [file.identity() for file in _checkpoint_files(config)],
         "encoding": _encoding_identity(config),
     }
 
@@ -169,11 +215,8 @@ def save_table(directory: Path, codec: FittedCodec) -> str:
 
     """
     path = table_path(directory)
-    staging = path.with_suffix(".pt.partial")
     table = {name: value.detach().cpu() for name, value in codec.table().items()}
-    _audit_table(table)
-    torch.save(table, staging)
-    staging.replace(path)
+    write_atomically(path, lambda stream: torch.save(table, stream))
     return _sha256(path)
 
 
@@ -182,7 +225,7 @@ def load_table(directory: Path, codec: FittedCodec) -> str:
 
     Args:
       directory: Latent directory.
-      codec: The codec to restore.
+      codec: The codec to restore; it validates the table.
 
     Returns:
       sha256: Hex digest of the table file.
@@ -201,17 +244,7 @@ def load_table(directory: Path, codec: FittedCodec) -> str:
         torch.load(path, map_location="cpu", weights_only=True),
     )
     codec.load_table(table)
-    _audit_table(table)
     return _sha256(path)
-
-
-def _audit_table(table: Mapping[str, Tensor]) -> None:
-    """Audit CPU artifact values once, outside reusable device kernels."""
-    arrays = {name: value.numpy() for name, value in table.items()}
-    if any(not np.isfinite(value).all() for value in arrays.values()):
-        raise ValueError("Codec tables must contain finite values.")
-    if not (np.diff(arrays["levels"], axis=-1) >= 0).all():
-        raise ValueError("Codec levels must be non-decreasing in every row.")
 
 
 def write_receipt(
@@ -232,7 +265,8 @@ def write_receipt(
       codec: The built (and, if fitted, fitted) codec.
       table_sha256: Digest of the table, for a fitted codec.
       details: Provenance for a reader: image source, counts, seed, device,
-        batch size, error statistics.
+        batch size, error statistics. A ``provenance`` of :data:`PREPARING`
+        marks a corpus the loader must refuse.
 
     Returns:
       path: The receipt.
@@ -240,13 +274,13 @@ def write_receipt(
     """
     receipt = {
         "format": FORMAT_VERSION,
-        "autoencoder": {
-            **autoencoder_identity(autoencoder),
-            "config": pformat(autoencoder, hide_default_values=False),
+        "identity": {
+            "autoencoder": autoencoder_identity(autoencoder),
+            "codec": codec_identity(codec_config, codec, table_sha256),
         },
-        "codec": {
-            **codec_identity(codec_config, codec, table_sha256),
-            "config": pformat(codec_config, hide_default_values=False),
+        "config": {
+            "autoencoder": pformat(autoencoder, hide_default_values=False),
+            "codec": pformat(codec_config, hide_default_values=False),
         },
         "suggested_latent_norm": pformat(
             autoencoder.latent_norm,
@@ -254,10 +288,9 @@ def write_receipt(
         ),
         "details": dict(details),
     }
+    text = json.dumps(receipt, indent=2, sort_keys=True, default=str)
     path = directory / RECEIPT
-    staging = path.with_suffix(".json.partial")
-    _ = staging.write_text(json.dumps(receipt, indent=2, sort_keys=True, default=str))
-    staging.replace(path)
+    write_atomically(path, lambda stream: stream.write(text.encode()))
     return path
 
 
@@ -268,7 +301,7 @@ def verify_receipt(
     codec_config: Makeable[LatentCodec],
     codec: LatentCodec,
     table_sha256: str | None,
-) -> None:
+) -> dict[str, object]:
     """Raise unless the corpus receipt matches the configured producers.
 
     Args:
@@ -278,9 +311,13 @@ def verify_receipt(
       codec: The built codec (table loaded, if fitted).
       table_sha256: Digest of the loaded table, for a fitted codec.
 
+    Returns:
+      details: The receipt's provenance, as :func:`write_receipt` recorded it.
+
     Raises:
       FileNotFoundError: The corpus has no receipt.
-      CorpusMismatchError: A recorded identity differs, naming every field.
+      CorpusMismatchError: The receipt has another format, or a recorded
+        identity differs, naming every field.
 
     """
     path = directory / RECEIPT
@@ -290,29 +327,50 @@ def verify_receipt(
             "record an existing REG corpus with its --receipt-only mode.",
         )
     receipt = DictCodec.coerce(loads(path.read_text()), default=None)
-    recorded_autoencoder = DictCodec.coerce(receipt["autoencoder"], default=None)
-    recorded_codec = DictCodec.coerce(receipt["codec"], default=None)
-    expected = {
-        **{f"autoencoder.{k}": v for k, v in autoencoder_identity(autoencoder).items()},
-        **{
-            f"codec.{k}": v
-            for k, v in codec_identity(codec_config, codec, table_sha256).items()
+    if receipt.get("format") != FORMAT_VERSION:
+        raise CorpusMismatchError(
+            f"{path} has receipt format {receipt.get('format')!r}, not "
+            f"{FORMAT_VERSION}. Re-encode the corpus with scripts/prepare_data.py, or "
+            "delete the receipt and re-record the corpus with --receipt-only.",
+        )
+    expected = _flatten(
+        {
+            "autoencoder": autoencoder_identity(autoencoder),
+            "codec": codec_identity(codec_config, codec, table_sha256),
         },
-    }
-    recorded = {
-        **{f"autoencoder.{k}": v for k, v in recorded_autoencoder.items()},
-        **{f"codec.{k}": v for k, v in recorded_codec.items()},
-    }
-    problems = [
-        f"{key}: corpus {recorded.get(key)!r}, config {value!r}"
-        for key, value in expected.items()
-        if _jsonable(recorded.get(key)) != _jsonable(value)
-    ]
+    )
+    problems = mismatches(_flatten(receipt["identity"]), expected)
     if problems:
         raise CorpusMismatchError(
             f"{directory} was not produced by the configured autoencoder and codec:\n  "
             + "\n  ".join(problems),
         )
+    return DictCodec.coerce(receipt["details"], default=None)
+
+
+def mismatches(
+    recorded: Mapping[str, object],
+    expected: Mapping[str, object],
+) -> list[str]:
+    """Name every field whose recorded and expected values differ.
+
+    Args:
+      recorded: Values read from disk.
+      expected: Values the configuration declares.
+
+    Returns:
+      problems: ``"key: corpus <recorded>, config <expected>"`` per difference,
+        a field one side lacks shown as ``<absent>``.
+
+    """
+    return [
+        f"{key}: corpus {recorded.get(key, '<absent>')!r}, "
+        f"config {expected.get(key, '<absent>')!r}"
+        for key in sorted(recorded.keys() | expected.keys())
+        if key not in recorded
+        or key not in expected
+        or _jsonable(recorded[key]) != _jsonable(expected[key])
+    ]
 
 
 def _qualified(config: object) -> str:
@@ -321,12 +379,8 @@ def _qualified(config: object) -> str:
     return f"{made.__module__}.{made.__qualname__}"
 
 
-# Decode-only modules and diffusion normalization never produce raw latent bytes.
-_DECODE_FIELDS: Final = frozenset({"decoder", "pixel_decoder", "latent_norm"})
-
-
 def _encoding_identity(config: object) -> object:
-    """Describe encoding inputs without machine-specific checkpoint locations."""
+    """Describe encoding inputs, naming checkpoints by digest rather than location."""
     made = getattr(type(config), "parent_class", None)
     if isinstance(made, type) and issubclass(made, CheckpointFile):
         return cast("Makeable[CheckpointFile]", config).make().identity()
@@ -343,24 +397,26 @@ def _encoding_identity(config: object) -> object:
         }
     if isinstance(config, list | tuple):
         return [_encoding_identity(item) for item in cast("list[object]", config)]
+    # ``pformat`` masks a function's address, so two lambdas, or two closures
+    # over different captured state, would share one identity.
+    if isinstance(config, types.FunctionType) and (
+        "<lambda>" in config.__qualname__ or "<locals>" in config.__qualname__
+    ):
+        raise ValueError(
+            f"{config.__qualname__} cannot identify a corpus; use a module-level "
+            "function so the receipt names what it computes.",
+        )
     return pformat(config, hide_default_values=False)
 
 
-def _checkpoint_files(config: object) -> list[CheckpointFile]:
-    """Return encoding checkpoints reachable in a config tree, in field order."""
-    found: list[CheckpointFile] = []
-    made = getattr(type(config), "parent_class", None)
-    if isinstance(made, type) and issubclass(made, CheckpointFile):
-        built = cast("Makeable[CheckpointFile]", config).make()
-        return [built]
-    if is_dataclass(config) and not isinstance(config, type):
-        for entry in fields(config):
-            if entry.name not in _DECODE_FIELDS:
-                found += _checkpoint_files(getattr(config, entry.name))  # pyright: ignore[reportAny] -- Dataclass fields are read by name.
-    elif isinstance(config, list | tuple):
-        for item in cast("list[object]", config):
-            found += _checkpoint_files(item)
-    return found
+def _flatten(value: object, prefix: str = "") -> dict[str, object]:
+    """Key every leaf of nested mappings by its dotted path, so a diff names the leaf."""
+    if not isinstance(value, dict):
+        return {prefix: value}
+    flat: dict[str, object] = {}
+    for key, child in cast("dict[str, object]", value).items():
+        flat |= _flatten(child, f"{prefix}.{key}" if prefix else key)
+    return flat
 
 
 def _jsonable(value: object) -> object:

@@ -68,7 +68,8 @@ def lloyd_max(
       levels: ``[len(init)]`` float64, non-decreasing; sums run in float64.
 
     Raises:
-      ValueError: ``values`` or ``init`` is empty or not one-dimensional.
+      ValueError: ``values`` or ``init`` is empty or not one-dimensional, or
+        either is not finite.
 
     """
     if values.ndim != 1 or init.ndim != 1:
@@ -76,6 +77,10 @@ def lloyd_max(
     if values.numel() == 0 or init.numel() == 0:
         raise ValueError("lloyd_max needs a nonempty sample and at least one level.")
     x = values.detach().to(torch.float64).sort().values
+    # Sorted, so the ends bound every value (NaN sorts last). The loop reads host
+    # scalars every iteration anyway; without this a NaN ran every iteration.
+    if math.isnan(float(x[-1])) or math.isinf(float(x[0])) or math.isinf(float(x[-1])):
+        raise ValueError("lloyd_max needs finite values.")
     num_levels = init.numel()
     distinct = cast("Tensor", torch.unique_consecutive(x))  # pyright: ignore[reportAny] -- torch stubs type unique_consecutive as Any.
     if distinct.numel() <= num_levels:
@@ -86,6 +91,8 @@ def lloyd_max(
     total_sq = torch.cat([zero, (x * x).cumsum(0)])
     levels = init.detach().to(device=x.device, dtype=torch.float64).sort().values
     previous = _distortion(x, levels, total, total_sq)
+    if math.isnan(previous) or math.isinf(previous):
+        raise ValueError("lloyd_max needs finite initial levels.")
     for _ in range(max_iterations):
         bounds = _cell_bounds(x, levels)
         levels = _centroids(levels, bounds, total)
@@ -139,13 +146,15 @@ def high_resolution_levels(
       levels: ``[num_levels]`` float64, non-decreasing.
 
     Raises:
-      ValueError: ``values`` is empty or not one-dimensional.
+      ValueError: ``values`` is empty, not one-dimensional, or not finite.
 
     """
     if values.ndim != 1 or values.numel() == 0:
         raise ValueError("high_resolution_levels expects a nonempty 1-D sample.")
     x = values.detach().to(torch.float64)
     low, high = float(x.min()), float(x.max())
+    if math.isnan(low) or math.isinf(low) or math.isinf(high):
+        raise ValueError("high_resolution_levels needs finite values.")
     if low == high:
         return x.new_full((num_levels,), low)
     bins = math.isqrt(x.numel()) if bins is None else bins
@@ -205,7 +214,9 @@ def midpoints(levels: Tensor) -> Tensor:
       thresholds: ``[..., L - 1]`` midpoints, in ``levels``' dtype.
 
     """
-    return (levels[..., 1:] + levels[..., :-1]) / 2
+    # Halving is exact, so this rounds once like ``(a + b) / 2``, without overflowing
+    # when the sum of two finite levels would.
+    return levels[..., 1:] / 2 + levels[..., :-1] / 2
 
 
 def quantize(values: Tensor, thresholds: Tensor) -> Tensor:
@@ -216,7 +227,8 @@ def quantize(values: Tensor, thresholds: Tensor) -> Tensor:
     the first or last level.
 
     Args:
-      values: ``[R, M]`` finite values.
+      values: ``[R, M]`` finite values; a NaN codes as the last index, since
+        checking values here would synchronize the device on every call.
       thresholds: ``[R, L - 1]`` sorted boundaries, one row per row of values.
 
     Returns:
