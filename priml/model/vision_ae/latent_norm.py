@@ -10,8 +10,8 @@ a storage codec (which never sees it): a corpus stores raw latents, so changing
 normalization never requires re-encoding.
 
 Normalizers are plain objects, not modules: they hold no parameters and run on
-data rather than in a model slot. Statistics stay on the CPU and move to the
-latent's device per call, as the RAE reference moves them.
+data rather than in a model slot. Statistics load on the CPU and are copied to
+each device a latent arrives on once, then reused there.
 """
 
 from __future__ import annotations
@@ -38,9 +38,10 @@ class ScaleLatents:
         """Multiplier into diffusion space; INVAE publishes 0.3099."""
 
     def __init__(self, config: Config) -> None:
-        if not math.isfinite(config.scale) or config.scale == 0:
+        scale = config.scale
+        if math.isnan(scale) or math.isinf(scale) or scale == 0:
             raise ValueError("ScaleLatents needs a finite nonzero scale.")
-        self.scale = config.scale
+        self.scale = scale
 
     def normalize(self, latent: Tensor, /) -> Tensor:
         """Return ``latent * scale``.
@@ -91,6 +92,9 @@ class ElementwiseLatentStats:
         """Added to the variance before the square root."""
 
     def __init__(self, config: Config) -> None:
+        eps = config.eps
+        if math.isnan(eps) or math.isinf(eps) or eps < 0:
+            raise ValueError("ElementwiseLatentStats needs a finite nonnegative eps.")
         if config.stats is None:
             raise ValueError("ElementwiseLatentStats needs a stats file.")
         payload = cast(
@@ -106,7 +110,8 @@ class ElementwiseLatentStats:
             raise ValueError("ElementwiseLatentStats needs a var in its stats file.")
         self.mean = payload.get("mean")
         self.var = var
-        self.eps = config.eps
+        self.eps = eps
+        self._on_device: dict[torch.device, tuple[Tensor | None, Tensor]] = {}
 
     def normalize(self, latent: Tensor, /) -> Tensor:
         """Return ``(latent - mean) / sqrt(var + eps)``.
@@ -118,9 +123,10 @@ class ElementwiseLatentStats:
           normalized: Standardized latent.
 
         """
-        if self.mean is not None:
-            latent = latent - self.mean.to(latent.device)
-        return latent / torch.sqrt(self.var.to(latent.device) + self.eps)
+        mean, var = self._statistics(latent.device)
+        if mean is not None:
+            latent = latent - mean
+        return latent / torch.sqrt(var + self.eps)
 
     def denormalize(self, latent: Tensor, /) -> Tensor:
         """Return ``latent * sqrt(var + eps) + mean``.
@@ -132,10 +138,20 @@ class ElementwiseLatentStats:
           raw: Raw latent.
 
         """
-        latent = latent * torch.sqrt(self.var.to(latent.device) + self.eps)
-        if self.mean is not None:
-            latent = latent + self.mean.to(latent.device)
+        mean, var = self._statistics(latent.device)
+        latent = latent * torch.sqrt(var + self.eps)
+        if mean is not None:
+            latent = latent + mean
         return latent
+
+    def _statistics(self, device: torch.device) -> tuple[Tensor | None, Tensor]:
+        """Return ``mean`` and ``var`` on ``device``, copying them there once."""
+        # A host-to-device ``to`` from pageable memory blocks until the copy lands,
+        # so a copy per call would stall the stream on every batch.
+        if device not in self._on_device:
+            mean = None if self.mean is None else self.mean.to(device)
+            self._on_device[device] = mean, self.var.to(device)
+        return self._on_device[device]
 
 
 class ChannelLatentStats:
@@ -160,7 +176,8 @@ class ChannelLatentStats:
         """Applied after standardizing; VTP's configs set 1.0."""
 
     def __init__(self, config: Config) -> None:
-        if not math.isfinite(config.multiplier) or config.multiplier == 0:
+        multiplier = config.multiplier
+        if math.isnan(multiplier) or math.isinf(multiplier) or multiplier == 0:
             raise ValueError("ChannelLatentStats needs a finite nonzero multiplier.")
         if config.stats is None:
             raise ValueError("ChannelLatentStats needs a stats file.")
@@ -172,9 +189,17 @@ class ChannelLatentStats:
                 weights_only=True,
             ),
         )
-        self.mean = payload["mean"]
-        self.std = payload["std"]
-        self.multiplier = config.multiplier
+        mean, std = payload["mean"], payload["std"]
+        # Broadcasting would accept a bare ``[C]`` and standardize the width axis.
+        if mean.shape != std.shape or mean.shape[:1] + mean.shape[2:] != (1, 1, 1):
+            raise ValueError(
+                "ChannelLatentStats needs mean and std of shape [1, C, 1, 1]; got "
+                f"{list(mean.shape)} and {list(std.shape)}.",
+            )
+        self.mean = mean
+        self.std = std
+        self.multiplier = multiplier
+        self._on_device: dict[torch.device, tuple[Tensor, Tensor]] = {}
 
     def normalize(self, latent: Tensor, /) -> Tensor:
         """Return ``(latent - mean) / std * multiplier``.
@@ -186,7 +211,7 @@ class ChannelLatentStats:
           normalized: Standardized, scaled latent.
 
         """
-        mean, std = self.mean.to(latent.device), self.std.to(latent.device)
+        mean, std = self._statistics(latent.device)
         return (latent - mean) / std * self.multiplier
 
     def denormalize(self, latent: Tensor, /) -> Tensor:
@@ -199,5 +224,12 @@ class ChannelLatentStats:
           raw: Raw latent.
 
         """
-        mean, std = self.mean.to(latent.device), self.std.to(latent.device)
+        mean, std = self._statistics(latent.device)
         return (latent * std) / self.multiplier + mean
+
+    def _statistics(self, device: torch.device) -> tuple[Tensor, Tensor]:
+        """Return ``mean`` and ``std`` on ``device``, copying them there once."""
+        # As in ``ElementwiseLatentStats``: a copy per call would block every batch.
+        if device not in self._on_device:
+            self._on_device[device] = self.mean.to(device), self.std.to(device)
+        return self._on_device[device]

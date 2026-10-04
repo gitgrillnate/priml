@@ -59,6 +59,7 @@ from priml.cost import (
     map_cost,
     matmul_cost,
     reduction_cost,
+    resolve_dtype,
     traffic,
 )
 from priml.math.custom_types import TensorFn
@@ -81,11 +82,13 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from safetensors.torch import load_file
-    from transformers import Dinov2WithRegistersModel
+
+    import transformers
 else:
     from wrapt import lazy_import
 
     load_file = lazy_import("safetensors.torch", "load_file")
+    transformers = lazy_import("transformers")
 
 
 @runtime_checkable
@@ -186,8 +189,9 @@ class Dinov2WithRegisters(nn.Module):
             position-table interpolation whenever HF runs it (a patch count
             other than the table's, or a non-square input), the position add,
             every layer, and the affine-free final norm, all over the CLS and
-            register tokens too. Dropping the leading tokens is a view. The
-            mask token is owned but never read.
+            register tokens too. HF interpolates in float32 whatever ``dtype``,
+            casting the table there and the result back. Dropping the leading
+            tokens is a view. The mask token is owned but never read.
 
             Args:
               input_grid: ``(height, width)`` pixels in; a scalar is square.
@@ -283,8 +287,23 @@ class Dinov2WithRegisters(nn.Module):
                     grid_in=(table_grid, table_grid),
                     grid_out=grid,
                     antialias=True,
-                    dtype=dtype,
+                    dtype=torch.float32,
                 ) + _concatenate_cost(elements=(1 + patches) * channels, dtype=dtype)
+                if resolve_dtype(dtype) != torch.float32:
+                    # The table in, the resized grid back out, each phase.
+                    embeddings += sum(
+                        (
+                            traffic(
+                                phase,
+                                "elementwise",
+                                elements=(positions + patches) * channels,
+                                dtype=cast_dtype,
+                            )
+                            for phase in ("primal", "adjoint")
+                            for cast_dtype in (dtype, torch.float32)
+                        ),
+                        Cost(),
+                    )
             final_norm = cost(
                 LayerNorm.Config(channels, elementwise_affine=False),
                 seq_len=seq_len,
@@ -302,10 +321,6 @@ class Dinov2WithRegisters(nn.Module):
 
     def __init__(self, config: Config) -> None:
         super().__init__()
-        # Inline, not ``lazy_import``: ``transformers`` replaces its own
-        # ``sys.modules`` entry during init, which a lazy proxy cannot follow.
-        import transformers  # noqa: PLC0415 -- The optional hub dependency stays off module import.
-
         hf_config = transformers.Dinov2WithRegistersConfig(
             hidden_size=config.channels_hidden,
             num_hidden_layers=config.num_layers,
@@ -333,8 +348,8 @@ class Dinov2WithRegisters(nn.Module):
             # latent values by at most 3 float32 ULP.
             attn_implementation="eager",
         )
-        self.encoder: Dinov2WithRegistersModel = transformers.Dinov2WithRegistersModel(
-            hf_config,
+        self.encoder: transformers.Dinov2WithRegistersModel = (
+            transformers.Dinov2WithRegistersModel(hf_config)
         )
         mlp_class = transformers.models.dinov2_with_registers.modeling_dinov2_with_registers.Dinov2WithRegistersMLP
         for mlp in self.encoder.modules():
@@ -435,7 +450,7 @@ class ViTMAEAttention(nn.Module):
 
     def __init__(self, channels: int, num_heads: int) -> None:
         super().__init__()
-        self.attention = ViTMAESelfAttention(channels, num_heads)
+        self.attention = ViTMAESelfAttention(channels, num_heads=num_heads)
         self.output = ViTMAESelfOutput(channels)
 
     @override
@@ -491,9 +506,13 @@ class ViTMAELayer(nn.Module):
         super().__init__()
         # Registration order is the reference's; it fixes the checkpoint key
         # order and the draw order of a random initialization.
-        self.attention = ViTMAEAttention(channels, num_heads)
-        self.intermediate = ViTMAEIntermediate(channels, channels_hidden, activation)
-        self.output = ViTMAEOutput(channels, channels_hidden)
+        self.attention = ViTMAEAttention(channels, num_heads=num_heads)
+        self.intermediate = ViTMAEIntermediate(
+            channels,
+            channels_hidden=channels_hidden,
+            activation=activation,
+        )
+        self.output = ViTMAEOutput(channels, channels_hidden=channels_hidden)
         self.layernorm_before = nn.LayerNorm(channels, eps=eps)
         self.layernorm_after = nn.LayerNorm(channels, eps=eps)
 
@@ -554,8 +573,8 @@ class GeneralDecoder(nn.Module):
 
         @override
         def finalize(self) -> Self:
-            side = math.isqrt(self.num_patches) if self.num_patches > 0 else 0
-            if side * side != self.num_patches:
+            n = self.num_patches
+            if n <= 0 or math.isqrt(n) ** 2 != n:
                 raise ValueError(
                     f"num_patches {self.num_patches} must be a positive square.",
                 )
@@ -910,6 +929,12 @@ class RAE(nn.Module):
 
     def __init__(self, config: Config) -> None:
         super().__init__()
+        mean, std = config.encoder.pixel_mean, config.encoder.pixel_std
+        if any(math.isnan(v) or math.isinf(v) for v in (*mean, *std)) or 0 in std:
+            raise ValueError(
+                "RAE needs finite pixel statistics and a nonzero std; got mean "
+                f"{mean}, std {std}.",
+            )
         self.encoder_image_size = config.encoder_image_size
         self.latent_shape = config.latent_shape()
         # Encoder before decoder, as the reference registers them.
@@ -1097,10 +1122,12 @@ def _activation_cost(
 ) -> Cost:
     """Cost ``activation`` over ``channels`` elements.
 
-    Torch's exact-erf GELU -- the reference's, and HF's ``"gelu"`` -- is a
-    builtin that cannot carry :func:`~priml.cost.set_cost`, so it is priced
+    Torch's exact-erf GELU -- the reference's, and HF's ``"gelu"`` -- is priced
     here at eight operations each way, the count ``priml.baselines.sudoku``
-    gives exact GELU. Any other activation must cost itself.
+    gives exact GELU, rather than registered on torch's function with
+    :func:`~priml.cost.set_cost`: registering would impose this module's count
+    on every importer, and ``cost(gelu)`` would work only once this module had
+    been imported. Any other activation must cost itself.
     """
     if activation is functional.gelu:
         return map_cost(primal=8, adjoint=8)(channels=channels, dtype=dtype)

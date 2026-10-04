@@ -14,15 +14,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Final
 
+import math
+
 from configgle.testing import assert_pprint_golden
 from torch import Tensor, nn
 
 import pytest
 import torch
 
-from priml.cost import cost
+from priml.cost import cost, map_cost, set_cost
 from priml.model.vision_ae.custom_types import (
     Autoencoder,
+    Posterior,
     VariationalAutoencoder,
     posterior_mode,
 )
@@ -122,6 +125,45 @@ def test_mode_cost_removes_exactly_the_measured_sampling_traffic() -> None:
         - cost(modal, batch_size=1, dtype=None)["bytes", "elementwise"].sum()
     )
     assert measured_delta == analytical_delta
+
+
+@set_cost(map_cost(primal=1, adjoint=1))
+def _doubled_mode(posterior: Posterior) -> Tensor:
+    """Return twice the mode: a latent function carrying a cost of its own."""
+    return 2 * posterior.mode()
+
+
+def _unpriced_mode(posterior: Posterior) -> Tensor:
+    """Return the mode: a latent function carrying no cost."""
+    return posterior.mode()
+
+
+def test_cost_prices_the_latent_fn_by_its_own_cost() -> None:
+    """Any latent function with ``set_cost`` is priced; one without is refused."""
+    doubled, modal, unpriced = tiny(), tiny(), tiny()
+    doubled.latent_fn = _doubled_mode
+    modal.latent_fn = posterior_mode
+    unpriced.latent_fn = _unpriced_mode
+    latents = 2 * math.prod(doubled.latent_shape())
+    doubling = map_cost(primal=1, adjoint=1)(channels=latents, dtype=None)
+    assert cost(doubled, batch_size=2, dtype=None) == cost(
+        modal,
+        batch_size=2,
+        dtype=None,
+    ) + doubling.only("primal")
+    with pytest.raises(TypeError, match="_unpriced_mode has no cost"):
+        _ = cost(unpriced, batch_size=2, dtype=None)
+
+
+def test_cost_charges_the_input_rescale_in_float32() -> None:
+    """``image.float() / 127.5 - 1`` is float32 whatever the activation dtype."""
+    analytical = cost(tiny(), batch_size=1, dtype=torch.bfloat16)
+    pixels = 3 * 16 * 16
+    # The cast writes the pixels; the divide and the subtract each read and write them.
+    assert analytical["bytes", "primal", "elementwise", torch.float32] == 4 * (
+        pixels + 2 * 2 * pixels
+    )
+    assert analytical["flops", "primal", "elementwise", torch.float32] == 2 * pixels
 
 
 def test_sample_draws_from_an_explicit_generator() -> None:

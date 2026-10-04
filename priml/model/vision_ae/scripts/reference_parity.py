@@ -1,6 +1,5 @@
 #!/bin/sh
 # ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
-# ruff: noqa: E402 -- Every import after cap_math_threads() must follow it.
 # fmt: off
 '''' 2>/dev/null #
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"
@@ -14,7 +13,8 @@ paths on the same inputs. Following ``docs/SKILL.bit-for-bit.md``:
    reconstruction path is PAIRED with the port code that mirrors it, or NOT
    PORTED with a reason. A definition in neither table fails the run.
 2. Randomness. ``torch.randn`` is pinned on both sides to the same stored
-   draws, and each call site is counted; every other random primitive raises.
+   draws, and each call site is counted; every other seeded random op raises,
+   a native kernel's included.
 3. Bisection. Forward hooks record every submodule's outputs under its module
    name on both sides, and every name both sides share is compared with
    ``torch.equal``. All mismatches are collected into one report.
@@ -52,28 +52,22 @@ Examples:
 
 from __future__ import annotations
 
-from priml.conftest import cap_math_threads
-
-
-# Before torch loads: the goldens this mints must come from the environment
-# pytest replays them in.
-cap_math_threads()
-
 from collections import Counter, defaultdict
 from collections.abc import (
     Callable,
     Generator,
+    Iterator,
     Mapping,
     Sequence,
 )
 from contextlib import (
-    ExitStack,
     contextmanager,
     nullcontext,
 )
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Protocol, Self, cast
+from types import TracebackType
+from typing import TYPE_CHECKING, Final, Protocol, cast, override
 
 import argparse
 import ast
@@ -81,19 +75,15 @@ import dataclasses
 import importlib
 import inspect
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import types
 
-from safetensors.torch import save_file
 from torch import Tensor, nn
-from torchvision.transforms import Normalize
-from torchvision.transforms.functional import (
-    to_tensor,
-)
+from torch.utils._python_dispatch import TorchDispatchMode
 
-import coverage
 import torch
 
 from priml.hub import get_cache_dir
@@ -124,6 +114,27 @@ from priml.testing.golden import (
 )
 
 import priml
+
+
+if TYPE_CHECKING:
+    from safetensors.torch import save_file
+    from torch._ops import OpOverload
+    from torchvision.transforms import Normalize
+    from torchvision.transforms.functional import to_tensor
+
+    import coverage
+    import transformers
+else:
+    from wrapt import lazy_import
+
+    # The branch measurement and the reference-side tools are what running the
+    # comparison needs; importing this module needs none of them, and the
+    # optional ``coverage`` and ``transformers`` are absent from a plain install.
+    coverage = lazy_import("coverage")
+    transformers = lazy_import("transformers")
+    save_file = lazy_import("safetensors.torch", "save_file")
+    Normalize = lazy_import("torchvision.transforms", "Normalize")
+    to_tensor = lazy_import("torchvision.transforms.functional", "to_tensor")
 
 
 _PRIML: Final = Path(priml.__file__).resolve().parent
@@ -226,10 +237,14 @@ class Reference:
     """Reference definition (a class covers its methods) -> why nothing mirrors it."""
 
     reference_unreached: Mapping[str, str]
-    """``"<file>::<source line>"`` of a reference branch no input drives both ways -> why."""
+    """Reference branches no input drives both ways -> why.
+
+    Keyed ``"<file>::<Qualified.name>::<source line>"``: the definition is part of
+    the key, so an entry never silences the same line in another function.
+    """
 
     port_unreached: Mapping[str, str]
-    """The same, for branches in the port's ``model/vision_ae`` code."""
+    """The same, for branches in the paired port code."""
 
     extra_outputs: Mapping[str, str]
     """Module names whose calls return more tensors on one side -> why."""
@@ -308,34 +323,28 @@ _INVAE: Final = Reference(
         ),
     },
     reference_unreached={
-        "models/invae.py::if self.with_conv:": (
-            "Every published model resamples with a convolution."
-        ),
-        "models/invae.py::if temb is not None:": "INVAE has no time embedding.",
-        "models/invae.py::if temb_channels > 0:": "INVAE has no time embedding.",
-        "models/invae.py::if self.use_conv_shortcut:": (
-            "The encoder and decoder build every ResnetBlock without it."
-        ),
-        "models/invae.py::if self.deterministic:": (
-            "AutoencoderKL.encode never builds a deterministic posterior."
-        ),
-        "models/invae.py::if not self.use_variational:": ("VAE_F16D32 is variational."),
-        "models/invae.py::if self.give_pre_end:": "Never set by AutoencoderKL.",
+        "models/invae.py::Upsample.__init__::if self.with_conv:": "Every published model resamples with a convolution.",
+        "models/invae.py::Upsample.forward::if self.with_conv:": "Every published model resamples with a convolution.",
+        "models/invae.py::Downsample.__init__::if self.with_conv:": "Every published model resamples with a convolution.",
+        "models/invae.py::Downsample.forward::if self.with_conv:": "Every published model resamples with a convolution.",
+        "models/invae.py::ResnetBlock.forward::if temb is not None:": "INVAE has no time embedding.",
+        "models/invae.py::ResnetBlock.__init__::if temb_channels > 0:": "INVAE has no time embedding.",
+        "models/invae.py::ResnetBlock.__init__::if self.use_conv_shortcut:": "The encoder and decoder build every ResnetBlock without it.",
+        "models/invae.py::ResnetBlock.forward::if self.use_conv_shortcut:": "The encoder and decoder build every ResnetBlock without it.",
+        "models/invae.py::DiagonalGaussianDistribution.__init__::if self.deterministic:": "AutoencoderKL.encode never builds a deterministic posterior.",
+        "models/invae.py::AutoencoderKL.encode::if not self.use_variational:": "VAE_F16D32 is variational.",
+        "models/invae.py::Decoder.forward::if self.give_pre_end:": "Never set by AutoencoderKL.",
     },
     port_unreached={
-        "model/vision_ae/invae.py::if self.with_conv:": (
-            "The port builds every resampler with a convolution."
-        ),
-        "model/vision_ae/invae.py::if temb is not None:": (
-            "INVAE has no time embedding."
-        ),
-        "model/vision_ae/invae.py::if temb_channels > 0:": (
-            "INVAE has no time embedding."
-        ),
-        "model/vision_ae/invae.py::if self.use_conv_shortcut:": (
-            "The encoder and decoder build every ResnetBlock without it."
-        ),
-        "model/vision_ae/invae.py::if self.give_pre_end:": "INVAE never sets it.",
+        "model/vision_ae/invae.py::Upsample.__init__::if self.with_conv:": "The port builds every resampler with a convolution.",
+        "model/vision_ae/invae.py::Upsample.forward::if self.with_conv:": "The port builds every resampler with a convolution.",
+        "model/vision_ae/invae.py::Downsample.__init__::if self.with_conv:": "The port builds every resampler with a convolution.",
+        "model/vision_ae/invae.py::Downsample.forward::if self.with_conv:": "The port builds every resampler with a convolution.",
+        "model/vision_ae/invae.py::ResnetBlock.forward::if temb is not None:": "INVAE has no time embedding.",
+        "model/vision_ae/invae.py::ResnetBlock.__init__::if temb_channels > 0:": "INVAE has no time embedding.",
+        "model/vision_ae/invae.py::ResnetBlock.__init__::if self.use_conv_shortcut:": "The encoder and decoder build every ResnetBlock without it.",
+        "model/vision_ae/invae.py::ResnetBlock.forward::if self.use_conv_shortcut:": "The encoder and decoder build every ResnetBlock without it.",
+        "model/vision_ae/invae.py::Decoder.forward::if self.give_pre_end:": "INVAE never sets it.",
     },
     extra_outputs={},
 )
@@ -462,72 +471,39 @@ _RAE: Final = Reference(
         ),
     },
     reference_unreached={
-        "src/stage1/rae.py::if len(keys.missing_keys) > 0:": (
-            "A load report; the port loads strictly, so no key is ever missing."
-        ),
-        "src/stage1/rae.py::if self.training and self.noise_tau > 0:": (
-            "Training-time noising; both sides only evaluate."
-        ),
-        "src/stage1/rae.py::if self.reshape_to_2d:": (
-            "The published RAE reshapes; the port always does."
-        ),
-        "src/stage1/encoders/dinov2.py::if normalize:": (
-            "The published RAE strips the final norm's affine; the port always does."
-        ),
-        f"{_RAE_DECODER}::if config.hidden_size % config.num_attention_heads != 0 "
-        'and not hasattr(config, "embedding_size"):': (
-            "A misconfiguration guard; the port's matching one is tested in rae_test."
-        ),
-        f"{_RAE_DECODER}::if head_mask is not None:": "No caller passes a head mask.",
-        f"{_RAE_DECODER}::if isinstance(config.hidden_act, str):": (
-            "Every ViTMAE config names its activation; the port injects the function."
-        ),
-        f"{_RAE_DECODER}::if num_patches_h * num_patches_w != patchified_pixel_values.shape[1]:": (
-            "A shape guard the decoder's own output always satisfies."
-        ),
-        f"{_RAE_DECODER}::if drop_cls_token:": "RAE.decode passes drop_cls_token=False.",
-        f"{_RAE_DECODER}::if l == self.num_patches:": (
-            "The latent always has the decoder's grid; on another the port "
-            "raises, which rae_test drives."
-        ),
-        f"{_RAE_DECODER}::if not return_dict:": "RAE.decode reads the returned record.",
-        f"{_RAE_DECODER}::if output_attentions:": "RAE.decode asks for no attentions.",
-        f"{_RAE_DECODER}::if interpolate_pos_encoding:": (
-            "RAE.decode never asks; the port raises on another grid instead."
-        ),
-        f"{_RAE_DECODER}::if output_hidden_states:": (
-            "RAE.decode asks for no hidden states."
-        ),
-        f"{_RAE_DECODER}::if self.gradient_checkpointing and self.training:": (
-            "Training-only."
-        ),
-        f"{_RAE_DECODER}::if add_cls_token:": (
-            "initialize_weights always asks for the CLS row."
-        ),
-        f"{_RAE_DECODER}::if embed_dim % 2 != 0:": (
-            "A misconfiguration guard; the port's GeneralDecoder.Config refuses "
-            "a width the table cannot split."
-        ),
+        "src/stage1/rae.py::RAE.__init__::if len(keys.missing_keys) > 0:": "A load report; the port loads strictly, so no key is ever missing.",
+        "src/stage1/rae.py::RAE.encode::if self.training and self.noise_tau > 0:": "Training-time noising; both sides only evaluate.",
+        "src/stage1/rae.py::RAE.encode::if self.reshape_to_2d:": "The published RAE reshapes; the port always does.",
+        "src/stage1/rae.py::RAE.decode::if self.reshape_to_2d:": "The published RAE reshapes; the port always does.",
+        "src/stage1/encoders/dinov2.py::Dinov2withNorm.__init__::if normalize:": "The published RAE strips the final norm's affine; the port always does.",
+        'src/stage1/decoders/decoder.py::ViTMAESelfAttention.__init__::if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):': "A misconfiguration guard; the port's matching one is tested in rae_test.",
+        "src/stage1/decoders/decoder.py::ViTMAESelfAttention.forward::if head_mask is not None:": "No caller passes a head mask.",
+        "src/stage1/decoders/decoder.py::ViTMAEIntermediate.__init__::if isinstance(config.hidden_act, str):": "Every ViTMAE config names its activation; the port injects the function.",
+        "src/stage1/decoders/decoder.py::GeneralDecoder.unpatchify::if num_patches_h * num_patches_w != patchified_pixel_values.shape[1]:": "A shape guard the decoder's own output always satisfies.",
+        "src/stage1/decoders/decoder.py::GeneralDecoder.forward::if drop_cls_token:": "RAE.decode passes drop_cls_token=False.",
+        "src/stage1/decoders/decoder.py::GeneralDecoder.interpolate_latent::if l == self.num_patches:": "The latent always has the decoder's grid; on another the port raises, which rae_test drives.",
+        "src/stage1/decoders/decoder.py::GeneralDecoder.forward::if not return_dict:": "RAE.decode reads the returned record.",
+        "src/stage1/decoders/decoder.py::GeneralDecoder.forward::if output_attentions:": "RAE.decode asks for no attentions.",
+        "src/stage1/decoders/decoder.py::GeneralDecoder.forward::if interpolate_pos_encoding:": "RAE.decode never asks; the port raises on another grid instead.",
+        "src/stage1/decoders/decoder.py::GeneralDecoder.forward::if output_hidden_states:": "RAE.decode asks for no hidden states.",
+        "src/stage1/decoders/decoder.py::GeneralDecoder.forward::if self.gradient_checkpointing and self.training:": "Training-only.",
+        "src/stage1/decoders/decoder.py::get_2d_sincos_pos_embed::if add_cls_token:": "initialize_weights always asks for the CLS row.",
+        "src/stage1/decoders/decoder.py::get_2d_sincos_pos_embed_from_grid::if embed_dim % 2 != 0:": "A misconfiguration guard; the port's GeneralDecoder.Config refuses a width the table cannot split.",
+        "src/stage1/decoders/decoder.py::get_1d_sincos_pos_embed_from_grid::if embed_dim % 2 != 0:": "A misconfiguration guard; the port's GeneralDecoder.Config refuses a width the table cannot split.",
     },
     port_unreached={
-        "model/vision_ae/latent_norm.py::if config.stats is None:": (
-            "An error guard; latent_norm_test drives it."
-        ),
-        "model/vision_ae/latent_norm.py::if var is None:": (
-            "An error guard; latent_norm_test drives it."
-        ),
-        "model/vision_ae/rae.py::if config.checkpoint is not None:": (
-            "The comparison loads both checkpoints; rae_test builds without them."
-        ),
-        "model/vision_ae/rae.py::if tokens.shape[1] != self.num_patches:": (
-            "Raises where the reference resizes; rae_test drives it."
-        ),
-        "model/vision_ae/rae.py::if (channels, height, width) != self.latent_shape:": (
-            "Raises where the reference reshapes; rae_test drives it."
-        ),
-        "model/vision_ae/rae.py::if channels % num_heads:": (
-            "A misconfiguration guard; valid configs never take it."
-        ),
+        "model/vision_ae/latent_norm.py::ElementwiseLatentStats.__init__::if config.stats is None:": "An error guard; latent_norm_test drives it.",
+        "model/vision_ae/latent_norm.py::ElementwiseLatentStats.__init__::if var is None:": "An error guard; latent_norm_test drives it.",
+        "model/vision_ae/rae.py::Dinov2WithRegisters.__init__::if config.checkpoint is not None:": "The comparison loads both checkpoints; rae_test builds without them.",
+        "model/vision_ae/rae.py::GeneralDecoder.forward::if tokens.shape[1] != self.num_patches:": "Raises where the reference resizes; rae_test drives it.",
+        "model/vision_ae/rae.py::RAE.decode::if (channels, height, width) != self.latent_shape:": "Raises where the reference reshapes; rae_test drives it.",
+        "model/vision_ae/rae.py::ViTMAESelfAttention.__init__::if channels % num_heads:": "A misconfiguration guard; rae_test drives it.",
+        "math/pixel.py::rgb2float::if not x_.dtype.is_floating_point:": "An input-type guard; the encoders always pass float_dtype=float32.",
+        "math/pixel.py::rgb2float::if inplace and x_.requires_grad and x_.is_leaf:": "The encoders never scale a leaf requiring grad in place.",
+        "math/pixel.py::rgb2float::if unit_interval:": "Both encoders normalize from [0, 1], so they always pass unit_interval=True.",
+        "math/position_embedding.py::sincos_position_table::if channels % 4:": "A misconfiguration guard; GeneralDecoder.Config refuses such a width first, and position_embedding_test drives it.",
+        "model/vision_ae/latent_norm.py::ElementwiseLatentStats.__init__::if math.isnan(eps) or math.isinf(eps) or eps < 0:": "An error guard; latent_norm_test drives it.",
+        "model/vision_ae/rae.py::RAE.__init__::if any(math.isnan(v) or math.isinf(v) for v in (*mean, *std)) or 0 in std:": "An error guard; rae_test drives it.",
     },
     extra_outputs={
         "encoder.encoder": (
@@ -867,55 +843,62 @@ _VTP: Final = Reference(
         f"{_VTP_LAYERS}/activation.py::QuickGELU": _VTP_TEXT,
     },
     reference_unreached={
-        "vtp/models/vtp_hf/modeling_vtp.py::elif isinstance(module, nn.Embedding):": "VTP's reconstruction modules hold no embedding tables.",
-        "vtp/models/vtp_hf/modeling_vtp.py::if N != feat_h * feat_w:": "A shape guard the trunk's own tokens always satisfy.",
-        "vtp/models/vtp_hf/modeling_vtp.py::if config.train_clip:": "Reconstruction builds VTPModel without the CLIP side.",
-        "vtp/models/vtp_hf/modeling_vtp.py::if config.train_reconstruction:": "Reconstruction always builds the pixel decoder.",
-        "vtp/models/vtp_hf/modeling_vtp.py::if self.pixel_decoder is None:": "Reconstruction always builds the pixel decoder.",
-        "vtp/models/encoders/vision_transformer_bottleneck.py::if vit_feature_bottleneck is None:": "Every published trunk has a bottleneck.",
-        "vtp/models/encoders/vision_transformer_bottleneck.py::if self.vit_feature_bottleneck != self.original_embed_dim:": "Every published bottleneck narrows; the port refuses an equal width.",
-        "vtp/models/encoders/vision_transformer_bottleneck.py::if self.feature_bottleneck is not None:": "Every published trunk has a bottleneck.",
-        "vtp/models/encoders/vision_transformer_bottleneck.py::if self.feature_bottleneck is None or not use_bottleneck:": "get_reconstruction_latents always asks for the bottleneck.",
-        "vtp/models/encoders/vision_transformer_bottleneck.py::if isinstance(output, list):": "Reconstruction encodes one tensor, not a crop list.",
-        "vtp/models/encoders/vision_transformer_bottleneck.py::for item in output:": "Reconstruction encodes one tensor, not a crop list.",
-        "vtp/models/encoders/vision_transformer.py::if len(ignored_kwargs) > 0:": "A warning for unknown constructor keywords; none are passed.",
-        "vtp/models/encoders/vision_transformer.py::if self.n_storage_tokens > 0:": "VTP's trunk has no register tokens.",
-        "vtp/models/encoders/vision_transformer.py::if untie_cls_and_patch_norms:": "VTP ties the CLS and patch norms.",
-        "vtp/models/encoders/vision_transformer.py::if untie_global_and_local_cls_norm:": "VTP ties the global and local CLS norms.",
-        "vtp/models/encoders/vision_transformer.py::if self.untie_cls_and_patch_norms or self.untie_global_and_local_cls_norm:": "VTP ties both norm pairs.",
-        "vtp/models/encoders/vision_transformer.py::if self.untie_global_and_local_cls_norm and self.training and idx == 1:": "VTP ties both norm pairs, so this branch is never reached.",
-        "vtp/models/encoders/vision_transformer.py::elif self.untie_cls_and_patch_norms:": "VTP ties both norm pairs, so this branch is never reached.",
-        "vtp/models/encoders/vision_transformer.py::if masks is not None:": "Masked-token pretraining; reconstruction masks nothing.",
-        "vtp/models/encoders/vision_transformer.py::if self.rope_embed is not None:": "VTP always uses rotary positions.",
-        "vtp/models/encoders/vision_transformer.py::if isinstance(x, torch.Tensor):": "Reconstruction encodes one tensor, not a crop list.",
-        "vtp/models/encoders/vision_transformer.py::if is_training:": "get_reconstruction_latents always asks for the token dict.",
-        "vtp/models/encoders/vision_transformer.py::if isinstance(module, LayerScale):": "LayerScale is identity at VTP's layerscale_init=None.",
-        "vtp/models/decoders/pixel_decoder.py::if len(ignored_kwargs) > 0:": "A warning for unknown constructor keywords; none are passed.",
-        "vtp/models/decoders/pixel_decoder.py::if isinstance(m, nn.Conv2d):": "Its only modules are the two convolutions.",
-        "vtp/models/decoders/pixel_decoder.py::if m.bias is not None:": "Both convolutions are biased.",
-        "vtp/models/layers/attention.py::if rope is not None:": "VTP always uses rotary positions.",
-        "vtp/models/layers/block.py::elif isinstance(x_or_x_list, list):": "The trunk and decoder pass one tensor.",
-        "vtp/models/layers/block.py::if rope_or_rope_list is None:": "The trunk and decoder pass one tensor.",
-        "vtp/models/layers/block.py::if rope_list is not None:": "Reached only for a list input; the blocks get one tensor.",
-        "vtp/models/layers/block.py::if self.training and effective_drop_ratio > 0.0:": "Training-only stochastic depth.",
-        "vtp/models/layers/embeddings.py::if isinstance(x, tuple):": "Every published patch size is an int.",
-        "vtp/models/layers/embeddings.py::if not self.flatten_embedding:": "VTP flattens its patch embedding.",
-        "vtp/models/layers/embeddings.py::if self.proj.bias is not None:": "The patch projection is biased.",
-        "vtp/models/layers/embeddings.py::if (base is None and not both_periods) or (base is not None and both_periods):": "A misconfiguration guard; VTP configures a base.",
-        "vtp/models/layers/embeddings.py::if self.base is not None:": "VTP configures a base, not explicit periods.",
-        'vtp/models/layers/embeddings.py::if self.normalize_coords == "max":': "VTP normalizes each side separately, the one mode the port implements.",
-        'vtp/models/layers/embeddings.py::elif self.normalize_coords == "min":': "VTP normalizes each side separately, the one mode the port implements.",
-        'vtp/models/layers/embeddings.py::elif self.normalize_coords == "separate":': "VTP normalizes each side separately, the one mode the port implements.",
-        "vtp/models/layers/embeddings.py::if self.training and self.shift_coords is not None:": "Training-only coordinate augmentation.",
-        "vtp/models/layers/embeddings.py::if self.training and self.jitter_coords is not None:": "Training-only coordinate augmentation.",
-        "vtp/models/layers/embeddings.py::if self.training and self.rescale_coords is not None:": "Training-only coordinate augmentation.",
+        "vtp/models/vtp_hf/modeling_vtp.py::VTPPreTrainedModel._init_weights::elif isinstance(module, nn.Embedding):": "VTP's reconstruction modules hold no embedding tables.",
+        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel._patch_tokens_to_4d::if N != feat_h * feat_w:": "A shape guard the trunk's own tokens always satisfy.",
+        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel.__init__::if config.train_clip:": "Reconstruction builds VTPModel without the CLIP side.",
+        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel._init_vision_components::if config.train_clip:": "Reconstruction builds VTPModel without the CLIP side.",
+        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel._init_vision_components::if config.train_reconstruction:": "Reconstruction always builds the pixel decoder.",
+        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel.get_latents_decoded_images::if self.pixel_decoder is None:": "Reconstruction always builds the pixel decoder.",
+        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.__init__::if vit_feature_bottleneck is None:": "Every published trunk has a bottleneck.",
+        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.__init__::if self.vit_feature_bottleneck != self.original_embed_dim:": "Every published bottleneck narrows; the port refuses an equal width.",
+        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck._apply_feature_bottleneck::if self.feature_bottleneck is not None:": "Every published trunk has a bottleneck.",
+        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.forward_features::if self.feature_bottleneck is None or not use_bottleneck:": "get_reconstruction_latents always asks for the bottleneck.",
+        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.forward_features::if isinstance(output, list):": "Reconstruction encodes one tensor, not a crop list.",
+        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.forward_features::for item in output:": "Reconstruction encodes one tensor, not a crop list.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.__init__::if len(ignored_kwargs) > 0:": "A warning for unknown constructor keywords; none are passed.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.__init__::if self.n_storage_tokens > 0:": "VTP's trunk has no register tokens.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.init_weights::if self.n_storage_tokens > 0:": "VTP's trunk has no register tokens.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.prepare_tokens_with_masks::if self.n_storage_tokens > 0:": "VTP's trunk has no register tokens.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.__init__::if untie_cls_and_patch_norms:": "VTP ties the CLS and patch norms.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.__init__::if untie_global_and_local_cls_norm:": "VTP ties the global and local CLS norms.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features_list::if self.untie_cls_and_patch_norms or self.untie_global_and_local_cls_norm:": "VTP ties both norm pairs.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features_list::if self.untie_global_and_local_cls_norm and self.training and idx == 1:": "VTP ties both norm pairs, so this branch is never reached.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features_list::elif self.untie_cls_and_patch_norms:": "VTP ties both norm pairs, so this branch is never reached.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.prepare_tokens_with_masks::if masks is not None:": "Masked-token pretraining; reconstruction masks nothing.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features_list::if self.rope_embed is not None:": "VTP always uses rotary positions.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features::if isinstance(x, torch.Tensor):": "Reconstruction encodes one tensor, not a crop list.",
+        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward::if is_training:": "get_reconstruction_latents always asks for the token dict.",
+        "vtp/models/encoders/vision_transformer.py::init_weights_vit::if isinstance(module, LayerScale):": "LayerScale is identity at VTP's layerscale_init=None.",
+        "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder.__init__::if len(ignored_kwargs) > 0:": "A warning for unknown constructor keywords; none are passed.",
+        "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder.init_weights::if isinstance(m, nn.Conv2d):": "Its only modules are the two convolutions.",
+        "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder.init_weights::if m.bias is not None:": "Both convolutions are biased.",
+        "vtp/models/layers/attention.py::SelfAttention.compute_attention::if rope is not None:": "VTP always uses rotary positions.",
+        "vtp/models/layers/block.py::SelfAttentionBlock.forward::elif isinstance(x_or_x_list, list):": "The trunk and decoder pass one tensor.",
+        "vtp/models/layers/block.py::SelfAttentionBlock.forward::if rope_or_rope_list is None:": "The trunk and decoder pass one tensor.",
+        "vtp/models/layers/block.py::SelfAttentionBlock._forward_list::if rope_list is not None:": "Reached only for a list input; the blocks get one tensor.",
+        "vtp/models/layers/block.py::SelfAttentionBlock._forward_list::if self.training and effective_drop_ratio > 0.0:": "Training-only stochastic depth.",
+        "vtp/models/layers/embeddings.py::make_2tuple::if isinstance(x, tuple):": "Every published patch size is an int.",
+        "vtp/models/layers/embeddings.py::PatchEmbed.forward::if not self.flatten_embedding:": "VTP flattens its patch embedding.",
+        "vtp/models/layers/embeddings.py::PatchEmbed.reset_parameters::if self.proj.bias is not None:": "The patch projection is biased.",
+        "vtp/models/layers/embeddings.py::RopePositionEmbedding.__init__::if (base is None and not both_periods) or (base is not None and both_periods):": "A misconfiguration guard; VTP configures a base.",
+        "vtp/models/layers/embeddings.py::RopePositionEmbedding._init_weights::if self.base is not None:": "VTP configures a base, not explicit periods.",
+        'vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::if self.normalize_coords == "max":': "VTP normalizes each side separately, the one mode the port implements.",
+        'vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::elif self.normalize_coords == "min":': "VTP normalizes each side separately, the one mode the port implements.",
+        'vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::elif self.normalize_coords == "separate":': "VTP normalizes each side separately, the one mode the port implements.",
+        "vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::if self.training and self.shift_coords is not None:": "Training-only coordinate augmentation.",
+        "vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::if self.training and self.jitter_coords is not None:": "Training-only coordinate augmentation.",
+        "vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::if self.training and self.rescale_coords is not None:": "Training-only coordinate augmentation.",
     },
     port_unreached={
-        "model/vision_ae/vtp.py::elif isinstance(module, nn.Embedding):": "Mirrors the reference's branch; VTP holds no embedding tables.",
-        "model/vision_ae/vtp.py::if conv.bias is not None:": "Mirrors the reference's guard; both convolutions are biased.",
-        "model/vision_ae/vtp.py::if self.proj.bias is not None:": "Mirrors the reference's guard; the patch projection is biased.",
-        "model/vision_ae/vtp.py::if embed_dim % (4 * num_heads):": "A misconfiguration guard; valid configs never take it.",
-        "model/vision_ae/vtp.py::if height % self.patch_size or width % self.patch_size:": "Raises on a side off the patch grid; vtp_test drives it.",
+        "model/vision_ae/vtp.py::init_weights_post::elif isinstance(module, nn.Embedding):": "Mirrors the reference's branch; VTP holds no embedding tables.",
+        "model/vision_ae/vtp.py::DinoV3PixelDecoder.__init__::if conv.bias is not None:": "Mirrors the reference's guard; both convolutions are biased.",
+        "model/vision_ae/vtp.py::PatchEmbed.reset_parameters::if self.proj.bias is not None:": "Mirrors the reference's guard; the patch projection is biased.",
+        "model/vision_ae/vtp.py::RopePositionEmbedding.__init__::if embed_dim % (4 * num_heads):": "A misconfiguration guard; vtp_test drives it.",
+        "model/vision_ae/vtp.py::VTP.encode::if height % self.patch_size or width % self.patch_size:": "Raises on a side off the patch grid; vtp_test drives it.",
+        "math/pixel.py::rgb2float::if not x_.dtype.is_floating_point:": "An input-type guard; the encoders always pass float_dtype=float32.",
+        "math/pixel.py::rgb2float::if inplace and x_.requires_grad and x_.is_leaf:": "The encoders never scale a leaf requiring grad in place.",
+        "math/pixel.py::rgb2float::if unit_interval:": "Both encoders normalize from [0, 1], so they always pass unit_interval=True.",
+        "model/vision_ae/vtp.py::VTP.__init__::if any(math.isnan(v) or math.isinf(v) for v in stats) or 0 in config.pixel_std:": "An error guard; vtp_test drives it.",
     },
     extra_outputs={},
     uncompared={
@@ -936,7 +919,7 @@ _VTP: Final = Reference(
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Definition:
     """One function, method, or class, and the body lines that are its own."""
 
@@ -954,49 +937,63 @@ def definitions(root: Path, relative: str) -> list[Definition]:
       relative: The file, as inventory keys spell it.
 
     Returns:
-      definitions: One per ``def`` and ``class``, keyed ``"<relative>::<qualname>"``.
+      definitions: One per ``def`` and ``class``, keyed ``"<relative>::<qualname>"``,
+        under an ``if``, ``try``, or ``with`` as much as at the top.
 
     """
     path = root / relative
-    found: list[Definition] = []
+    tree = ast.parse(path.read_text())
+    return list(_definitions(tree, path=path, prefix=f"{relative}::"))
 
-    def walk(node: ast.AST, prefix: str) -> None:
-        for child in ast.iter_child_nodes(node):
-            if not isinstance(
-                child,
+
+def _definitions(node: ast.AST, *, path: Path, prefix: str) -> Iterator[Definition]:
+    """Yield every definition below ``node``, through any compound statement."""
+    for child in ast.iter_child_nodes(node):
+        if not isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            yield from _definitions(child, path=path, prefix=prefix)
+            continue
+        key = f"{prefix}{child.name}"
+        own = set(range(child.body[0].lineno, (child.end_lineno or child.lineno) + 1))
+        for inner in ast.walk(child):
+            if inner is not child and isinstance(
+                inner,
                 ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
             ):
-                continue
-            name = f"{prefix}{child.name}"
-            end = child.end_lineno or child.lineno
-            own = set(range(child.body[0].lineno, end + 1))
-            for inner in ast.walk(child):
-                if inner is not child and isinstance(
-                    inner,
-                    ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
-                ):
-                    own -= set(
-                        range(inner.lineno, (inner.end_lineno or inner.lineno) + 1),
-                    )
-            found.append(
-                Definition(
-                    key=f"{relative}::{name}",
-                    path=path,
-                    function=not isinstance(child, ast.ClassDef),
-                    lines=frozenset(own),
-                ),
-            )
-            walk(child, f"{name}.")
+                own -= set(range(inner.lineno, (inner.end_lineno or inner.lineno) + 1))
+        yield Definition(
+            key=key,
+            path=path,
+            function=not isinstance(child, ast.ClassDef),
+            lines=frozenset(own),
+        )
+        yield from _definitions(child, path=path, prefix=f"{key}.")
 
-    walk(ast.parse(path.read_text()), "")
-    return found
+
+class Measured(Protocol):
+    """What the inventory reads of a ``coverage.Coverage`` run with branches."""
+
+    def get_data(self) -> MeasuredLines:
+        """Return the lines each file ran."""
+        ...
+
+    def branch_stats(self, morf: str) -> dict[int, tuple[int, int]]:
+        """Return ``line -> (exits, exits taken)`` for each branch in ``morf``."""
+        ...
+
+
+class MeasuredLines(Protocol):
+    """The executed lines of a measured run."""
+
+    def lines(self, filename: str) -> list[int] | None:
+        """Return the lines ``filename`` ran, or ``None`` if it never ran."""
+        ...
 
 
 def inventory_problems(
     reference: Reference,
     *,
     clone: Path,
-    measured: coverage.Coverage,
+    measured: Measured,
 ) -> list[str]:
     """Check the inventory against the reference files and the measured run.
 
@@ -1060,17 +1057,11 @@ def inventory_problems(
 
     problems += _branch_problems(
         [theirs[k] for k in reference.paired if k in theirs and theirs[k].function],
-        root=clone,
         allowed=reference.reference_unreached,
         measured=measured,
     )
     problems += _branch_problems(
-        [
-            ours[k]
-            for k in sorted(port_keys & ours.keys())
-            if ours[k].function and k.startswith("model/vision_ae/")
-        ],
-        root=_PRIML,
+        [ours[k] for k in sorted(port_keys & ours.keys()) if ours[k].function],
         allowed=reference.port_unreached,
         measured=measured,
     )
@@ -1080,22 +1071,22 @@ def inventory_problems(
 def _branch_problems(
     functions: Sequence[Definition],
     *,
-    root: Path,
     allowed: Mapping[str, str],
-    measured: coverage.Coverage,
+    measured: Measured,
 ) -> list[str]:
     """Report each branch in ``functions`` not taken both ways, less the allowlist."""
     problems: list[str] = []
     used: set[str] = set()
     for definition in functions:
         source = definition.path.read_text().splitlines()
-        relative = definition.path.relative_to(root).as_posix()
         for line, (total, taken) in measured.branch_stats(str(definition.path)).items():
             if line not in definition.lines or taken >= total:
                 continue
             text = source[line - 1].strip()
-            if f"{relative}::{text}" in allowed:
-                used.add(f"{relative}::{text}")
+            # Keyed by the definition as well as the text: one entry must not
+            # silence the same line written in another function.
+            if f"{definition.key}::{text}" in allowed:
+                used.add(f"{definition.key}::{text}")
                 continue
             problems.append(
                 f"{definition.key}:{line} takes {taken} of {total} exits: {text}",
@@ -1108,63 +1099,47 @@ def _branch_problems(
     return problems
 
 
-class PinnedRandom:
-    """Serve ``torch.randn`` from stored draws; refuse every other random primitive."""
+class PinnedRandom(TorchDispatchMode):
+    """Serve ``randn`` from stored draws; refuse every other seeded random op.
 
-    _REFUSED: Final = (
-        "rand",
-        "rand_like",
-        "randn_like",
-        "randint",
-        "randint_like",
-        "randperm",
-        "normal",
-        "bernoulli",
-        "multinomial",
-        "poisson",
-    )
-    _REFUSED_METHODS: Final = (
-        "normal_",
-        "uniform_",
-        "bernoulli_",
-        "random_",
-        "exponential_",
-        "geometric_",
-        "log_normal_",
-        "cauchy_",
-    )
+    A dispatch mode, so it sees what a native kernel draws (dropout's mask) and
+    a ``randn`` bound before entry as surely as a Python call. Each draw is
+    counted under the first frame outside torch that asked for it.
+    """
 
     def __init__(self, draws: Sequence[Tensor]) -> None:
+        super().__init__()
         self._draws = list(draws)
         self.sites: Counter[str] = Counter()
-        self._stack = ExitStack()
 
-    def __enter__(self) -> Self:
-        """Patch the primitives."""
-        self._patch(torch, "randn", self._randn)
-        for name in self._REFUSED:
-            self._patch(torch, name, _refuse(name))
-        for name in self._REFUSED_METHODS:
-            self._patch(torch.Tensor, name, _refuse(name))
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        """Restore the primitives and require every draw consumed."""
-        self._stack.close()
-        if self._draws and exc[0] is None:
+    @override
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Leave the mode and require every draw consumed."""
+        super().__exit__(exc_type, exc_val, exc_tb)
+        if self._draws and exc_type is None:
             raise AssertionError(f"{len(self._draws)} pinned draws were never taken")
 
-    def _patch(self, owner: object, name: str, value: object) -> None:
-        original = cast("object", getattr(owner, name))
-        setattr(owner, name, value)
-        self._stack.callback(setattr, owner, name, original)
-
-    def _randn(self, *size: object, **kwargs: object) -> Tensor:
-        caller = inspect.currentframe()
-        caller = caller.f_back if caller is not None else None
-        if caller is not None:
-            self.sites[f"{Path(caller.f_code.co_filename).name}:{caller.f_lineno}"] += 1
-        shape = tuple(cast("Sequence[int]", size[0])) if len(size) == 1 else size
+    @override
+    def __torch_dispatch__(
+        self,
+        func: OpOverload[..., object],
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        del types
+        kwargs = kwargs or {}
+        if not _draws(func, args, kwargs):
+            return func(*args, **kwargs)
+        if func.overloadpacket is not torch.ops.aten.randn:
+            raise AssertionError(f"unpinned random op {func} was called")
+        self.sites[_caller()] += 1
+        shape = tuple(cast("Sequence[int]", args[0]))
         if not self._draws:
             raise AssertionError(f"an unpinned torch.randn{shape} was drawn")
         draw = self._draws.pop(0)
@@ -1172,17 +1147,37 @@ class PinnedRandom:
             raise AssertionError(
                 f"torch.randn{shape} drawn; the pinned draw is {tuple(draw.shape)}",
             )
-        return draw.to(device=cast("torch.device | str | None", kwargs.get("device")))
+        return draw.to(
+            device=cast("torch.device | None", kwargs.get("device")),
+            dtype=cast("torch.dtype | None", kwargs.get("dtype")),
+        )
 
 
-def _refuse(name: str) -> Callable[..., object]:
-    """Return a stand-in that fails naming the primitive."""
+def _draws(
+    func: OpOverload[..., object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> bool:
+    """Whether ``func`` draws: seeded, and not attention with ``dropout_p == 0``."""
+    if torch.Tag.nondeterministic_seeded not in func.tags:
+        return False
+    names = [a.name for a in func._schema.arguments]  # noqa: SLF001 -- The harness reads the op schema to find the dropout argument.
+    if "dropout_p" not in names:
+        return True
+    index = names.index("dropout_p")
+    return kwargs.get("dropout_p", args[index] if index < len(args) else 0.0) != 0
 
-    def refused(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise AssertionError(f"unpinned random primitive torch.{name} was called")
 
-    return refused
+def _caller() -> str:
+    """Return ``file:line`` of the innermost frame outside torch and this file."""
+    torch_root = Path(torch.__file__).parent
+    frame = inspect.currentframe()
+    while frame is not None:
+        source = Path(frame.f_code.co_filename)
+        if source != Path(__file__) and not source.is_relative_to(torch_root):
+            return f"{source.name}:{frame.f_lineno}"
+        frame = frame.f_back
+    return "unknown"
 
 
 type Record = dict[str, list[list[Tensor]]]
@@ -1329,14 +1324,24 @@ def clone_upstream(reference: Reference, root: Path) -> Path:
 
 
 def _git(root: Path, *arguments: str) -> str:
-    """Run a git command in the clone and return its output."""
-    return subprocess.run(  # noqa: S603 -- The parity harness runs fixed git subcommands against the pinned reference.
+    """Run a git command in the clone and return its output.
+
+    Raises:
+      RuntimeError: git failed; the message carries its stderr.
+
+    """
+    completed = subprocess.run(  # noqa: S603 -- The parity harness runs fixed git subcommands against the pinned reference.
         ["git", *arguments],  # noqa: S607 -- The parity harness runs fixed git subcommands against the pinned reference.
         cwd=root,
         capture_output=True,
         text=True,
-        check=True,
-    ).stdout.strip()
+        check=False,
+    )
+    if completed.returncode:
+        raise RuntimeError(
+            f"git {' '.join(arguments)} failed in {root}: {completed.stderr.strip()}",
+        )
+    return completed.stdout.strip()
 
 
 @dataclass(slots=True, kw_only=True)
@@ -1467,8 +1472,6 @@ def run_rae(clone: Path, work: Path) -> Outcome:
         "_DecoderUtilsModule",
         importlib.import_module("stage1.decoders.utils"),
     )
-    import transformers  # noqa: PLC0415 -- Heavy; only this model needs it.
-
     outcome = Outcome(problems=[], sites=Counter())
     encoder_dir, decoder_dir = work / "enc", work / "dec"
     encoder_dir.mkdir(parents=True, exist_ok=True)
@@ -1523,22 +1526,7 @@ def run_rae(clone: Path, work: Path) -> Outcome:
         patch_size=4,
     )
     _ = (decoder_dir / "config.json").write_text(json.dumps(decoder_json))
-
-    def build(decoder: Path | None, stats: Path | None) -> nn.Module:
-        return stage1.RAE(
-            encoder_cls="Dinov2withNorm",
-            encoder_config_path=str(encoder_dir),
-            encoder_input_size=8,
-            encoder_params={"dinov2_path": str(encoder_dir), "normalize": True},
-            decoder_config_path=str(decoder_dir),
-            decoder_patch_size=4,
-            pretrained_decoder_path=None if decoder is None else str(decoder),
-            noise_tau=0.0,
-            reshape_to_2d=True,
-            normalization_stat_path=None if stats is None else str(stats),
-        )
-
-    bootstrap = cast("_TheirRae", build(None, None))
+    bootstrap = cast("_TheirRae", _their_rae(stage1, work=work))
     _randomize(bootstrap.decoder, seed=2)
     torch.save(bootstrap.decoder.state_dict(), work / "decoder.pt")
 
@@ -1569,7 +1557,8 @@ def run_rae(clone: Path, work: Path) -> Outcome:
         dtype=torch.uint8,
     )
     for stats in (None, work / "stats.pt", work / "stats_var.pt"):
-        theirs = build(work / "decoder.pt", stats).eval()
+        theirs = _their_rae(stage1, work=work, decoder=work / "decoder.pt", stats=stats)
+        theirs.eval()
         # The one reference-side change: the kernel the port fixes, through HF's setter.
         their_rae = cast("_TheirRae", theirs)
         their_rae.encoder.encoder.set_attn_implementation("eager")
@@ -1605,6 +1594,7 @@ def run_rae(clone: Path, work: Path) -> Outcome:
             outcome.compared = max(outcome.compared, compared)
             if stats is None and name == "16px":
                 outcome.golden = {
+                    "source_commit": _commit_tensor(_RAE),
                     **{f"state.{k}": v for k, v in ours.state_dict().items()},
                     "image": image,
                     "latent": their_latent.float(),
@@ -1641,6 +1631,33 @@ def run_rae(clone: Path, work: Path) -> Outcome:
     ).make()
     outcome.problems += state_problems("rae decoder init", their_decoder, our_decoder)
     return outcome
+
+
+def _their_rae(
+    stage1: _Stage1Module,
+    *,
+    work: Path,
+    decoder: Path | None = None,
+    stats: Path | None = None,
+) -> nn.Module:
+    """Build the reference RAE on the tiny encoder and decoder configs in ``work``."""
+    return stage1.RAE(
+        encoder_cls="Dinov2withNorm",
+        encoder_config_path=str(work / "enc"),
+        encoder_input_size=8,
+        encoder_params={"dinov2_path": str(work / "enc"), "normalize": True},
+        decoder_config_path=str(work / "dec"),
+        decoder_patch_size=4,
+        pretrained_decoder_path=None if decoder is None else str(decoder),
+        noise_tau=0.0,
+        reshape_to_2d=True,
+        normalization_stat_path=None if stats is None else str(stats),
+    )
+
+
+def _commit_tensor(reference: Reference) -> Tensor:
+    """Return the reference's pinned commit as bytes, the golden's provenance."""
+    return torch.frombuffer(bytearray(reference.commit.encode()), dtype=torch.uint8)
 
 
 def _rae_tiny() -> RAE.Config:
@@ -1695,20 +1712,6 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
     hf = cast("_VtpHfModule", importlib.import_module("vtp.models.vtp_hf"))
     outcome = Outcome(problems=[], sites=Counter())
 
-    def their_decoder() -> nn.Module:
-        # VTPModel builds its decoder at ffn ratio 4 and upscale 16; the same
-        # constructor at the golden's ratio 1 and upscale 4.
-        return decoders.DinoV3PixelDecoder(
-            in_chans=4,
-            embed_dim=16,
-            num_heads=2,
-            depth=1,
-            ffn_ratio=1.0,
-            ffn_layer="swiglu",
-            norm_layer="layernorm",
-            upscale_factor=4,
-        )
-
     # Initialization, at a geometry VTPModel builds natively: its decoder's
     # ffn ratio is 4 and its upscale the patch, 16.
     torch.manual_seed(0)
@@ -1761,7 +1764,18 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
             decoder_num_heads=2,
         ),
     )
-    theirs.pixel_decoder = their_decoder()
+    # VTPModel builds its decoder at ffn ratio 4 and upscale 16; the same
+    # constructor at the golden's ratio 1 and upscale 4.
+    theirs.pixel_decoder = decoders.DinoV3PixelDecoder(
+        in_chans=4,
+        embed_dim=16,
+        num_heads=2,
+        depth=1,
+        ffn_ratio=1.0,
+        ffn_layer="swiglu",
+        norm_layer="layernorm",
+        upscale_factor=4,
+    )
     _ = theirs.load_state_dict(state, strict=True)
     theirs.eval()
     their_vtp = cast("_TheirVtp", theirs)
@@ -1770,34 +1784,6 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
     ours = config.make()
     config.dtype_autocast = torch.bfloat16
     ours_bf16 = config.make()
-
-    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-    normalize = Normalize(mean, std)
-    denormalize = Normalize(
-        [-m / s for m, s in zip(mean, std, strict=True)],
-        [1 / s for s in std],
-    )
-
-    def theirs_round_trip(
-        image: Tensor,
-        autocast: torch.dtype | None,
-    ) -> dict[str, Tensor]:
-        # The reference's evaluation, tools/test_reconstruction_hf.py: ToTensor and
-        # Normalize in, the encoder under autocast, the inverse Normalize and a clamp out.
-        pixels_in = torch.stack(
-            [normalize(to_tensor(img.permute(1, 2, 0).numpy())) for img in image],
-        )
-        cast_context = (
-            nullcontext() if autocast is None else torch.autocast("cpu", dtype=autocast)
-        )
-        with cast_context:
-            latent = their_vtp.get_reconstruction_latents(pixels_in)
-        pixels = their_vtp.get_latents_decoded_images(latent.float())
-        return {
-            "latent": latent,
-            "pixels": pixels,
-            "image": torch.clamp(denormalize(pixels), 0, 1),
-        }
 
     golden_input = cast("Tensor", golden["input"])
     square = torch.randint(
@@ -1815,10 +1801,10 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
         numerics = host_agnostic_numerics() if autocast is None else nullcontext()
         with torch.no_grad(), numerics, PinnedRandom([]):
             with recorded(theirs) as their_modules:
-                expected = theirs_round_trip(image, autocast)
+                expected = _their_round_trip(their_vtp, image, autocast=autocast)
             with recorded(model) as our_modules:
                 latent = model.encode(image)
-                got = {"latent": latent, "image": model.decode(latent.float())}
+                got = {"latent": latent, "image": model.decode(latent)}
         # The raw pixels are the recorded ``pixel_decoder`` output on both sides.
         problems, compared = compare(
             label,
@@ -1833,12 +1819,44 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
         outcome.problems += problems
         outcome.compared = max(outcome.compared, compared)
         if label == "vtp golden input":
-            commit = _VTP.commit.encode()
             outcome.golden = {
-                "source_commit": torch.frombuffer(bytearray(commit), dtype=torch.uint8),
+                "source_commit": _commit_tensor(_VTP),
                 **{k: v.float() for k, v in expected.items()},
             }
     return outcome
+
+
+def _their_round_trip(
+    their_vtp: _TheirVtp,
+    image: Tensor,
+    *,
+    autocast: torch.dtype | None,
+) -> dict[str, Tensor]:
+    """Reconstruct as the reference's evaluation, ``tools/test_reconstruction_hf.py``.
+
+    ToTensor and Normalize in, the encoder under autocast, the latent cast to
+    float32 for the decoder, then the inverse Normalize and a clamp out.
+    """
+    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+    normalize = Normalize(mean, std)
+    denormalize = Normalize(
+        [-m / s for m, s in zip(mean, std, strict=True)],
+        [1 / s for s in std],
+    )
+    pixels_in = torch.stack(
+        [normalize(to_tensor(img.permute(1, 2, 0).numpy())) for img in image],
+    )
+    cast_context = (
+        nullcontext() if autocast is None else torch.autocast("cpu", dtype=autocast)
+    )
+    with cast_context:
+        latent = their_vtp.get_reconstruction_latents(pixels_in)
+    pixels = their_vtp.get_latents_decoded_images(latent.float())
+    return {
+        "latent": latent,
+        "pixels": pixels,
+        "image": torch.clamp(denormalize(pixels), 0, 1),
+    }
 
 
 def _vtp_tiny() -> VTP.Config:
@@ -1857,6 +1875,45 @@ def _vtp_tiny() -> VTP.Config:
     config.image_size = 8
     config.checkpoint = None
     return config
+
+
+def measure(
+    reference: Reference,
+    run: Callable[[Path, Path], Outcome],
+    *,
+    clone: Path,
+    work: Path,
+) -> tuple[Outcome, Measured]:
+    """Run one comparison under a branch measurement of its own.
+
+    Args:
+      reference: The pinned reference whose files are measured.
+      run: The comparison, given the clone and a scratch directory.
+      clone: The reference's clone.
+      work: Scratch directory for the comparison.
+
+    Returns:
+      outcome: What the comparison found.
+      measured: Branch coverage of this run alone, so no other model's run can
+        satisfy its inventory.
+
+    """
+    measured = coverage.Coverage(
+        branch=True,
+        data_file=None,
+        include=[
+            *(str(clone / f) for f in reference.files),
+            str(_PRIML / "model" / "vision_ae" / "*.py"),
+            str(_PRIML / "math" / "*.py"),
+        ],
+        config_file=False,
+    )
+    measured.start()
+    try:
+        outcome = run(clone, work)
+    finally:
+        measured.stop()
+    return outcome, measured
 
 
 _MODELS: Final = {
@@ -1896,32 +1953,23 @@ def main() -> int:
     models = cast("list[str]", flags.model)
     clone_dir = cast("Path", flags.clone_dir)
     mint = cast("bool", flags.mint)
+    # Before the first matmul: pytest, which replays the goldens this mints, runs
+    # one math thread with MKL's kernel pinned (priml's conftest), and another
+    # reduction order or GEMM kernel can move a float64 result across a float32
+    # rounding boundary.
+    os.environ["MKL_CBWR"] = "COMPATIBLE"
+    torch.set_num_threads(1)
 
     clones = {
         name: clone_upstream(_MODELS[name][0], clone_dir / name) for name in models
     }
-    include = [str(clones[name] / f) for name in models for f in _MODELS[name][0].files]
-    include += [
-        str(_PRIML / "model" / "vision_ae" / "*.py"),
-        str(_PRIML / "math" / "*.py"),
-    ]
-    measured = coverage.Coverage(
-        branch=True,
-        data_file=None,
-        include=include,
-        config_file=False,
-    )
     failed = False
     with tempfile.TemporaryDirectory() as scratch:
         for name in models:
             reference, run, golden_name = _MODELS[name]
             work = Path(scratch) / name
             work.mkdir()
-            measured.start()
-            try:
-                outcome = run(clones[name], work)
-            finally:
-                measured.stop()
+            outcome, measured = measure(reference, run, clone=clones[name], work=work)
             problems = list(outcome.problems)
             if golden_name is not None and outcome.golden is not None:
                 path = _TESTDATA / golden_name

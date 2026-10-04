@@ -6,8 +6,8 @@ function: its ``stage1.RAE`` loaded a tiny
 DINOv2-with-registers through ``from_pretrained`` and a tiny decoder through its
 own ``GeneralDecoder``, while the port loaded the same two files strictly, and
 the reference's ``encode``/``decode`` ran under ``host_agnostic_numerics``. The
-record holds the tiny weights, the input, and the reference's latent and
-(unclamped) pixels. The reference's encoder attention was pinned to HF's eager
+record holds the reference commit, the tiny weights, the input, and the
+reference's latent and (unclamped) pixels. The reference's encoder attention was pinned to HF's eager
 kernel, the port's; its ``from_pretrained`` default, ``sdpa``, moves 6 of the 64
 latent values by up to 3 float32 ULP.
 """
@@ -30,7 +30,13 @@ from priml.cost import cost
 from priml.model.vision_ae.checkpoint import HubFile
 from priml.model.vision_ae.custom_types import Autoencoder, VariationalAutoencoder
 from priml.model.vision_ae.latent_norm import ElementwiseLatentStats
-from priml.model.vision_ae.rae import RAE, Dinov2WithRegisters, rae_dinov2_base
+from priml.model.vision_ae.rae import (
+    RAE,
+    Dinov2WithRegisters,
+    GeneralDecoder,
+    ViTMAESelfAttention,
+    rae_dinov2_base,
+)
 from priml.testing.bfb import assert_bfb_against_golden, host_agnostic_numerics
 from priml.testing.cost import assert_cost_matches_torch
 from priml.testing.golden import mismatches, read_tensors
@@ -43,6 +49,8 @@ pytest.importorskip(
 )
 
 _CWD: Final = Path(__file__).resolve().parent
+
+_REFERENCE_COMMIT: Final = "a4d18c4db766419cbe7cb8c02cd9f7ceb0ec9041"
 
 
 def tiny() -> RAE.Config:
@@ -100,6 +108,9 @@ def test_rae_encode_decode_bfb() -> None:
 
 def test_matches_the_reference_implementation() -> None:
     reference = read_tensors(_CWD / "testdata" / "rae_reference.pt")
+    assert (
+        reference.pop("source_commit").numpy().tobytes().decode() == _REFERENCE_COMMIT
+    )
     # Inside the unit interval, so the port's clamp leaves every compared bit visible.
     assert reference["decoded"].min() > 0
     assert reference["decoded"].max() < 1
@@ -174,6 +185,46 @@ def test_rejects_an_encoder_side_the_patch_does_not_divide() -> None:
         _ = config.copy_tree().finalize()
 
 
+@pytest.mark.parametrize(
+    ("mean", "std"),
+    [
+        ((0.5, 0.5, 0.5), (0.2, 0.0, 0.2)),
+        ((0.5, 0.5, 0.5), (0.2, float("nan"), 0.2)),
+        ((0.5, float("inf"), 0.5), (0.2, 0.2, 0.2)),
+    ],
+    ids=["zero-std", "nan-std", "inf-mean"],
+)
+def test_rejects_pixel_statistics_that_would_make_latents_nonfinite(
+    mean: tuple[float, float, float],
+    std: tuple[float, float, float],
+) -> None:
+    config = tiny()
+    config.encoder.pixel_mean = mean
+    config.encoder.pixel_std = std
+    with pytest.raises(ValueError, match="finite pixel statistics"):
+        _ = config.make()
+
+
+@pytest.mark.parametrize("num_patches", [0, -1, 8])
+def test_decoder_refuses_a_patch_count_that_is_not_a_positive_square(
+    num_patches: int,
+) -> None:
+    config = GeneralDecoder.Config(channels_in=8, num_patches=num_patches)
+    with pytest.raises(ValueError, match="must be a positive square"):
+        _ = config.copy_tree().finalize()
+
+
+def test_decoder_refuses_a_width_the_sine_cosine_table_cannot_split() -> None:
+    config = GeneralDecoder.Config(channels_in=8, num_patches=4, channels_hidden=6)
+    with pytest.raises(ValueError, match="divisible by 4"):
+        _ = config.copy_tree().finalize()
+
+
+def test_decoder_attention_refuses_heads_that_do_not_divide_its_width() -> None:
+    with pytest.raises(ValueError, match="3 heads do not divide width 8"):
+        _ = ViTMAESelfAttention(8, num_heads=3)
+
+
 def test_decoder_takes_its_width_and_token_count_from_the_encoder() -> None:
     config = tiny()
     config.decoder.channels_in = 16
@@ -196,6 +247,36 @@ def test_encoder_cost_matches_torch() -> None:
     assert analytical["adjoint"].sum() > 0
     # The mask token is owned but never read.
     assert analytical.params - analytical.params_active == 8
+
+
+def test_encoder_cost_matches_torch_where_hf_skips_the_resize() -> None:
+    """A 12px input is the 3x3 table's own grid, so no interpolation runs or is priced."""
+    config = tiny().copy_tree().finalize()
+    assert isinstance(config.encoder, Dinov2WithRegisters.Config)
+    _ = assert_cost_matches_torch(
+        config.encoder,
+        build_input=lambda: torch.randn(2, 3, 12, 12, requires_grad=True),
+        input_grid=12,
+        batch_size=2,
+        dtype=None,
+    )
+    bfloat16 = cost(config.encoder, input_grid=12, batch_size=2, dtype=torch.bfloat16)
+    assert bfloat16[torch.float32].sum() == 0
+
+
+def test_encoder_cost_resizes_the_position_table_in_float32() -> None:
+    """HF casts the table to float32, interpolates, and casts the grid back."""
+    config = tiny().copy_tree().finalize()
+    assert isinstance(config.encoder, Dinov2WithRegisters.Config)
+    analytical = cost(config.encoder, input_grid=8, batch_size=2, dtype=torch.bfloat16)
+    # Antialiased 3 -> 2 reads three taps per axis, five operations per output:
+    # a width pass over 8 x 3 x 2 values, then a height pass over 8 x 2 x 2.
+    assert analytical["flops", "primal", "elementwise", torch.float32] == 5 * (48 + 32)
+    # The resample moves 72 + 2 * 48 + 32 values; the casts write the 9-position
+    # table and read the 4-patch grid, 8 channels each.
+    assert analytical["bytes", "primal", "elementwise", torch.float32] == 4 * (
+        200 + 13 * 8
+    )
 
 
 def test_encoder_cost_refuses_an_unpriced_activation() -> None:

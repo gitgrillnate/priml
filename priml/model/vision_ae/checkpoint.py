@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import hashlib
+import re
+import urllib.parse
 
 from configgle import Fig
 
@@ -41,17 +43,23 @@ class HubFile:
         """Path of the file within the repository."""
 
         revision: str = ""
-        """Commit SHA; a branch name would let the bytes move under a run."""
+        """Full lowercase commit SHA; a branch name would let the bytes move under a run."""
 
-        sha256: str | None = None
-        """Expected hex digest; ``None`` skips verification."""
+        sha256: str = ""
+        """Expected lowercase hex digest; empty skips verification."""
 
     def __init__(self, config: Config) -> None:
-        if not config.repo_id or not config.filename or not config.revision:
+        if not config.repo_id or not config.filename:
             raise ValueError(
-                "HubFile needs repo_id, filename, and a pinned revision; got "
-                f"{config.repo_id!r}, {config.filename!r}, {config.revision!r}.",
+                "HubFile needs repo_id and filename; got "
+                f"{config.repo_id!r}, {config.filename!r}.",
             )
+        if re.fullmatch(r"[0-9a-f]{40}", config.revision) is None:
+            raise ValueError(
+                "HubFile needs a pinned revision, a 40-digit lowercase commit SHA; "
+                f"got {config.revision!r}.",
+            )
+        _require_digest("HubFile", config.sha256)
         self.config = config
 
     def path(self) -> Path:
@@ -59,6 +67,9 @@ class HubFile:
 
         Returns:
           path: Local file.
+
+        Raises:
+          RuntimeError: The file does not hash to ``sha256``.
 
         """
         path = Path(
@@ -82,7 +93,7 @@ class HubFile:
             "repo_id": self.config.repo_id,
             "filename": self.config.filename,
             "revision": self.config.revision,
-            "sha256": self.config.sha256 or "",
+            "sha256": self.config.sha256,
         }
 
 
@@ -96,13 +107,19 @@ class UrlFile:
         """HTTPS URL naming immutable bytes, e.g. a raw file at a commit SHA."""
 
         sha256: str = ""
-        """Expected hex digest; required, since a URL alone pins nothing."""
+        """Expected lowercase hex digest; required, since a URL alone pins nothing."""
 
     def __init__(self, config: Config) -> None:
         if not config.url.startswith("https://") or not config.sha256:
             raise ValueError(
                 f"UrlFile needs an https URL and a sha256; got {config.url!r}.",
             )
+        _require_digest("UrlFile", config.sha256)
+        # The cached copy is named for the URL path's last segment alone: a query
+        # string can carry a token, or outrun the file-name limit.
+        self.filename = urllib.parse.urlsplit(config.url).path.rsplit("/", 1)[-1]
+        if self.filename in {"", ".", ".."}:
+            raise ValueError(f"UrlFile needs a URL naming a file; got {config.url!r}.")
         self.config = config
 
     def path(self) -> Path:
@@ -115,16 +132,15 @@ class UrlFile:
           RuntimeError: The downloaded bytes do not hash to ``sha256``.
 
         """
-        name = self.config.url.rsplit("/", 1)[-1]
         target = get_cache_dir() / "url" / self.config.sha256
         _ = ensure_data(
             DataSpec(
                 target_dir=target,
-                manifest=[FileSpec(rel_path=name, sha256=self.config.sha256)],
+                manifest=[FileSpec(rel_path=self.filename, sha256=self.config.sha256)],
                 fetch=self._fetch,
             ),
         )
-        return target / name
+        return target / self.filename
 
     def identity(self) -> dict[str, str]:
         """Return the URL and digest.
@@ -150,10 +166,13 @@ class LocalFile:
         path: Path | str = ""
         """Local file."""
 
-        sha256: str | None = None
-        """Expected hex digest; ``None`` skips verification."""
+        sha256: str = ""
+        """Expected lowercase hex digest; empty skips verification."""
 
     def __init__(self, config: Config) -> None:
+        if not str(config.path):
+            raise ValueError("LocalFile needs a path.")
+        _require_digest("LocalFile", config.sha256)
         self.config = config
 
     def path(self) -> Path:
@@ -164,6 +183,7 @@ class LocalFile:
 
         Raises:
           FileNotFoundError: The file does not exist.
+          RuntimeError: The file does not hash to ``sha256``.
 
         """
         path = Path(self.config.path)
@@ -196,22 +216,33 @@ def sha256_file(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def verify_sha256(path: Path, expected: str | None) -> None:
-    """Raise unless ``path`` hashes to ``expected``; ``None`` skips the check.
+def verify_sha256(path: Path, expected: str) -> None:
+    """Raise unless ``path`` hashes to ``expected``; an empty digest skips the check.
 
     Args:
       path: File to verify.
-      expected: Lowercase hex SHA-256, or ``None``.
+      expected: Lowercase hex SHA-256, or empty.
 
     Raises:
-      ValueError: The digest differs.
+      RuntimeError: The digest differs, as ``ensure_data`` raises for a
+        downloaded file.
 
     """
-    if expected is None:
+    if not expected:
         return
     actual = sha256_file(path)
     if actual != expected:
-        raise ValueError(
+        raise RuntimeError(
             f"{path} hashes to {actual}, not the configured {expected}; the "
             "file changed or is truncated.",
+        )
+
+
+def _require_digest(source: str, digest: str) -> None:
+    """Raise unless ``digest`` is empty or 64 lowercase hex digits."""
+    # At construction: ``hexdigest`` is lowercase, so another spelling would fail
+    # only after a full hash, and ``UrlFile`` makes the digest a directory name.
+    if digest and re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError(
+            f"{source} sha256 must be 64 lowercase hex digits; got {digest!r}.",
         )

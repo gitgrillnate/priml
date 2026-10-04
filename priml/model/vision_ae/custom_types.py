@@ -19,6 +19,8 @@ from torch import Tensor
 
 import torch
 
+from priml.cost import Cost, elementwise_cost, set_cost, traffic
+
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -56,8 +58,8 @@ class Autoencoder(Protocol):
 def require_uint8(image: Tensor) -> None:
     """Raise unless ``image`` meets ``Autoencoder.encode``'s uint8 contract.
 
-    Every encoder scales by 255 itself, so a float image already in ``[0, 1]``
-    would encode as near-black rather than fail.
+    Every encoder rescales from ``[0, 255]`` itself, so a float image already in
+    ``[0, 1]`` would encode as near-black rather than fail.
 
     Args:
       image: The batch an encoder was handed.
@@ -95,9 +97,39 @@ class VariationalAutoencoder(Autoencoder, Protocol):
 
 
 type LatentFn = Callable[[Posterior], Tensor]
-"""Chooses the latent a variational encoder's ``encode`` returns."""
+"""Chooses the latent a variational encoder's ``encode`` returns.
+
+A costed autoencoder prices it with ``cost(latent_fn, channels=..., dtype=...)``,
+so one it holds carries :func:`~priml.cost.set_cost`.
+"""
 
 
+# Priced as the reparameterized Gaussian draw INVAE's posterior takes. The noise
+# is charged as the tensor it writes, with no FLOPs; ``mean + std * noise`` is a
+# product and a sum of two operands each. Back, the sum passes its gradient
+# through and the product scales it by the saved noise for ``std``.
+def _posterior_sample_cost(*, channels: int, dtype: torch.dtype | None) -> Cost:
+    noise = traffic("primal", "elementwise", elements=channels, dtype=dtype)
+    product = elementwise_cost(
+        primal=channels,
+        adjoint=channels,
+        channels=channels,
+        inputs=2,
+        dtype=dtype,
+    )
+    total = elementwise_cost(
+        primal=channels,
+        adjoint=0,
+        channels=channels,
+        inputs=2,
+        adjoint_inputs=0,
+        adjoint_outputs=0,
+        dtype=dtype,
+    )
+    return noise + product + total
+
+
+@set_cost(_posterior_sample_cost)
 def posterior_sample(posterior: Posterior) -> Tensor:
     """Draw from the posterior with the global generator.
 
@@ -111,6 +143,13 @@ def posterior_sample(posterior: Posterior) -> Tensor:
     return posterior.sample()
 
 
+# The mode is a tensor the posterior already holds; taking it moves nothing.
+def _posterior_mode_cost(*, channels: int, dtype: torch.dtype | None) -> Cost:
+    del channels, dtype
+    return Cost()
+
+
+@set_cost(_posterior_mode_cost)
 def posterior_mode(posterior: Posterior) -> Tensor:
     """Take the posterior's most likely latent.
 
@@ -161,7 +200,15 @@ class CheckpointFile(Protocol):
     """A weights file that resolves to a local path, downloading if it must."""
 
     def path(self) -> Path:
-        """Return the local path, verified when a digest is configured."""
+        """Return the local path, verified when a digest is configured.
+
+        Returns:
+          path: Local file.
+
+        Raises:
+          RuntimeError: The bytes do not hash to the configured digest.
+
+        """
         ...
 
     def identity(self) -> dict[str, str]:

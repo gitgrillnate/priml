@@ -22,10 +22,19 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 import pytest
 import torch
 
+from priml.cost import cost
+from priml.model import norm as priml_norm
 from priml.model.vision_ae.checkpoint import LocalFile, UrlFile
 from priml.model.vision_ae.custom_types import Autoencoder, VariationalAutoencoder
 from priml.model.vision_ae.latent_norm import ChannelLatentStats
-from priml.model.vision_ae.vtp import VTP, init_weights_post, vtp_large
+from priml.model.vision_ae.vtp import (
+    VTP,
+    RopePositionEmbedding,
+    init_weights_post,
+    vtp_base,
+    vtp_large,
+    vtp_small,
+)
 from priml.testing.bfb import (
     assert_bfb_against_golden,
     host_agnostic_numerics,
@@ -141,6 +150,92 @@ def test_dtype_autocast_reaches_the_encoder() -> None:
     config.dtype_autocast = torch.bfloat16
     assert config.make().encode(_image()).dtype == torch.bfloat16
     assert tiny().make().encode(_image()).dtype == torch.float32
+
+
+def test_decode_takes_the_latent_encode_returns_under_autocast() -> None:
+    """The protocol's round trip holds: ``decode`` casts back to the weights' dtype."""
+    config = tiny()
+    config.dtype_autocast = torch.bfloat16
+    model = config.make()
+    latent = model.encode(_image())
+    image = model.decode(latent)
+    assert image.dtype == torch.float32
+    assert torch.equal(image, model.decode(latent.float()))
+
+
+def test_vtp_cost_charges_the_decoder_cast_under_autocast() -> None:
+    config = tiny()
+    config.dtype_autocast = torch.bfloat16
+    finalized = config.copy_tree().finalize()
+    analytical = cost(finalized, batch_size=2, dtype=None)
+    parts = finalized.trunk.cost(
+        image_size=8,
+        batch_size=2,
+        dtype=None,
+        dtype_autocast=torch.bfloat16,
+    ) + finalized.pixel_decoder.cost(latent_size=2, batch_size=2, dtype=None)
+    latents = 2 * 4 * 2 * 2
+    # The cast reads the bfloat16 latent once; its float32 write joins the pixel maps.
+    assert (
+        analytical["bytes", "primal", "elementwise", torch.bfloat16]
+        == parts["bytes", "primal", "elementwise", torch.bfloat16] + 2 * latents
+    )
+
+
+def test_trunk_cost_keeps_the_norms_in_the_weights_dtype_under_autocast() -> None:
+    """The reference's RMSNorm promotes to its float32 weight, as does the stream."""
+    trunk = tiny().trunk
+    analytical = trunk.cost(
+        image_size=8,
+        batch_size=2,
+        dtype=None,
+        dtype_autocast=torch.bfloat16,
+    )
+    norm = priml_norm.RMSNorm.Config(16, eps=1e-5, elementwise_affine=True).cost(
+        seq_len=5,
+        batch_size=2,
+        dtype=torch.float32,
+    )
+    # Two norms in the one block, then the final norm.
+    assert (
+        analytical["flops", "primal", "reduction", torch.float32]
+        == 3 * norm["flops", "primal", "reduction", torch.float32]
+    )
+    assert analytical["matmul", torch.float32].sum() == 0
+
+
+@pytest.mark.parametrize(
+    ("mean", "std"),
+    [
+        ((0.5, 0.5, 0.5), (0.2, 0.0, 0.2)),
+        ((0.5, 0.5, 0.5), (0.2, float("nan"), 0.2)),
+        ((float("-inf"), 0.5, 0.5), (0.2, 0.2, 0.2)),
+    ],
+    ids=["zero-std", "nan-std", "inf-mean"],
+)
+def test_rejects_pixel_statistics_that_would_make_latents_nonfinite(
+    mean: tuple[float, float, float],
+    std: tuple[float, float, float],
+) -> None:
+    config = tiny()
+    config.pixel_mean = mean
+    config.pixel_std = std
+    with pytest.raises(ValueError, match="finite pixel statistics"):
+        _ = config.make()
+
+
+def test_trunk_refuses_a_bottleneck_as_wide_as_the_tokens() -> None:
+    config = tiny()
+    config.trunk.channels_out = config.trunk.channels_hidden
+    with pytest.raises(ValueError, match="channels_out 16 must differ"):
+        _ = config.copy_tree().finalize()
+
+
+def test_rotary_embedding_refuses_a_width_four_times_the_heads_does_not_divide() -> (
+    None
+):
+    with pytest.raises(ValueError, match=r"divisible by 4 \* num_heads \(12\)"):
+        _ = RopePositionEmbedding(16, num_heads=3)
 
 
 def test_train_leaves_the_frozen_model_in_eval_mode() -> None:
@@ -378,6 +473,22 @@ def test_vtp_large_config_pprint() -> None:
         test_file=__file__,
         name="vtp_large_config",
         config=vtp_large(),
+    )
+
+
+def test_vtp_small_config_pprint() -> None:
+    assert_pprint_golden(
+        test_file=__file__,
+        name="vtp_small_config",
+        config=vtp_small(),
+    )
+
+
+def test_vtp_base_config_pprint() -> None:
+    assert_pprint_golden(
+        test_file=__file__,
+        name="vtp_base_config",
+        config=vtp_base(),
     )
 
 

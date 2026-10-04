@@ -374,6 +374,7 @@ class DinoVisionTransformerWithBottleneck(nn.Module):
             image_size: int,
             batch_size: int,
             dtype: torch.dtype | None,
+            dtype_autocast: torch.dtype | None = None,
             **kwargs: object,
         ) -> Cost:
             """Cost one trainable forward and backward on ``[batch_size, 3, S, S]``.
@@ -387,11 +388,18 @@ class DinoVisionTransformerWithBottleneck(nn.Module):
             output reshape) move no arithmetic and are not counted, as in
             :class:`priml.model.attention.self_attention.SelfAttention`.
 
+            Under autocast the products, attention, and MLP run in
+            ``dtype_autocast``, while the class token, the residual stream, and
+            every norm stay in ``dtype``: the reference's RMSNorm returns its
+            weight's dtype. Autocast's casts of each product's operands are not
+            counted.
+
             Args:
               image_size: Side ``S`` of the square input image, in pixels.
               batch_size: Images per invocation.
-              dtype: Activation dtype; ``None`` is torch's default. The rotary
+              dtype: The weights' dtype; ``None`` is torch's default. The rotary
                 embedding runs in bfloat16 whatever it is.
+              dtype_autocast: The autocast dtype; ``None`` runs all in ``dtype``.
               **kwargs: The open bus, unread.
 
             Returns:
@@ -409,6 +417,7 @@ class DinoVisionTransformerWithBottleneck(nn.Module):
                 )
             side = image_size // self.patch_size
             width = self.channels_hidden
+            compute = dtype if dtype_autocast is None else dtype_autocast
             patch_embed = conv_cost(
                 channels_in=3,
                 channels_out=width,
@@ -420,7 +429,7 @@ class DinoVisionTransformerWithBottleneck(nn.Module):
                 batch_size=batch_size,
                 stride=self.patch_size,
                 padding=0,
-                dtype=dtype,
+                dtype=compute,
             )
             # ``cls_token + 0 * mask_token``: two maps over one row owning both
             # tokens. Back, the mask token's gradient is the zero product and the
@@ -454,13 +463,14 @@ class DinoVisionTransformerWithBottleneck(nn.Module):
                 side=side,
                 prefix=1,
                 batch_size=batch_size,
-                dtype=dtype,
+                dtype=compute,
+                dtype_stream=dtype,
             )
             bottleneck = matmul_cost(
                 channels_in=width,
                 channels_out=self.channels_out,
                 rows=batch_size * side * side,
-                dtype=dtype,
+                dtype=compute,
             )
             return patch_embed + class_token + blocks + bottleneck
 
@@ -616,6 +626,7 @@ class DinoV3PixelDecoder(nn.Module):
                 prefix=0,
                 batch_size=batch_size,
                 dtype=dtype,
+                dtype_stream=dtype,
             )
             proj_out = conv_cost(
                 channels_in=width,
@@ -725,7 +736,7 @@ class VTP(nn.Module):
 
         The reference's evaluation autocasts the encoder to its precision flag
         and decodes in float32. Set, ``encode`` returns latents in this dtype;
-        ``decode`` never autocasts, so it wants them cast back to float32.
+        ``decode`` never autocasts and casts them back to the weights' dtype.
         """
 
         checkpoint: Makeable[CheckpointFile] | None = field(
@@ -786,12 +797,14 @@ class VTP(nn.Module):
             every weight, as :class:`priml.model.dinov2.DinoV2Teacher` does. The
             pixel maps around them run in float32 whatever ``dtype`` is:
             ``float()``, ``/ 255``, ``- mean``, ``/ std`` in; ``- inverse_mean``,
-            ``/ inverse_std``, and the two-sided clamp out.
+            ``/ inverse_std``, and the two-sided clamp out. Under autocast,
+            ``decode`` first casts the latent to ``dtype``.
 
             Args:
               batch_size: Images per invocation.
-              dtype: The weights' dtype, which the decoder runs in; the trunk
-                runs in ``dtype_autocast`` when set. ``None`` is torch's default.
+              dtype: The weights' dtype, which the decoder runs in; the trunk's
+                products run in ``dtype_autocast`` when set. ``None`` is torch's
+                default.
               **kwargs: The open bus, unread: ``image_size`` is this config's.
 
             Returns:
@@ -803,12 +816,22 @@ class VTP(nn.Module):
             full = self.trunk.cost(
                 image_size=self.image_size,
                 batch_size=batch_size,
-                dtype=dtype if self.dtype_autocast is None else self.dtype_autocast,
+                dtype=dtype,
+                dtype_autocast=self.dtype_autocast,
             ) + self.pixel_decoder.cost(
                 latent_size=self.image_size // self.trunk.patch_size,
                 batch_size=batch_size,
                 dtype=dtype,
             )
+            autocast = self.dtype_autocast
+            if autocast is not None and autocast != resolve_dtype(dtype):
+                latents = batch_size * math.prod(self.latent_shape())
+                full += traffic(
+                    "primal",
+                    "elementwise",
+                    elements=latents,
+                    dtype=autocast,
+                ) + traffic("primal", "elementwise", elements=latents, dtype=dtype)
             pixels = batch_size * 3 * self.image_size**2
             channels = len(self.pixel_mean)
             # Each map reads the image and writes it once; the two subtracted or
@@ -838,6 +861,12 @@ class VTP(nn.Module):
 
     def __init__(self, config: Config) -> None:
         super().__init__()
+        stats = (*config.pixel_mean, *config.pixel_std)
+        if any(math.isnan(v) or math.isinf(v) for v in stats) or 0 in config.pixel_std:
+            raise ValueError(
+                "VTP needs finite pixel statistics and a nonzero std; got mean "
+                f"{config.pixel_mean}, std {config.pixel_std}.",
+            )
         # The reference registers the trunk, then the pixel decoder.
         self.trunk = config.trunk.make()
         self.pixel_decoder = config.pixel_decoder.make()
@@ -922,13 +951,14 @@ class VTP(nn.Module):
         """Decode a raw latent to RGB in ``[0, 1]``.
 
         Args:
-          latent: ``[B, channels_out, h, w]`` raw latent, in the weights' dtype.
+          latent: ``[B, channels_out, h, w]`` raw latent in any floating dtype,
+            ``encode``'s under ``dtype_autocast`` included.
 
         Returns:
           image: ``[B, 3, h * patch_size, w * patch_size]`` float RGB, clamped.
 
         """
-        decoded = self.pixel_decoder(latent)
+        decoded = self.pixel_decoder(latent.to(self.pixel_decoder.proj_in.weight.dtype))
         return ((decoded - self.inverse_mean) / self.inverse_std).clamp(0, 1)
 
 
@@ -1041,13 +1071,15 @@ def _transformer_cost(
     prefix: int,
     batch_size: int,
     dtype: torch.dtype | None,
+    dtype_stream: torch.dtype | None,
 ) -> Cost:
     """Cost the rotary table, ``num_layers`` blocks, and the final norm.
 
     The sequence is ``prefix`` unrotated tokens then the ``side ** 2`` grid.
     Each block is two norms, the biased ``qkv`` and ``proj`` projections, the
     rotation, the two attention products, the biased split-gate SwiGLU, and two
-    residual adds; the table is built once and shared by every block.
+    residual adds; the table is built once and shared by every block. The norms
+    and the residual adds run in ``dtype_stream``, the rest in ``dtype``.
     """
     patches = side * side
     tokens = patches + prefix
@@ -1061,7 +1093,7 @@ def _transformer_cost(
         split_gate_projection=True,
     )
     block = (
-        norm.cost(seq_len=tokens, batch_size=batch_size, dtype=dtype).tile(
+        norm.cost(seq_len=tokens, batch_size=batch_size, dtype=dtype_stream).tile(
             2,
             copies=2,
         )
@@ -1099,13 +1131,13 @@ def _transformer_cost(
             channels=2 * channels,
             rows=rows,
             inputs=2,
-            dtype=dtype,
+            dtype=dtype_stream,
         )
     )
     return (
         _rope_table_cost(side=side, channels_head=channels_head)
         + block.tile(num_layers, copies=num_layers)
-        + norm.cost(seq_len=tokens, batch_size=batch_size, dtype=dtype)
+        + norm.cost(seq_len=tokens, batch_size=batch_size, dtype=dtype_stream)
     )
 
 
@@ -1139,9 +1171,9 @@ def _rotation_cost(
         return rotation
     return sum(
         (
-            traffic(phase, "elementwise", elements=2 * rows * width, dtype=cast)
+            traffic(phase, "elementwise", elements=2 * rows * width, dtype=cast_dtype)
             for phase in ("primal", "adjoint")
-            for cast in (dt, torch.bfloat16)
+            for cast_dtype in (dt, torch.bfloat16)
         ),
         rotation,
     )
