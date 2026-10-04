@@ -18,6 +18,8 @@ from __future__ import annotations
 from dataclasses import field
 from typing import Self, override
 
+import math
+
 from configgle import Makes
 
 import torch
@@ -89,8 +91,8 @@ def exp000() -> SpeedrunTrainLoop:
     config.study_name = "speedrundit"
     config.experiment_name = "exp000"
     config.max_steps = config.step.train_budget_steps = 400_000
-    config.num_steps_eval = float(
-        "inf",
+    config.num_steps_eval = (
+        math.inf
     )  # The reference evaluates generated images separately.
     config.eval_every_epoch = False
     config.seed = 0

@@ -111,6 +111,56 @@ def test_prepared_corpus_loads_back_as_the_encoder_wrote_it(tmp_path: Path) -> N
     assert torch.equal(sample["latent"], expected)
 
 
+def test_center_crop_box_downsamples_before_center_crop() -> None:
+    image = Image.new("RGB", (768, 512))
+    for x in range(768):
+        for y in range(512):
+            image.putpixel((x, y), (x % 256, y % 256, (x + y) % 256))
+
+    cropped = prepare_data.center_crop(image, 256)
+    expected = image.resize((384, 256), Image.Resampling.BOX).crop(
+        (64, 0, 320, 256),
+    )
+
+    assert cropped.size == (256, 256)
+    assert cropped.tobytes() == expected.tobytes()
+
+
+def test_center_crop_resizes_short_axis_and_centers_both_axes() -> None:
+    image = Image.new("RGB", (7, 5))
+    for x in range(image.width):
+        for y in range(image.height):
+            image.putpixel((x, y), (x * 30, y * 40, 0))
+
+    cropped = prepare_data.center_crop(image, 4)
+    expected = image.resize((6, 4), Image.Resampling.BICUBIC).crop((1, 0, 5, 4))
+
+    assert cropped.size == (4, 4)
+    assert cropped.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize(
+    ("source_size", "resized_size", "crop_box"),
+    [
+        ((774, 512), (387, 256), (65, 0, 321, 256)),
+        ((512, 774), (256, 387), (0, 65, 256, 321)),
+    ],
+)
+def test_center_crop_floors_odd_center_offsets(
+    source_size: tuple[int, int],
+    resized_size: tuple[int, int],
+    crop_box: tuple[int, int, int, int],
+) -> None:
+    image = Image.new("RGB", source_size)
+    for x in range(image.width):
+        for y in range(image.height):
+            image.putpixel((x, y), (x % 256, y % 256, (x + y) % 256))
+    resized = image.resize(resized_size, Image.Resampling.BOX)
+    expected = resized.crop(crop_box)
+
+    assert prepare_data.center_crop(image, 256).tobytes() == expected.tobytes()
+
+
 def test_images_are_center_cropped_to_the_autoencoder_size(tmp_path: Path) -> None:
     config = _source(tmp_path)
     _ = prepare_data.prepare(config, _imagenet(tmp_path, 1), device="cpu")

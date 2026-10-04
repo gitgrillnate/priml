@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final, Protocol, runtime_checkable
 
 import json
+import multiprocessing as mp
 
 from PIL import Image
+from torch.utils.data import DistributedSampler, RandomSampler, SequentialSampler
 
 import numpy as np
 import pytest
@@ -31,6 +33,16 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+_WORKER_CONTEXT: Final = "fork" if "fork" in mp.get_all_start_methods() else None
+"""Forkserver, the default, starts its server per process: 1.1s against 0.05s."""
+
+
+@runtime_checkable
+class _SamplerOptions(Protocol):
+    drop_last: bool
+    shuffle: bool
+
+
 def _source(root: Path, **fields: object) -> PairedImageLatentDataset.Config:
     """Return a source over ``root`` whose INVAE yields 2x2 latents (32px images)."""
     config = PairedImageLatentDataset.Config(working_dir=root)
@@ -46,12 +58,17 @@ def _prepared_pair(
     label: int,
     *,
     subdir: str = "vae-in",
+    image_suffix: str = ".png",
 ) -> None:
     image_dir = root / "images" / "00000"
     latent_dir = root / subdir / "00000"
     image_dir.mkdir(parents=True, exist_ok=True)
     latent_dir.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", (4, 3), color=(label, 0, 0)).save(image_dir / f"img{name}.png")
+    image_path = image_dir / f"img{name}{image_suffix}"
+    if image_suffix == ".npy":
+        np.save(image_path, np.full((3, 4, 5), label, dtype=np.uint8))
+    else:
+        Image.new("RGB", (4, 3), color=(label, 0, 0)).save(image_path)
     # PairedImageLatentDataset.__getitem__ strips the leading axis REG corpora
     # store, and INVAE.Config.latent_shape is square: (channels_latent, side, side).
     np.save(
@@ -60,12 +77,24 @@ def _prepared_pair(
     )
 
 
-def _corpus(root: Path, config: PairedImageLatentDataset.Config, count: int) -> None:
+def _corpus(
+    root: Path,
+    config: PairedImageLatentDataset.Config,
+    count: int,
+    *,
+    image_suffix: str = ".png",
+) -> None:
     """Write ``count`` float32 pairs, labelled from 5, and a matching receipt."""
     labels: list[list[str | int]] = []
     for index in range(count):
         name = f"{index:08d}"
-        _prepared_pair(root, name, index + 5, subdir=config.latent_subdir)
+        _prepared_pair(
+            root,
+            name,
+            index + 5,
+            subdir=config.latent_subdir,
+            image_suffix=image_suffix,
+        )
         labels.append([f"00000/img-latents-{name}.npy", index + 5])
     latent_dir = root / config.latent_subdir
     (latent_dir / "dataset.json").write_text(json.dumps({"labels": labels}))
@@ -86,6 +115,43 @@ def _data(root: Path, *, num_workers: int = 0) -> SpeedrunImageNetData:
     config.num_workers = num_workers
     config.pin_memory = False
     return config.make()
+
+
+def _assert_random_sampler(sampler: object) -> None:
+    assert isinstance(sampler, RandomSampler)
+
+
+def _assert_sequential_sampler(sampler: object) -> None:
+    assert isinstance(sampler, SequentialSampler)
+
+
+def _assert_distributed_sampler(sampler: object) -> None:
+    assert isinstance(sampler, DistributedSampler)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [".png", ".PNG", ".jpg", ".jpeg", ".JPG", ".JPEG", ".npy"],
+)
+def test_image_extensions_are_case_insensitive_and_supported(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    _corpus(tmp_path, _source(tmp_path), 1, image_suffix=suffix)
+    assert len(_source(tmp_path).make()) == 1
+
+
+def test_unrecognized_image_names_keep_their_stem(tmp_path: Path) -> None:
+    _corpus(tmp_path, _source(tmp_path), 1)
+    image = tmp_path / "images" / "00000" / "img00000000.png"
+    latent = tmp_path / "vae-in" / "00000" / "img-latents-00000000.npy"
+    _ = image.rename(image.with_name("scene.png"))
+    _ = latent.rename(latent.with_name("scene.npy"))
+    _ = (tmp_path / "vae-in" / "dataset.json").write_text(
+        json.dumps({"labels": [["00000/scene.npy", 1]]}),
+    )
+    dataset = _source(tmp_path).make()
+    assert dataset.records[0][0].name == "scene.png"
 
 
 def test_reference_names_and_tensor_values(tmp_path: Path) -> None:
@@ -227,21 +293,41 @@ def test_a_uint8_corpus_decodes_through_its_table(tmp_path: Path) -> None:
 
 def test_eval_loader_reads_every_full_batch_in_order(tmp_path: Path) -> None:
     _corpus(tmp_path, _source(tmp_path), 5)
-    order = [batch["label"].tolist() for batch in _data(tmp_path).eval_dataloader()]
+    data = _data(tmp_path)
+    data.config.pin_memory = True
+    # Built, not iterated: iterating a pinning loader warns on a host with no
+    # accelerator (CPU-only CI), and the suite turns warnings into errors.
+    assert data.eval_dataloader().pin_memory is True
+    data.config.pin_memory = False
+    loader = data.eval_dataloader()
+    order = [batch["label"].tolist() for batch in loader]
     # drop_last discards the fifth sample.
     assert order == [[5 + 0, 5 + 1], [5 + 2, 5 + 3]]
+    assert loader.num_workers == 0
 
 
 def test_worker_loader_carries_its_prefetch_settings(tmp_path: Path) -> None:
-    _corpus(tmp_path, _source(tmp_path), 4)
-    loader = _data(tmp_path, num_workers=2).train_dataloader()
+    _corpus(tmp_path, _source(tmp_path), 5)
+    data = _data(tmp_path, num_workers=2)
+    data.config.pin_memory = True
+    loader = data.train_dataloader()
     assert (loader.num_workers, loader.prefetch_factor) == (2, 2)
+    assert loader.batch_size == 2
+    assert loader.pin_memory is True
     assert loader.drop_last
+    train_sampler: object = loader.sampler
+    _assert_random_sampler(train_sampler)
+    data.config.pin_memory = False
+    eval_loader = data.eval_dataloader()
+    eval_loader.multiprocessing_context = _WORKER_CONTEXT
+    assert [batch["label"].shape[0] for batch in eval_loader] == [2, 2]
+    eval_sampler: object = eval_loader.sampler
+    _assert_sequential_sampler(eval_sampler)
 
 
 def test_distributed_loader_uses_a_reshuffled_sampler(tmp_path: Path) -> None:
     _corpus(tmp_path, _source(tmp_path), 4)
-    data = _data(tmp_path)
+    data = _data(tmp_path, num_workers=2)
     dist.init_process_group(
         backend="gloo",
         init_method=(tmp_path / "gloo-rendezvous").resolve().as_uri(),
@@ -250,13 +336,27 @@ def test_distributed_loader_uses_a_reshuffled_sampler(tmp_path: Path) -> None:
     )
     try:
         loader = data.train_dataloader()
+        sampler: object = loader.sampler
+        _assert_distributed_sampler(sampler)
+        assert isinstance(sampler, _SamplerOptions)
+        assert sampler.drop_last is True
+        assert sampler.shuffle is True
+        eval_sampler: object = data.eval_dataloader().sampler
+        _assert_distributed_sampler(eval_sampler)
+        assert isinstance(eval_sampler, _SamplerOptions)
+        assert eval_sampler.drop_last is True
+        assert eval_sampler.shuffle is False
+        assert loader.num_workers == 2
+        assert loader.prefetch_factor == 2
+        assert loader.pin_memory is False
     finally:
         dist.destroy_process_group()
-    assert data.dataset.sampler is not None
+    assert data.dataset.sampler is sampler
     data.dataset.set_epoch(3)
     # One rank's sampler draws the whole permutation seeded by seed 0 + epoch,
     # and the loader reads its batches in that order; labels start at 5.
     order = torch.randperm(4, generator=torch.Generator().manual_seed(3)) + 5
+    loader.multiprocessing_context = _WORKER_CONTEXT
     labels = [batch["label"] for batch in loader]
     assert torch.equal(torch.cat(labels), order)
 
