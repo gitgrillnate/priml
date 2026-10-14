@@ -6,7 +6,6 @@ from functools import partial
 from pathlib import Path
 from typing import Final
 
-from configgle.testing import assert_pprint_golden
 from torch import Tensor
 
 import pytest
@@ -18,6 +17,7 @@ from priml.model.embedding import Embedding, MultiHotEmbedding, _power_of_two
 from priml.model.init import normal
 from priml.testing.bfb import assert_bfb_against_golden
 from priml.testing.cost import assert_cost_matches_torch
+from priml.testing.golden import assert_pprint_golden
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -451,6 +451,7 @@ def test_multi_hot_embedding_kernel_host_dispatch_with_fake_launches(
         "width_block": 2,
         "cell_block": 4,
         "scalar_block": 2,
+        "table_rows": config.channels_in,
         "num_warps": 4,
     }
 
@@ -617,12 +618,69 @@ def test_multi_hot_backward_triton_program_count_ceil_division(
     assert kernels.accumulate.args[2] == (pairs + 127) // 128
 
 
+def test_kernels_are_jitted_once_from_their_bodies() -> None:
+    embed = embedding._embed_kernel()
+    backward = embedding._backward_kernels()
+    assert embedding._embed_kernel() is embed
+    assert embedding._backward_kernels() is backward
+    assert "def _embed_triton(" in embed.src
+    assert "def _embed_backward_triton(" in backward.accumulate.src
+    assert "def _embed_decode_triton(" in backward.decode.src
+
+
 def test_multi_hot_embedding_cost_counts_cpu_gather_and_scatter() -> None:
     config = _small_layout()
     cost = config.cost(seq_len=3, batch_size=2, dtype=torch.float32)
-    assert cost.params == 0
-    assert cost.params_active == 0
+    assert cost.params == config.channels_in * config.channels_out
+    assert cost.params_active == len(config.offsets) * config.channels_out
     assert cost["flops", "adjoint", "selection"].sum() == 3 * 2 * 3 * 4 * 2
+
+
+@pytest.mark.gpu_triton
+def test_multi_hot_triton_reads_a_row_outside_the_table_as_zero() -> None:
+    """The kernel masks the bad row, as the backward skips it; torch raises."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    config = _small_layout()
+    model = config.make()
+    rows = _draw_packed(config)
+    rows[0, 0] = -1
+    with pytest.raises(IndexError):
+        model.forward_torch(rows)
+    valid = rows.clone()
+    valid[0, 0] = 0
+    # The row just before the table is a live allocation the unmasked read
+    # would sum; row 0 is zeroed so the masked read and the valid id agree.
+    storage = torch.ones(
+        1 + config.channels_in,
+        config.channels_out,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    model = model.cuda()
+    with torch.no_grad():
+        model.weight.data = storage[1:]
+        model.weight[0] = 0
+        actual = model.forward_triton(rows.cuda())
+        expected = model.forward_triton(valid.cuda())
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_multi_hot_materialization_rebuilds_offsets() -> None:
+    config = _small_layout()
+    model = config.make().to("meta")
+    model.to_empty(device="cpu")
+    model.offsets.fill_(-1)
+    model.reset_parameters()
+    assert torch.equal(model.offsets, torch.tensor(config.offsets))
+
+
+@pytest.mark.parametrize("offsets", [(), (3, 1), (0, 2, 2), (0, 8), (-1, 2)])
+def test_multi_hot_invalid_field_offsets_rejected(offsets: tuple[int, ...]) -> None:
+    config = _small_layout()
+    config.offsets = offsets
+    with pytest.raises(ValueError, match="offsets"):
+        config.make()
 
 
 def test_embedding_keeps_shard_and_requested_meta_device() -> None:
@@ -935,7 +993,11 @@ def _launch_backward_mutation_case(
 ) -> tuple[_FakeKernel, Tensor, Tensor]:
     # The launch reads only metadata; a real 2^25-row table took 4.5s to draw.
     with torch.device("meta"):
-        module = _mutation_layout(offsets=offsets, width=16, rows=rows)
+        module = _mutation_layout(
+            offsets=offsets,
+            width=16,
+            rows=max(rows, offsets[-1] + 1),
+        )
     kernels = _FakeBackwardKernels()
     devices: list[torch.device] = []
 
@@ -1029,6 +1091,6 @@ def test_multi_hot_backward_triton_program_count_uses_signed_ceil_division(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

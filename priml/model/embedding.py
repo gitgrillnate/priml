@@ -26,6 +26,7 @@ import torch
 
 from priml.cost import (
     Cost,
+    nbytes,
     resolve_dtype,
 )
 from priml.kernel import jit_kernel
@@ -124,11 +125,13 @@ class Embedding(nn.Embedding):
             return Cost(
                 cells={
                     ("flops", "adjoint", "selection", dt): rows * row,
-                    ("bytes", "primal", "selection", index): rows * index.itemsize,
-                    ("bytes", "primal", "selection", dt): dt.itemsize * 2 * rows * row,
-                    ("bytes", "adjoint", "selection", index): rows * index.itemsize,
-                    ("bytes", "adjoint", "selection", dt): dt.itemsize
-                    * (3 * rows * row + self.channels_in * row),
+                    ("bytes", "primal", "selection", index): nbytes(rows, index),
+                    ("bytes", "primal", "selection", dt): nbytes(2 * rows * row, dt),
+                    ("bytes", "adjoint", "selection", index): nbytes(rows, index),
+                    ("bytes", "adjoint", "selection", dt): nbytes(
+                        3 * rows * row + self.channels_in * row,
+                        dt,
+                    ),
                 },
                 params=self.channels_in * row,
                 params_active=row,
@@ -251,12 +254,18 @@ class MultiHotEmbedding(nn.Module):
             return Cost(
                 cells={
                     ("flops", "primal", "elementwise", dt): gathered - summed,
-                    ("bytes", "primal", "selection", dt): dt.itemsize
-                    * (ids + gathered + 2 * scalars + summed),
+                    ("bytes", "primal", "selection", dt): nbytes(
+                        ids + gathered + 2 * scalars + summed,
+                        dt,
+                    ),
                     ("flops", "adjoint", "selection", dt): gathered,
-                    ("bytes", "adjoint", "selection", dt): dt.itemsize
-                    * (ids + summed + 2 * gathered + table),
+                    ("bytes", "adjoint", "selection", dt): nbytes(
+                        ids + summed + 2 * gathered + table,
+                        dt,
+                    ),
                 },
+                params=table,
+                params_active=fields * self.channels_out,
             )
 
     def __init__(self, config: Config) -> None:
@@ -267,6 +276,15 @@ class MultiHotEmbedding(nn.Module):
 
         """
         super().__init__()
+        if (
+            not config.offsets
+            or config.offsets[0] != 0
+            or any(a >= b for a, b in itertools.pairwise(config.offsets))
+            or config.offsets[-1] >= config.channels_in
+        ):
+            raise ValueError(
+                "offsets must start at 0, increase strictly, and stay below channels_in.",
+            )
         self.weight = nn.Parameter(
             torch.empty(config.channels_in, config.channels_out, dtype=config.dtype),
         )
@@ -290,6 +308,7 @@ class MultiHotEmbedding(nn.Module):
 
     def reset_parameters(self) -> None:
         """Draw the table with the config's initializer, undivided by any depth."""
+        self.offsets = torch.tensor(self.field_offsets, device=self.weight.device)
         call_init(self._init_weight, self.weight, depth_index=())
 
     @override
@@ -373,6 +392,7 @@ class MultiHotEmbedding(nn.Module):
             width_block=_power_of_two(width),
             cell_block=_power_of_two(self.num_cells),
             scalar_block=_power_of_two(self.num_scalars),
+            table_rows=self.weight.shape[0],
             num_warps=4,
         )
         return output.reshape(
@@ -625,6 +645,7 @@ def _embed_triton(  # noqa: PLR0917 -- The signature is the kernel's positional 
     width_block: language.constexpr,
     cell_block: language.constexpr,
     scalar_block: language.constexpr,
+    table_rows: language.constexpr,
 ) -> None:
     """Embed one packed row per program: sum each cell's rows, copy the scalars."""
     row = language.program_id(0)
@@ -644,9 +665,12 @@ def _embed_triton(  # noqa: PLR0917 -- The signature is the kernel's positional 
         rows = language.load(offsets_ptr + field) + ids.to(language.float32).to(
             language.int32,
         )
+        # A row outside the table reads zero, as the backward skips it: no
+        # device assert, which would need a debug build of every launch.
+        valid = (rows >= 0) & (rows < table_rows)
         entry = language.load(
             table_ptr + rows[:, None] * width + lane[None, :],
-            mask=lanes,
+            mask=lanes & valid[:, None],
             other=0.0,
         )
         total = total + entry.to(language.float32)

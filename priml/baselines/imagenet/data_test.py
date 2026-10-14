@@ -10,6 +10,7 @@ import io
 from configgle import Fig
 from PIL import Image
 from torch import Tensor
+from treekle import from_plain
 
 import pytest
 import torch
@@ -45,7 +46,6 @@ from priml.data.processors.fields import FieldRenameKeys
 from priml.data.processors.labels import ImagenetSynsetToIndex
 from priml.data.processors.resize import Interpolate
 from priml.data.sources.extracted_imagenet import ExtractedImageNetSource
-from priml.lib.custom_json import DictCodec
 
 
 if TYPE_CHECKING:
@@ -70,7 +70,7 @@ def test_working_dir_propagates_through_imagenet_pipelines(tmp_path: Path) -> No
 
 def _fake_jpeg() -> bytes:
     buffer = io.BytesIO()
-    Image.new("RGB", (256, 255), color="red").save(buffer, format="JPEG")
+    Image.new("RGB", (12, 10), color="red").save(buffer, format="JPEG")
     return buffer.getvalue()
 
 
@@ -289,6 +289,8 @@ def test_deit_pipeline_configs_pin_augmentation_order_and_outputs() -> None:
     assert train_tensor.dtype is None
     assert eval_tensor.dtype == torch.int64
     assert isinstance(train.processors[-2], MixupCutmix.Config)
+    # Mixes the renamed ``image`` field, not the decoder's ``media_tensor``.
+    assert train.processors[-2].field == "image"
     assert isinstance(train.processors[-3], AsTensor.Config)
     assert isinstance(evaluate.processors[-2], AsTensor.Config)
     assert isinstance(train.processors[-1], PrefetchBuffer.Config)
@@ -309,14 +311,21 @@ def test_deit_train_data_pipeline(tmp_path: Path, batch_size: int) -> None:
     cfg.source.shuffle = False
     (batcher,) = (p for p in cfg.processors if isinstance(p, Batcher.Config))
     batcher.size = batch_size
+    (crop,) = (
+        p
+        for p in cfg.processors
+        if isinstance(p, GetRandomResizedCropBoxFromDimensions.Config)
+    )
+    assert crop.size == (224, 224)
+    crop.size = (6, 5)
 
     batch = next(iter(cfg.make()))
 
     image, label = batch["image"], batch["label"]
     assert isinstance(image, Tensor)
     assert isinstance(label, Tensor)
-    # (B, C, F, H, W): an image is one frame.
-    assert image.shape == (batch_size, 3, 1, 224, 224)
+    # (B, C, F, H, W): an image is one frame, resized to the crop's size.
+    assert image.shape == (batch_size, 3, 1, *crop.size)
     # MixUp with label smoothing emits soft float labels over the classes.
     assert label.shape == (batch_size, 1000)
     assert label.dtype == torch.float32
@@ -383,9 +392,11 @@ def test_dataset_builds_loaders_from_both_pipelines_and_checkpoints_its_pass_cou
     dataset = config.make()
 
     train_items = [
-        DictCodec.coerce(item, Tensor) for item in dataset.train_dataloader()
+        from_plain(item, dict[str, Tensor]) for item in dataset.train_dataloader()
     ]
-    eval_items = [DictCodec.coerce(item, Tensor) for item in dataset.eval_dataloader()]
+    eval_items = [
+        from_plain(item, dict[str, Tensor]) for item in dataset.eval_dataloader()
+    ]
     assert [int(item["index"]) for item in train_items] == [0, 1]
     assert [int(item["index"]) for item in eval_items] == [0, 1, 2]
 
@@ -397,6 +408,6 @@ def test_dataset_builds_loaders_from_both_pipelines_and_checkpoints_its_pass_cou
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

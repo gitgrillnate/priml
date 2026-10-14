@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import random
 
+from treekle import from_plain
+
 from priml.data.pipeline.shuffle import ShuffleBuffer
-from priml.lib.custom_json import IntCodec
 
 
 def test_shuffle_buffer():
@@ -41,11 +42,11 @@ def test_shuffle_buffer_seed_is_reproducible():
     samples = [{"key": f"test_{i}", "index": i} for i in range(50)]
 
     a = [
-        IntCodec.coerce(r["index"], 0)
+        from_plain(r.get("index"), int, default=0)
         for r in ShuffleBuffer.Config(size=10, seed=123).make()(iter(samples))
     ]
     b = [
-        IntCodec.coerce(r["index"], 0)
+        from_plain(r.get("index"), int, default=0)
         for r in ShuffleBuffer.Config(size=10, seed=123).make()(iter(samples))
     ]
 
@@ -93,6 +94,6 @@ def test_shuffle_buffer_without_seed_uses_global_random_state() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

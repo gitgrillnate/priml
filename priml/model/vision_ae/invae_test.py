@@ -16,7 +16,6 @@ from typing import Final
 
 import math
 
-from configgle.testing import assert_pprint_golden
 from torch import Tensor, nn
 
 import pytest
@@ -40,6 +39,7 @@ from priml.model.vision_ae.invae import (
 from priml.model.vision_ae.latent_norm import ScaleLatents
 from priml.testing.bfb import assert_bfb_against_golden
 from priml.testing.cost import assert_cost_matches_torch, measured_traffic
+from priml.testing.golden import assert_pprint_golden
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -343,6 +343,6 @@ def test_posterior_draws_its_shape_and_its_mode_is_the_mean() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

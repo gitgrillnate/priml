@@ -83,11 +83,11 @@ import types
 
 from torch import Tensor, nn
 from torch.utils._python_dispatch import TorchDispatchMode
+from treekle import json_loads
 
 import torch
 
 from priml.hub import get_cache_dir
-from priml.lib.custom_json import DictCodec, loads
 from priml.model.vision_ae.checkpoint import (
     LocalFile,
 )
@@ -120,9 +120,12 @@ if TYPE_CHECKING:
     from torch._ops import OpOverload
     from torchvision.transforms import Normalize
     from torchvision.transforms.functional import to_tensor
+    from transformers.models.dinov2_with_registers import (
+        configuration_dinov2_with_registers,
+        modeling_dinov2_with_registers,
+    )
 
     import coverage
-    import transformers
 else:
     from wrapt import lazy_import
 
@@ -130,7 +133,12 @@ else:
     # comparison needs; importing this module needs none of them, and the
     # optional ``coverage`` and ``transformers`` are absent from a plain install.
     coverage = lazy_import("coverage")
-    transformers = lazy_import("transformers")
+    configuration_dinov2_with_registers = lazy_import(
+        "transformers.models.dinov2_with_registers.configuration_dinov2_with_registers",
+    )
+    modeling_dinov2_with_registers = lazy_import(
+        "transformers.models.dinov2_with_registers.modeling_dinov2_with_registers",
+    )
     save_file = lazy_import("safetensors.torch", "save_file")
     Normalize = lazy_import("torchvision.transforms", "Normalize")
     to_tensor = lazy_import("torchvision.transforms.functional", "to_tensor")
@@ -1302,8 +1310,8 @@ def run_rae(clone: Path, work: Path) -> Outcome:
     encoder_dir.mkdir(parents=True, exist_ok=True)
     decoder_dir.mkdir(parents=True, exist_ok=True)
 
-    hf = transformers.Dinov2WithRegistersModel(
-        transformers.Dinov2WithRegistersConfig(
+    hf = modeling_dinov2_with_registers.Dinov2WithRegistersModel(
+        configuration_dinov2_with_registers.Dinov2WithRegistersConfig(
             hidden_size=8,
             num_hidden_layers=1,
             num_attention_heads=2,
@@ -1339,9 +1347,9 @@ def run_rae(clone: Path, work: Path) -> Outcome:
             },
         ),
     )
-    decoder_json = DictCodec.coerce(
-        loads((clone / "configs/decoder/ViTXL/config.json").read_text()),
-        default=None,
+    decoder_json = json_loads(
+        (clone / "configs/decoder/ViTXL/config.json").read_text(),
+        dict[str, object],
     )
     decoder_json.update(
         decoder_hidden_size=8,

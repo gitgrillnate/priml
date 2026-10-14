@@ -2,7 +2,7 @@
 
 Regenerate after an intentional numeric change::
 
-    BFB_REGENERATE=1 uv --quiet run --frozen pytest priml/model/moe_test.py
+    uv --quiet run --frozen pytest priml/model/moe_test.py --regenerate-b4b
 
 Run through ``pytest``: the priml ``conftest.py`` sets ``MKL_CBWR`` and caps
 math threads before torch imports. Minting from bare Python skips that setup.
@@ -12,10 +12,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Final, cast, override
+from typing import Final, Literal, cast, override
 from unittest import mock
 
-from configgle.testing import assert_pprint_golden
 from torch import Tensor
 
 import pytest
@@ -31,6 +30,7 @@ from priml.testing.bfb import (
     move_to_device,
 )
 from priml.testing.cost import assert_cost_matches_torch
+from priml.testing.golden import assert_pprint_golden
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -72,6 +72,89 @@ def test_router_rejects_top_k_above_grouped_eligible():
             n_group=4,
             topk_group=2,
         ).make()
+
+
+@pytest.mark.parametrize(
+    ("n_group", "topk_group", "message"),
+    [
+        (3, 1, r"^num_experts=8 must be divisible by n_group=3\.$"),
+        (2, 3, r"^topk_group=3 > n_group=2\.$"),
+    ],
+)
+def test_sigmoid_router_rejects_groups_it_cannot_form(
+    n_group: int,
+    topk_group: int,
+    message: str,
+) -> None:
+    config = SigmoidRouter.Config(
+        channels_in=4,
+        num_experts=8,
+        top_k=1,
+        n_group=n_group,
+        topk_group=topk_group,
+    )
+    with pytest.raises(ValueError, match=message):
+        config.make()
+
+
+def test_sigmoid_router_cost_adds_the_grouped_selection() -> None:
+    """Each of four groups sums its top two: one add per group per row."""
+    flat = SigmoidRouter.Config(channels_in=4, num_experts=8, top_k=2)
+    grouped = SigmoidRouter.Config(
+        channels_in=4,
+        num_experts=8,
+        top_k=2,
+        n_group=4,
+        topk_group=2,
+    )
+    rows = 3 * 2
+    plain = flat.cost(seq_len=3, batch_size=2, dtype=None)
+    extra = grouped.cost(seq_len=3, batch_size=2, dtype=None)
+    assert (
+        extra["flops", "primal", "reduction"].sum()
+        == plain["flops", "primal", "reduction"].sum() + rows * 4
+    )
+    assert extra["bytes", "primal", "sort", torch.int64] == plain[
+        "bytes",
+        "primal",
+        "sort",
+        torch.int64,
+    ] + rows * 8 * (4 * 2 + 2)
+
+
+def test_sigmoid_router_reset_zeroes_the_correction_bias() -> None:
+    router = SigmoidRouter.Config(channels_in=4, num_experts=3, top_k=1).make()
+    bias = router.e_score_correction_bias
+    assert bias is not None
+    bias.fill_(2.0)
+    router.reset_parameters()
+    assert torch.equal(bias, torch.zeros(3))
+
+
+def test_moe_infers_channels_in_from_channels_out() -> None:
+    config = MoE.Config(channels_out=6).finalize()
+    assert config.channels_in == 6
+    assert config.router.channels_in == 6
+
+
+@pytest.mark.parametrize(
+    ("expert_rows", "message"),
+    [
+        ((2, 2, 2), r"^expert_rows has length 3; expected 4\.$"),
+        ((5, -1, 2, 2), r"^expert_rows must contain nonnegative integers\.$"),
+        ((2, 2, 2, 1), r"^expert_rows sums to 7; expected 8 for 4 rows and top_k=2\.$"),
+    ],
+)
+def test_moe_cost_rejects_inconsistent_expert_rows(
+    expert_rows: tuple[int, ...],
+    message: str,
+) -> None:
+    config = MoE.Config(
+        channels_in=4,
+        router=SoftmaxRouter.Config(num_experts=4, top_k=2),
+    ).finalize()
+    with pytest.raises(ValueError, match=message):
+        config.cost(seq_len=4, batch_size=1, dtype=None, expert_rows=expert_rows)
 
 
 def test_router():
@@ -166,6 +249,32 @@ def test_moe_dispatch_forwards_expert_kwargs():
 
     assert torch.equal(result, torch.full((3, 2), 3.0))
     arange.assert_called_once_with(3, device=x.device)
+
+
+def test_moe_aux_loss_is_public_and_clears_on_eval() -> None:
+    config = MoE.Config(channels_in=3)
+    config.router = SoftmaxRouter.Config(num_experts=2, top_k=1)
+    model = config.make()
+    rows = torch.randn(2, 3)
+    model(rows)
+    assert model.aux_loss.item() > 0
+    model.eval()
+    model(rows)
+    assert model.aux_loss.item() == 0
+    assert not model.aux_loss.requires_grad
+
+
+@pytest.mark.parametrize("shard", ["colwise", "rowwise"])
+def test_moe_preserves_explicit_expert_shard(
+    shard: Literal["colwise", "rowwise"],
+) -> None:
+    config = MoE.Config(channels_in=3)
+    expert = SwiGLU.Config()
+    expert.shard = shard
+    config.expert = expert
+    finalized = config.copy_tree().finalize()
+    assert isinstance(finalized.expert, SwiGLU.Config)
+    assert finalized.expert.shard == shard
 
 
 def test_moe_aux_loss():
@@ -471,7 +580,7 @@ def test_router_bfb(device: str) -> None:
 
 @pytest.mark.parametrize("device", bfb_devices(), ids=str)
 def test_moe_bfb(device: str) -> None:
-    """Regenerate with ``BFB_REGENERATE=1`` against this canonical sidecar.
+    """Regenerate with ``--regenerate-b4b`` against this canonical sidecar.
 
     Args:
       device: Device on which to run the golden comparison.
@@ -669,6 +778,6 @@ def _first_tensor(module: torch.nn.Module, value: object) -> Tensor:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

@@ -14,7 +14,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Final
 
-from configgle.testing import assert_pprint_golden
 from safetensors.torch import save_file
 from torch import Tensor, nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -41,7 +40,7 @@ from priml.testing.bfb import (
     load_golden,
 )
 from priml.testing.cost import assert_cost_matches_torch
-from priml.testing.golden import mismatches, read_tensors
+from priml.testing.golden import assert_pprint_golden, mismatches, read_tensors
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -535,6 +534,6 @@ def test_initialization_ends_with_vtp_models_post_init_pass() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

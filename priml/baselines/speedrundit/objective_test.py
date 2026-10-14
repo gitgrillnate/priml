@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, cast
 from unittest.mock import Mock
 
 import math
@@ -304,6 +304,43 @@ def test_sampled_time_uses_the_latent_device(
     unused_sample.assert_not_called()
 
 
+@pytest.mark.parametrize("unknown", ["sigmoid"])
+def test_unknown_path_raises(unknown: str) -> None:
+    path = cast("Literal['linear', 'cosine']", unknown)
+    with pytest.raises(ValueError, match=rf"^unsupported flow path: {unknown}$"):
+        interpolant(torch.zeros(2), path)
+
+
+@pytest.mark.parametrize("bogus", ["bogus"])
+def test_an_unknown_choice_is_refused_at_construction(bogus: str) -> None:
+    with pytest.raises(ValueError, match=r"^unsupported path: bogus$"):
+        SpeedrunObjective(path=cast("Literal['linear', 'cosine']", bogus))
+    with pytest.raises(ValueError, match=r"^unsupported weighting: bogus$"):
+        SpeedrunObjective(weighting=cast("Literal['uniform', 'lognormal']", bogus))
+    with pytest.raises(ValueError, match=r"^unsupported cfm_weighting: bogus$"):
+        SpeedrunObjective(cfm_weighting=cast("Literal['uniform', 'linear']", bogus))
+
+
+def test_the_velocity_loss_reduces_every_non_batch_axis() -> None:
+    latents = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4) / 5
+    target = latents  # d_alpha = -1, d_sigma = 1 with zero noise and t = 0.
+    output = ModelOutput(
+        velocity=torch.zeros_like(latents),
+        cls_velocity=torch.zeros(2, 3),
+        projections=(Projection(torch.ones(2, 5, 3), None),),
+    )
+    terms = SpeedrunObjective(shift_time=False)(
+        Mock(return_value=output),
+        latents,
+        torch.tensor([0, 1]),
+        (torch.ones(2, 5, 3),),
+        time=torch.zeros(2),
+        noise=torch.zeros_like(latents),
+        cls_noise=torch.zeros(2, 3),
+    )
+    torch.testing.assert_close(terms.velocity, target.square().mean(dim=(1, 2)))
+
+
 def test_objective_rejects_mismatched_label_count() -> None:
     with pytest.raises(
         ValueError,
@@ -335,6 +372,6 @@ def test_objective_requires_a_teacher_feature_map() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

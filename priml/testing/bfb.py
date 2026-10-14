@@ -12,7 +12,7 @@ Pattern:
 
 Regenerate (after an intentional numeric change)::
 
-    BFB_REGENERATE=1 uv --quiet run --frozen pytest <test_file>
+    uv --quiet run --frozen pytest <test_file> --regenerate-b4b
 
 Cross-architecture portability (the whole point):
   A float32 CPU kernel's last mantissa bit depends on the host's vector width
@@ -114,6 +114,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -125,7 +126,6 @@ from typing import (
     override,
 )
 
-import os
 import tempfile
 
 from torch import Tensor, nn
@@ -134,10 +134,11 @@ from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dty
 from torch._prims_common.wrappers import out_wrapper
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils._python_dispatch import TorchDispatchMode
+from treekle import from_plain
 
 import torch
 
-from priml.lib.custom_json import DictCodec, ListCodec
+from priml.testing import regenerate
 from priml.testing.golden import pack, tensor_bits_equal, unpack
 
 
@@ -145,9 +146,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 
     from torch._ops import OpOverload
-
-
-_ENV_REGENERATE: Final = "BFB_REGENERATE"
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -450,7 +448,7 @@ def assert_bfb_against_golden[InputT](
 ) -> None:
     """Assert that running ``module(input)`` reproduces the saved golden.
 
-    First call (no golden file present, or ``BFB_REGENERATE=1`` set):
+    First call (no golden file present, or ``--regenerate-b4b`` passed):
       - Builds the module, builds the input, randomizes parameters under
         ``seed``, runs ``module(input)``, and writes ``{golden_name}.pt``
         containing the pre-run state_dict, input, output, and every post-run
@@ -519,9 +517,8 @@ def regenerate_golden[InputT](
 ) -> None:
     """Force-regenerate a golden, ignoring any existing file.
 
-    Equivalent to setting ``BFB_REGENERATE=1`` and calling
-    ``assert_bfb_against_golden`` once. The freshly written golden is
-    replayed and must round-trip bit-exactly.
+    Equivalent to ``assert_bfb_against_golden`` under ``--regenerate-b4b``.
+    The freshly written golden is replayed and must round-trip bit-exactly.
 
     Args:
       golden_dir: Directory for the golden file.
@@ -532,26 +529,15 @@ def regenerate_golden[InputT](
       run: Optional custom runner.
 
     """
-    prior = os.environ.get(_ENV_REGENERATE)
-    os.environ[_ENV_REGENERATE] = "1"
-    try:
-        with suppress(_MissingGoldenError):
-            assert_bfb_against_golden(
-                golden_dir=golden_dir,
-                golden_name=golden_name,
-                build_module=build_module,
-                build_input=build_input,
-                seed=seed,
-                run=run,
-            )
-    finally:
-        # Restore the caller's prior value rather than unconditionally
-        # clearing it, so calling this inside a process launched with
-        # BFB_REGENERATE=1 does not silently disable regeneration afterward.
-        if prior is None:
-            del os.environ[_ENV_REGENERATE]
-        else:
-            os.environ[_ENV_REGENERATE] = prior
+    with regenerate.forced(), suppress(_MissingGoldenError):
+        assert_bfb_against_golden(
+            golden_dir=golden_dir,
+            golden_name=golden_name,
+            build_module=build_module,
+            build_input=build_input,
+            seed=seed,
+            run=run,
+        )
 
 
 class _Golden(TypedDict):
@@ -618,9 +604,11 @@ def stale_post_states(paths: Iterable[Path]) -> list[Path]:
     """
     stale: list[Path] = []
     for path in paths:
-        raw = DictCodec.coerce(
-            cast(object, torch.load(path, weights_only=False)),
-        )
+        loaded = cast(object, torch.load(path, weights_only=False))
+        if not isinstance(loaded, dict):
+            continue
+        typed_loaded = cast(dict[str, object], loaded)
+        raw = from_plain(typed_loaded, dict[str, object])
         if "post_state" not in raw or "state_dict" not in raw:
             continue
         payload = load_golden(path)
@@ -862,7 +850,14 @@ def _assert_same_input(live: object, stored: object, *, label: str) -> None:
 
 
 def _ints(values: object) -> list[int]:
-    return ListCodec.coerce(values, int)
+    if not isinstance(values, (list, tuple)):
+        return []
+    typed_values = cast(list[object] | tuple[object, ...], values)
+    return [
+        from_plain(value, int)
+        for value in typed_values
+        if isinstance(value, int) and not isinstance(value, bool)
+    ]
 
 
 def _assert_equal(a: object, b: object, *, label: str) -> None:
@@ -992,6 +987,11 @@ def _floating_tensors(value: object) -> list[Tensor]:
 # of it.
 def _result_dtype(tensors: Sequence[Tensor]) -> torch.dtype:
     """Return the dtype the op would have produced natively."""
+    # Nearly every op meets one dtype, which promotes to itself; the general rule
+    # costs ~10us per op and the harness dispatches ~1e4 ops per golden.
+    first = tensors[0].dtype
+    if all(tensor.dtype == first for tensor in tensors):
+        return first
     # A zero-dimensional float64 tensor does not widen a float32 vector.
     # Dtype-only promotion loses that distinction.
     return elementwise_dtypes(
@@ -1140,9 +1140,26 @@ def _resolve_output(
     return _downcast_f64(element, target)
 
 
+@cache
 def _op_name(func: OpOverload[..., object]) -> str:
     """Return an Aten overload's packet name."""
     return func.name().split("::")[-1].split(".")[0]
+
+
+# A view moves no bytes, so it is exact, and its result must alias its input: upcast,
+# it returns a float64 copy narrowed back, and every write through it lands on that
+# copy. ``x[:, :n]`` over a whole dimension issues ``alias``, not ``slice``, so a
+# rollout of one buffer stored each step into a copy and kept zeros (measured). The
+# schema names every view, the allowlist's and the 13 it lacked (``alias``,
+# ``diagonal``, ``unfold``, ``real``, ...), so no future view op can fall through.
+@cache
+def _is_view(func: OpOverload[..., object]) -> bool:
+    """Whether every return aliases an input without writing it."""
+    returns = func._schema.returns  # noqa: SLF001 -- The harness reads the op schema to find views.
+    return bool(returns) and all(
+        value.alias_info is not None and not value.alias_info.is_write
+        for value in returns
+    )
 
 
 # ``add``/``sub`` with ``alpha != 1`` compute ``a + alpha * b``: vectorized kernels
@@ -1155,12 +1172,28 @@ def _scales_operand(
     kwargs: dict[str, object],
 ) -> bool:
     """Whether an allowlisted op carries a non-unit ``alpha`` multiplier."""
+    index = _alpha_index(func)
+    if index is None:
+        return False
+    return kwargs.get("alpha", args[index] if index < len(args) else 1) != 1
+
+
+@cache
+def _alpha_index(func: OpOverload[..., object]) -> int | None:
+    """Return the position of the op's ``alpha`` argument, if it has one."""
     for index, argument in enumerate(func._schema.arguments):  # noqa: SLF001 -- The harness reads the op schema to find the multiplier argument.
-        if argument.name != "alpha":
-            continue
-        alpha = kwargs.get("alpha", args[index] if index < len(args) else 1)
-        return alpha != 1
-    return False
+        if argument.name == "alpha":
+            return index
+    return None
+
+
+@cache
+def _writes(func: OpOverload[..., object]) -> bool:
+    """Whether the op mutates an argument: in-place, ``out=``, or foreach."""
+    return any(
+        arg.alias_info is not None and arg.alias_info.is_write
+        for arg in func._schema.arguments  # noqa: SLF001 -- The harness reads the op schema to find write arguments.
+    )
 
 
 # Upcasting is not enough for a fused multiply-add: its float64 kernel is itself
@@ -1191,6 +1224,25 @@ _UNFUSED_OPS: Final = frozenset(
         "_softmax_backward_data",
     },
 )
+
+
+# With a contraction of one, x86's matrix kernel stores the product itself, so
+# ``-1.0 * 0.0`` stays ``-0.0``; aarch64's adds it to a zero accumulator and stores
+# ``+0.0``. A single row or column takes x86's vector kernel, which also adds to
+# ``+0.0``, so those shapes run the kernel as usual.
+def _one_term_mm(
+    func: OpOverload[..., object],
+    args: tuple[object, ...],
+) -> Tensor | None:
+    """Return a one-term ``mm`` as its plain product, or ``None`` for any other op."""
+    if func.namespace != "aten" or _op_name(func) != "mm" or len(args) != 2:
+        return None
+    left, right = args
+    if not isinstance(left, Tensor) or not isinstance(right, Tensor):
+        return None
+    if left.shape[1] != 1 or left.shape[0] < 2 or right.shape[1] < 2:
+        return None
+    return left * right
 
 
 def _run_unfused(
@@ -1312,9 +1364,10 @@ class _Float64Compute(TorchDispatchMode):
     float32 argument and its overloadpacket name is NOT
     in ``_EXACT_F32_OPS``; the float32 args are widened to float64, the op runs,
     and float64 results are narrowed back to float32. Allowlisted ops (exact
-    elementwise arithmetic and pure data movement) pass through untouched. A
-    tensorless arithmetic factory in ``_FLOAT_FACTORIES`` is widened by its output dtype,
-    since it has no argument to read the width from.
+    elementwise arithmetic and pure data movement) pass through untouched, as
+    does every view op by its schema (``_is_view``), so a write through a view
+    reaches its base. A tensorless arithmetic factory in ``_FLOAT_FACTORIES`` is
+    widened by its output dtype, since it has no argument to read the width from.
 
     Upcast-by-default is the completeness guarantee: a transcendental or
     reduction absent from every list is still upcast, so it cannot silently mint
@@ -1340,7 +1393,7 @@ class _Float64Compute(TorchDispatchMode):
         kwargs = kwargs or {}
         if func.namespace in _COLLECTIVE_NAMESPACES:
             return func(*args, **kwargs)
-        exact = (
+        exact = _is_view(func) or (
             func.namespace == "aten"
             and _op_name(func) in _EXACT_F32_OPS
             and not _scales_operand(
@@ -1386,11 +1439,10 @@ class _Float64Compute(TorchDispatchMode):
             isinstance(explicit_dtype, torch.dtype) and _is_narrow_float(explicit_dtype)
         ):
             up_kwargs["dtype"] = torch.float64
-        result = _run_unfused(func, up_args, up_kwargs)
-        if any(
-            arg.alias_info is not None and arg.alias_info.is_write
-            for arg in func._schema.arguments  # noqa: SLF001 -- The harness reads the op schema to find write arguments.
-        ):
+        result = _one_term_mm(func, args=up_args)
+        if result is None:
+            result = _run_unfused(func, up_args, up_kwargs)
+        if _writes(func):
             # In-place / ``out=`` / foreach op: it mutated the float64 copies, not
             # the caller's originals. Narrow each back and return the originals
             # in the op's own return shape.
@@ -1488,7 +1540,7 @@ def _assert_bfb[InputT](
     golden_dir.mkdir(parents=True, exist_ok=True)
     golden_path = golden_dir / f"{golden_name}.pt"
     missing = not golden_path.exists()
-    if missing or os.environ.get(_ENV_REGENERATE) == "1":
+    if missing or regenerate.b4b():
         # The candidate belongs to the destination filesystem and is cleaned
         # up on every exit. Publish only after the complete replay succeeds.
         with tempfile.TemporaryDirectory(

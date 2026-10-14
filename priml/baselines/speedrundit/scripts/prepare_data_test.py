@@ -6,6 +6,7 @@ from dataclasses import field
 from functools import partial
 from pathlib import Path
 from typing import Final, cast, override
+from unittest.mock import Mock
 
 import shutil
 
@@ -13,6 +14,7 @@ from configgle import Fig, Makeable
 from PIL import Image
 from torch import Tensor, nn
 from torch.nn import functional
+from treekle import from_plain, json_loads
 
 import pytest
 import torch
@@ -26,7 +28,6 @@ from priml.baselines.speedrundit.corpus import (
 from priml.baselines.speedrundit.data import PairedImageLatentDataset
 from priml.baselines.speedrundit.latent_codec import FloatCodec, ScalarTableCodec
 from priml.baselines.speedrundit.scripts import prepare_data
-from priml.lib.custom_json import DictCodec, loads
 from priml.model.vision_ae.custom_types import LatentNormalizer, posterior_mode
 from priml.model.vision_ae.invae_test import tiny
 from priml.model.vision_ae.latent_norm import ScaleLatents
@@ -52,17 +53,12 @@ def test_prepared_corpus_loads_back_as_the_encoder_wrote_it(tmp_path: Path) -> N
 
 
 def test_center_crop_box_downsamples_before_center_crop() -> None:
-    image = Image.new("RGB", (768, 512))
-    for x in range(768):
-        for y in range(512):
-            image.putpixel((x, y), (x % 256, y % 256, (x + y) % 256))
+    image = _gradient((12, 8))
 
-    cropped = prepare_data.center_crop(image, size=256)
-    expected = image.resize((384, 256), Image.Resampling.BOX).crop(
-        (64, 0, 320, 256),
-    )
+    cropped = prepare_data.center_crop(image, size=4)
+    expected = image.resize((6, 4), Image.Resampling.BOX).crop((1, 0, 5, 4))
 
-    assert cropped.size == (256, 256)
+    assert cropped.size == (4, 4)
     assert cropped.tobytes() == expected.tobytes()
 
 
@@ -82,8 +78,8 @@ def test_center_crop_resizes_short_axis_and_centers_both_axes() -> None:
 @pytest.mark.parametrize(
     ("source_size", "resized_size", "crop_box"),
     [
-        ((774, 512), (387, 256), (65, 0, 321, 256)),
-        ((512, 774), (256, 387), (0, 65, 256, 321)),
+        ((14, 8), (7, 4), (1, 0, 5, 4)),
+        ((8, 14), (4, 7), (0, 1, 4, 5)),
     ],
 )
 def test_center_crop_floors_odd_center_offsets(
@@ -91,14 +87,11 @@ def test_center_crop_floors_odd_center_offsets(
     resized_size: tuple[int, int],
     crop_box: tuple[int, int, int, int],
 ) -> None:
-    image = Image.new("RGB", source_size)
-    for x in range(image.width):
-        for y in range(image.height):
-            image.putpixel((x, y), (x % 256, y % 256, (x + y) % 256))
+    image = _gradient(source_size)
     resized = image.resize(resized_size, Image.Resampling.BOX)
     expected = resized.crop(crop_box)
 
-    assert prepare_data.center_crop(image, size=256).tobytes() == expected.tobytes()
+    assert prepare_data.center_crop(image, size=4).tobytes() == expected.tobytes()
 
 
 def test_images_are_center_cropped_to_the_autoencoder_size(tmp_path: Path) -> None:
@@ -117,8 +110,8 @@ def test_a_rerun_keeps_what_is_already_encoded(tmp_path: Path) -> None:
     config = _source(tmp_path)
     _ = prepare_data.prepare(config, imagenet=raw, device="cpu")
     _ = prepare_data.prepare(config, imagenet=raw, device="cpu")
-    encoding = DictCodec.coerce(_receipt(config)["details"], default=None)["encoding"]
-    assert DictCodec.coerce(encoding, default=None)["newly_encoded"] == 0
+    encoding = from_plain(_receipt(config)["details"], dict[str, object])["encoding"]
+    assert from_plain(encoding, dict[str, object])["newly_encoded"] == 0
 
 
 def test_a_second_corpus_reuses_the_shared_images(tmp_path: Path) -> None:
@@ -140,12 +133,12 @@ def test_receipt_records_the_producers_and_error(tmp_path: Path) -> None:
         device="cpu",
     )
     receipt = _receipt(config)
-    identity = DictCodec.coerce(receipt["identity"], default=None)
-    autoencoder = DictCodec.coerce(identity["autoencoder"], default=None)
+    identity = from_plain(receipt["identity"], dict[str, object])
+    autoencoder = from_plain(identity["autoencoder"], dict[str, object])
     assert autoencoder["latent_shape"] == [4, *_GRID]
-    error = DictCodec.coerce(
-        DictCodec.coerce(receipt["details"], default=None)["error"],
-        default=None,
+    error = from_plain(
+        from_plain(receipt["details"], dict[str, object])["error"],
+        dict[str, object],
     )
     assert error["mse"] == 0.0
 
@@ -256,10 +249,10 @@ def test_a_rerun_keeps_the_fit_record(tmp_path: Path) -> None:
     raw = _imagenet(tmp_path, count=3)
     config = _source(tmp_path, codec=ScalarTableCodec.Config(num_fit_images=2))
     _ = prepare_data.prepare(config, imagenet=raw, device="cpu")
-    fit = DictCodec.coerce(_receipt(config)["details"], default=None)["fit"]
+    fit = from_plain(_receipt(config)["details"], dict[str, object])["fit"]
     _ = prepare_data.prepare(config, imagenet=raw, device="cpu")
-    assert DictCodec.coerce(_receipt(config)["details"], default=None)["fit"] == fit
-    assert DictCodec.coerce(fit, default=None)["num_images"] == 2
+    assert from_plain(_receipt(config)["details"], dict[str, object])["fit"] == fit
+    assert from_plain(fit, dict[str, object])["num_images"] == 2
 
 
 def test_latents_of_the_wrong_shape_are_refused_before_publication(
@@ -495,16 +488,71 @@ def test_main_hands_the_experiment_corpus_to_the_preparer(
         called.append((config, imagenet))
         return 0
 
+    raw = tmp_path / "raw"
+    for synset in _synsets():
+        (raw / "train" / synset).mkdir(parents=True)
     monkeypatch.setattr(prepare_data, "prepare", fake)
     monkeypatch.setattr(
         "sys.argv",
-        ["prepare_data", "--source", str(tmp_path), "--directory", str(tmp_path / "c")],
+        ["prepare_data", "--source", str(raw), "--directory", str(tmp_path / "c")],
     )
     assert prepare_data.main() == 0
     config, source = called[0]
-    assert source == tmp_path
+    assert source == raw
     assert Path(config.working_dir) == tmp_path / "c"
     assert cast(object, config.autoencoder) is not None
+
+
+def test_main_refuses_a_partial_imagenet_before_preparing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    train = tmp_path / "raw" / "train"
+    for synset in _synsets()[1:]:
+        (train / synset).mkdir(parents=True)
+    (train / "n00000000").mkdir()
+    prepare = Mock()
+    monkeypatch.setattr(prepare_data, "prepare", prepare)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prepare_data", "--source", str(tmp_path / "raw"), "--directory", "out"],
+    )
+
+    with pytest.raises(ValueError, match="1 are missing and 1 are unexpected"):
+        _ = prepare_data.main()
+    prepare.assert_not_called()
+
+
+def test_main_refuses_a_corpus_directory_over_its_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    prepare = Mock()
+    monkeypatch.setattr(prepare_data, "prepare", prepare)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prepare_data", "--source", str(raw), "--directory", str(raw)],
+    )
+
+    with pytest.raises(ValueError, match="aliases protected input"):
+        _ = prepare_data.main()
+    prepare.assert_not_called()
+    assert list(raw.iterdir()) == []
+
+
+def test_main_help_keeps_every_description_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(prepare_data, "__doc__", "a\nb\nfirst line\nsecond line\n")
+    monkeypatch.setattr("sys.argv", ["prepare_data", "--help"])
+
+    with pytest.raises(SystemExit):
+        _ = prepare_data.main()
+
+    assert "first line\nsecond line\n" in capsys.readouterr().out
 
 
 class _MeanAutoencoder(nn.Module):
@@ -542,10 +590,24 @@ class _MeanAutoencoder(nn.Module):
         return self.encode(image)
 
 
+def _gradient(size: tuple[int, int]) -> Image.Image:
+    """Return an RGB image whose every pixel differs, so a misplaced crop shows."""
+    image = Image.new("RGB", size)
+    for x in range(image.width):
+        for y in range(image.height):
+            image.putpixel((x, y), (x * 18, y * 18, (x + y) * 9))
+    return image
+
+
+def _synsets() -> list[str]:
+    """Return the 1,000 ImageNet synsets in the shipped label order."""
+    labels = _CWD.parents[2] / "data/processors/labels_imagenet.txt"
+    return labels.read_text(encoding="utf-8").splitlines()
+
+
 def _imagenet(root: Path, count: int) -> Path:
     """Write ``count`` distinct training JPEGs under the first synset."""
-    synsets = _CWD.parents[2] / "data/processors/labels_imagenet.txt"
-    synset = synsets.read_text(encoding="utf-8").splitlines()[0]
+    synset = _synsets()[0]
     directory = root / "raw" / "train" / synset
     directory.mkdir(parents=True)
     for index in range(count):
@@ -564,10 +626,10 @@ def _source(root: Path, **fields: object) -> PairedImageLatentDataset.Config:
 
 def _receipt(config: PairedImageLatentDataset.Config) -> dict[str, object]:
     path = Path(config.working_dir) / config.latent_subdir / RECEIPT
-    return DictCodec.coerce(loads(path.read_text()), default=None)
+    return json_loads(path.read_text(), dict[str, object])
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

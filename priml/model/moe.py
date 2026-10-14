@@ -17,6 +17,7 @@ from typing import Literal, Protocol, Self, cast, override, runtime_checkable
 
 from configgle import Fig, Makeable, Makes
 from torch import Tensor, nn
+from treekle import from_plain
 
 import torch
 
@@ -25,11 +26,11 @@ from priml.cost import (
     cost,
     elementwise_cost,
     matmul_cost,
+    nbytes,
     reduction_cost,
     resolve_dtype,
     traffic,
 )
-from priml.lib.custom_json import ListCodec
 from priml.model.custom_types import (
     ChannelsIn,
     ChannelsOut,
@@ -157,7 +158,6 @@ class Router(nn.Module):
             del kwargs
             rows = seq_len * batch_size
             dt = resolve_dtype(dtype)
-            s = dt.itemsize
             index = torch.int64
             k, e = self.top_k, self.num_experts
             total = matmul_cost(
@@ -169,12 +169,15 @@ class Router(nn.Module):
             ) + Cost(
                 cells={
                     ("flops", "adjoint", "selection", dt): rows * k,
-                    ("bytes", "primal", "sort", dt): rows * s * (e + k),
-                    ("bytes", "primal", "sort", index): rows * index.itemsize * k,
-                    ("bytes", "primal", "selection", dt): rows * s * 2 * k,
-                    ("bytes", "primal", "selection", index): rows * index.itemsize * k,
-                    ("bytes", "adjoint", "selection", dt): rows * s * (3 * k + e),
-                    ("bytes", "adjoint", "selection", index): rows * index.itemsize * k,
+                    ("bytes", "primal", "sort", dt): nbytes(rows * (e + k), dt),
+                    ("bytes", "primal", "sort", index): nbytes(rows * k, index),
+                    ("bytes", "primal", "selection", dt): nbytes(rows * 2 * k, dt),
+                    ("bytes", "primal", "selection", index): nbytes(rows * k, index),
+                    ("bytes", "adjoint", "selection", dt): nbytes(
+                        rows * (3 * k + e),
+                        dt,
+                    ),
+                    ("bytes", "adjoint", "selection", index): nbytes(rows * k, index),
                 },
             )
             if self.norm_topk_prob:
@@ -441,7 +444,6 @@ class SigmoidRouter(Router):
             """
             rows = seq_len * batch_size
             dt = resolve_dtype(dtype)
-            s = dt.itemsize
             index = torch.int64
             width = self.num_experts
             bias = width if self.use_correction_bias else 0
@@ -453,27 +455,32 @@ class SigmoidRouter(Router):
                         ("flops", "primal", "reduction", dt): rows
                         * self.n_group
                         * (picks - 1),
-                        ("bytes", "primal", "sort", dt): rows
-                        * s
-                        * (
-                            width
-                            + self.n_group * picks
-                            + self.n_group
-                            + self.topk_group
+                        ("bytes", "primal", "sort", dt): nbytes(
+                            rows
+                            * (
+                                width
+                                + self.n_group * picks
+                                + self.n_group
+                                + self.topk_group
+                            ),
+                            dt,
                         ),
-                        ("bytes", "primal", "sort", index): rows
-                        * index.itemsize
-                        * (self.n_group * picks + self.topk_group),
-                        ("bytes", "primal", "reduction", dt): rows
-                        * s
-                        * self.n_group
-                        * (picks + 1),
-                        ("bytes", "primal", "selection", dt): rows
-                        * s
-                        * (self.topk_group + 5 * width),
-                        ("bytes", "primal", "selection", index): rows
-                        * index.itemsize
-                        * (self.n_group + self.topk_group),
+                        ("bytes", "primal", "sort", index): nbytes(
+                            rows * (self.n_group * picks + self.topk_group),
+                            index,
+                        ),
+                        ("bytes", "primal", "reduction", dt): nbytes(
+                            rows * self.n_group * (picks + 1),
+                            dt,
+                        ),
+                        ("bytes", "primal", "selection", dt): nbytes(
+                            rows * (self.topk_group + 5 * width),
+                            dt,
+                        ),
+                        ("bytes", "primal", "selection", index): nbytes(
+                            rows * (self.n_group + self.topk_group),
+                            index,
+                        ),
                     },
                 )
             return (
@@ -642,7 +649,7 @@ class MoE(nn.Module):
                 )
                 # Each expert shards intra-expert over the tp dim (its own
                 # block style handles the split alignment).
-                if isinstance(cfg, Shardable):
+                if isinstance(cfg, Shardable) and cfg.shard is None:
                     cfg.shard = "colwise"
             return super().finalize()
 
@@ -696,7 +703,6 @@ class MoE(nn.Module):
                     f"{expected_rows} for {rows} rows and top_k={top_k}.",
                 )
             dt = resolve_dtype(dtype)
-            s = dt.itemsize
             index = torch.int64
             one_expert = cost(
                 self.expert,
@@ -752,44 +758,45 @@ class MoE(nn.Module):
                     ("flops", "adjoint", "selection", dt): rows
                     * (top_k + n_shared)
                     * width_in,
-                    ("bytes", "primal", "sort", index): rows
-                    * index.itemsize
-                    * 2
-                    * top_k,
-                    ("bytes", "primal", "elementwise", dt): rows
-                    * s
-                    * top_k
-                    * (2 * width + 1),
-                    ("bytes", "primal", "selection", dt): rows
-                    * s
-                    * (
-                        top_k * (2 * width_in + 3 * width)
-                        + width
-                        + 3 * n_shared * width
+                    ("bytes", "primal", "sort", index): nbytes(rows * 2 * top_k, index),
+                    ("bytes", "primal", "elementwise", dt): nbytes(
+                        rows * top_k * (2 * width + 1),
+                        dt,
                     ),
-                    ("bytes", "primal", "selection", index): rows
-                    * index.itemsize
-                    * top_k
-                    * 11,
-                    ("bytes", "adjoint", "elementwise", dt): rows
-                    * s
-                    * top_k
-                    * (5 * width + 1),
-                    ("bytes", "adjoint", "reduction", dt): rows
-                    * s
-                    * top_k
-                    * (width + 1),
-                    ("bytes", "adjoint", "selection", dt): rows
-                    * s
-                    * (
-                        top_k * (3 * width_in + 2 * width)
-                        + width_in
-                        + 3 * n_shared * width_in
+                    ("bytes", "primal", "selection", dt): nbytes(
+                        rows
+                        * (
+                            top_k * (2 * width_in + 3 * width)
+                            + width
+                            + 3 * n_shared * width
+                        ),
+                        dt,
                     ),
-                    ("bytes", "adjoint", "selection", index): rows
-                    * index.itemsize
-                    * top_k
-                    * 11,
+                    ("bytes", "primal", "selection", index): nbytes(
+                        rows * top_k * 11,
+                        index,
+                    ),
+                    ("bytes", "adjoint", "elementwise", dt): nbytes(
+                        rows * top_k * (5 * width + 1),
+                        dt,
+                    ),
+                    ("bytes", "adjoint", "reduction", dt): nbytes(
+                        rows * top_k * (width + 1),
+                        dt,
+                    ),
+                    ("bytes", "adjoint", "selection", dt): nbytes(
+                        rows
+                        * (
+                            top_k * (3 * width_in + 2 * width)
+                            + width_in
+                            + 3 * n_shared * width_in
+                        ),
+                        dt,
+                    ),
+                    ("bytes", "adjoint", "selection", index): nbytes(
+                        rows * top_k * 11,
+                        index,
+                    ),
                 },
             )
             return (
@@ -825,10 +832,12 @@ class MoE(nn.Module):
             assert isinstance(expert, nn.Module)
             shared_experts.append(expert)
         self.shared_experts = nn.ModuleList(shared_experts)
-        # Buffer (not a plain attribute) so ``.to(device)`` tracks it;
-        # non-persistent since it is recomputed every training forward and
-        # carries no learned state.
         self._aux_loss = torch.tensor(0.0)
+
+    @property
+    def aux_loss(self) -> Tensor:
+        """Return this forward's weighted load-balancing penalty."""
+        return self._aux_loss
 
     @override
     def _apply(self, fn: Callable[[Tensor], Tensor], recurse: bool = True) -> Self:
@@ -838,10 +847,7 @@ class MoE(nn.Module):
 
     def reset_parameters(self) -> None:
         """Initialize every parameter in place."""
-        # Sole init source for every owned tensor (meta-init audit
-        # contract): ``_aux_loss`` is runtime scratch overwritten each
-        # forward, but as a registered buffer it must still be reset here.
-        self._aux_loss.zero_()
+        self._aux_loss = self._aux_loss.new_zeros(())
         self.router.reset_parameters()
         for group in (self.experts, self.shared_experts):
             for expert in group:
@@ -861,6 +867,8 @@ class MoE(nn.Module):
             and self.router.scoring_func == "softmax"
         ):
             self._aux_loss = self._load_balance_loss(logits, indices)
+        else:
+            self._aux_loss = logits.new_zeros(())
 
         y = self._dispatch_routed(
             x_flat,
@@ -908,15 +916,12 @@ class MoE(nn.Module):
         starts = torch.cat([offsets.new_zeros(1), offsets[:-1]])
 
         y = x_flat.new_zeros(x_flat.shape[0], self.channels_out)
-        active_values = ListCodec.coerce(active.tolist())
-        starts_values = ListCodec.coerce(starts.tolist())
-        counts_values = ListCodec.coerce(counts.tolist())
+        active_values = from_plain(active.tolist(), list[int])
+        starts_values = from_plain(starts.tolist(), list[int])
+        counts_values = from_plain(counts.tolist(), list[int])
         for expert_index, expert_id in enumerate(active_values):
-            assert isinstance(expert_id, int)
             start = starts_values[expert_index]
             count = counts_values[expert_index]
-            assert isinstance(start, int)
-            assert isinstance(count, int)
             end = start + count
             tok_slice = sorted_tok[start:end]
             w_slice = sorted_w[start:end].unsqueeze(1)

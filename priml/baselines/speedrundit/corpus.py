@@ -29,11 +29,11 @@ import tempfile
 import types
 
 from configgle.pprinting import pformat
+from treekle import from_plain, json_loads
 
 import numpy as np
 import torch
 
-from priml.lib.custom_json import DictCodec, loads
 from priml.model.vision_ae.custom_types import CheckpointFile
 
 
@@ -331,7 +331,7 @@ def verify_receipt(
             f"{path} is missing. Encode the corpus with scripts/prepare_data.py, or "
             "record an existing REG corpus with its --receipt-only mode.",
         )
-    receipt = DictCodec.coerce(loads(path.read_text()), default=None)
+    receipt = json_loads(path.read_text(), dict[str, object])
     if receipt.get("format") != FORMAT_VERSION:
         raise CorpusMismatchError(
             f"{path} has receipt format {receipt.get('format')!r}, not "
@@ -354,7 +354,7 @@ def verify_receipt(
             f"{directory} was not produced by the configured autoencoder and codec:\n  "
             + "\n  ".join(problems),
         )
-    return DictCodec.coerce(receipt["details"], default=None)
+    return from_plain(receipt["details"], dict[str, object])
 
 
 def mismatches(

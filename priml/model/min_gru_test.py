@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from typing import ClassVar, Final, cast, override
 from unittest.mock import Mock, call
 
-from configgle.testing import assert_pprint_golden
 from torch import Tensor
 
 import pytest
@@ -33,6 +32,7 @@ from priml.model.min_gru import (
     _terminals_view,
 )
 from priml.testing.bfb import assert_bfb_against_golden
+from priml.testing.golden import assert_pprint_golden
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -272,22 +272,20 @@ def test_scan_config_cost_and_triton_cpu_dispatch() -> None:
     assert final.shape == state.shape
 
 
-def _cuda_tensor_metadata(dtype: torch.dtype) -> Tensor:
-    return cast(Tensor, SimpleNamespace(is_cuda=True, dtype=dtype))
-
-
 def test_runs_triton_checks_cuda_and_every_tensor_dtype() -> None:
     assert _runs_triton(
-        _cuda_tensor_metadata(torch.bfloat16),
-        _cuda_tensor_metadata(torch.float32),
+        cast(Tensor, SimpleNamespace(is_cuda=True, dtype=torch.bfloat16)),
+        cast(Tensor, SimpleNamespace(is_cuda=True, dtype=torch.float32)),
     )
     assert not _runs_triton(
         cast(Tensor, SimpleNamespace(is_cuda=False, dtype=torch.float32)),
     )
-    assert not _runs_triton(_cuda_tensor_metadata(torch.float64))
     assert not _runs_triton(
-        _cuda_tensor_metadata(torch.float32),
-        _cuda_tensor_metadata(torch.float64),
+        cast(Tensor, SimpleNamespace(is_cuda=True, dtype=torch.float64)),
+    )
+    assert not _runs_triton(
+        cast(Tensor, SimpleNamespace(is_cuda=True, dtype=torch.float32)),
+        cast(Tensor, SimpleNamespace(is_cuda=True, dtype=torch.float64)),
     )
 
 
@@ -1430,6 +1428,6 @@ def test_triton_scan_constructor_installs_torch_reference() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

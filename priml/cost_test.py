@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import fields
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final, assert_type, cast
 
 import functools
+import gc
 import importlib
 import inspect
 import math
 import pathlib
+import weakref
 
 from configgle import Fig
 
@@ -31,6 +33,7 @@ from priml.cost import (
     intensity,
     map_cost,
     matmul_cost,
+    nbytes,
     peak,
     reduction_cost,
     resolve_dtype,
@@ -130,6 +133,57 @@ def test_axes_are_named_by_their_values_in_any_order() -> None:
 def test_an_unknown_axis_value_is_rejected_by_name() -> None:
     with pytest.raises(KeyError, match="'gemm' is not a measure"):
         _ = _t()["gemm"]
+
+
+def test_an_empty_table_still_rejects_an_unknown_axis_value() -> None:
+    with pytest.raises(KeyError, match="'gemm' is not a measure"):
+        _ = Cost()["gemm"]
+    with pytest.raises(KeyError, match="'gemm' is not a measure"):
+        _ = Report()["gemm"]
+
+
+def test_an_empty_table_answers_by_the_axes_it_was_asked() -> None:
+    assert Cost()["flops", "primal", "matmul", BF] == 0
+    assert Cost()["flops", "primal"] == Cost()
+    assert Report()["primal", "matmul", BF] == 0.0
+    assert Report()["primal"] == Report()
+
+
+def test_a_slice_keeps_its_axes_whether_or_not_it_holds_cells() -> None:
+    t = _t()
+    # The int64 slice holds a cell; the float16 one holds none.
+    for table in (t[I64], t[torch.float16]):
+        assert table.axes == ("measure", "phase", "kernel")
+        assert table["bytes", "adjoint"].axes == ("kernel",)
+        with pytest.raises(KeyError, match="names no axis of a 3-axis table"):
+            _ = table[BF]
+
+
+def test_a_sub_table_is_read_by_its_sum_not_by_naming_every_axis() -> None:
+    t = _t()
+    assert t["bytes", "adjoint", "selection", I64] == 2
+    for table in (t[I64], t[torch.float16]):
+        with pytest.raises(KeyError, match=r"\.sum\(\)"):
+            _ = table["bytes", "adjoint", "selection"]
+    assert t[I64]["bytes", "adjoint"].sum() == 2
+    h100 = peak()["h100"]
+    assert h100[BF, "intensity", "matmul"] == 989 / 3.35
+    with pytest.raises(KeyError, match=r"\.sum\(\)"):
+        _ = h100[BF]["intensity", "matmul"]
+
+
+def test_a_lookup_is_typed_by_how_many_axes_it_names() -> None:
+    t = _t()
+    assert_type(t["flops", "primal", "matmul", BF], int)
+    assert_type(t["flops", "matmul"], Cost)
+    report = intensity(t)
+    assert_type(report["primal", "matmul", BF], float | Report)
+    assert_type(report["primal"], Report)
+
+
+def test_one_axis_named_twice_is_rejected() -> None:
+    with pytest.raises(KeyError, match="'adjoint' names the phase axis twice"):
+        _ = _t()["primal", "adjoint"]
 
 
 def test_missing_axis_error_names_the_requested_axis() -> None:
@@ -255,7 +309,8 @@ def test_equality_ignores_explicit_zero_cells() -> None:
 
 def test_cost_is_one_table_and_three_owned_integers() -> None:
     names = [f.name for f in fields(Cost)]
-    assert names == ["cells", "params", "params_active", "bytes_state"]
+    # The table is its cells and the axis each key position holds.
+    assert names == ["cells", "axes", "params", "params_active", "bytes_state"]
 
 
 def test_cost_add_sums_cells_and_ownership() -> None:
@@ -331,6 +386,28 @@ def test_matmul_cost_prices_a_packed_weight_at_its_stored_bytes() -> None:
     assert c["flops", "primal", "elementwise", BF] == 3 * 12
     assert c["bytes", "primal", "elementwise"] == Cost()
     assert c.params == c.params_active == 12
+
+
+def test_nbytes_matches_torch_storage_for_packed_fp4() -> None:
+    fp4 = torch.float4_e2m1fn_x2
+    # Each fp4 element holds two values in one byte.
+    packed = torch.zeros(3, 5, dtype=torch.uint8).view(fp4)
+    assert nbytes(2 * packed.numel(), fp4) == packed.nbytes
+    assert nbytes(3, fp4) == 2
+    assert nbytes(3, BF) == 6
+
+
+def test_matmul_cost_moves_half_the_int8_bytes_at_fp4() -> None:
+    fp4, int8 = torch.float4_e2m1fn_x2, torch.int8
+    packed, plain = (
+        matmul_cost(channels_in=2, channels_out=4, rows=3, dtype=dt)
+        for dt in (fp4, int8)
+    )
+    for phase in ("primal", "adjoint"):
+        assert (
+            2 * packed["bytes", phase, "matmul", fp4]
+            == (plain["bytes", phase, "matmul", int8])
+        )
 
 
 def test_matmul_cost_dequantizes_once_per_invocation_not_per_row() -> None:
@@ -537,9 +614,10 @@ def test_empty_cost_and_report_indexing_preserves_scalar_and_slice_shapes() -> N
     assert empty["flops"] == Cost()
     assert empty["flops", "primal", "matmul"] == Cost()
     assert empty["flops", "primal", "matmul", BF] == 0
-    report = Report()
+    report = Report(axes=("device", "dtype", "measure", "kernel"))
     assert report["h100", BF] == Report()
-    assert report["h100", BF, "intensity"] == 0.0
+    assert report["h100", BF, "intensity"] == Report()
+    assert report["h100", BF, "intensity", "matmul"] == 0.0
 
 
 def test_relabel_adds_cells_that_collide_at_the_destination() -> None:
@@ -876,6 +954,15 @@ def test_utilization_with_a_duration_is_achieved_over_the_roofline_ceiling(
     assert achieved["adjoint", "sort", F32] == pytest.approx(1 / 2 / 3.35e12)
 
 
+@pytest.mark.parametrize("duration_sec", [0.0, -1.0, math.nan, -math.inf])
+def test_utilization_rejects_a_duration_that_is_not_positive(
+    duration_sec: float,
+) -> None:
+    cost = matmul_cost(channels_in=4, channels_out=3, rows=2, dtype=BF)
+    with pytest.raises(ValueError, match="duration_sec"):
+        utilization(cost, device="h100", duration_sec=duration_sec)
+
+
 def test_utilization_treats_missing_bandwidth_as_zero() -> None:
     cost = Cost(
         cells={
@@ -941,7 +1028,8 @@ def test_peak_names_a_form_factor_without_moving_the_bare_name() -> None:
     # The table holds TB/s: 2.039 * 1e12 rounds to 2039000000000.0002, not 2.039e12.
     assert peak()["a100", BF, "bytes", "matmul"] == 2.039 * 1e12
     assert peak()["h100", BF, "bytes", "matmul"] == 3.35e12
-    # The other forms move less memory, and compute is identical across forms.
+    # The other forms move less memory. A100 compute is identical across forms;
+    # the H100 PCIe board clocks lower, so its datasheet rates are lower too.
     assert peak()["a100-40g", BF, "bytes", "matmul"] == 1.555 * 1e12
     assert peak()["a100-80g-pcie", BF, "bytes", "matmul"] == 1.935 * 1e12
     assert peak()["h100-pcie", BF, "bytes", "matmul"] == 2.0e12
@@ -949,14 +1037,9 @@ def test_peak_names_a_form_factor_without_moving_the_bare_name() -> None:
         peak()["a100-40g", BF, "flops", "matmul"]
         == peak()["a100", BF, "flops", "matmul"]
     )
-    assert (
-        peak()["h100-pcie", BF, "flops", "matmul"]
-        == peak()["h100", BF, "flops", "matmul"]
-    )
-    assert (
-        peak()["h100-pcie", BF, "flops", "elementwise"]
-        == peak()["h100", BF, "flops", "elementwise"]
-    )
+    assert peak()["h100-pcie", BF, "flops", "matmul"] == 756.5e12
+    assert peak()["h100", BF, "flops", "matmul"] == 989e12
+    assert peak()["h100-pcie", BF, "flops", "elementwise"] == 51e12
 
 
 def test_peak_ridge_moves_with_the_form_factor() -> None:
@@ -965,10 +1048,10 @@ def test_peak_ridge_moves_with_the_form_factor() -> None:
     sxm = peak()["h100", BF, "intensity", "matmul"]
     pcie = peak()["h100-pcie", BF, "intensity", "matmul"]
     assert sxm == 989 / 3.35
-    assert pcie == 989 / 2.0
+    assert pcie == 756.5 / 2.0
     # Sudoku exp000's transformer sits at intensity 272.
     assert 272 / sxm - 1 == pytest.approx(-0.07866532, abs=1e-6)
-    assert 272 / pcie - 1 < -0.4
+    assert 272 / pcie - 1 < -0.25
     a100_sxm = peak()["a100", BF, "intensity", "matmul"]
     a100_40g = peak()["a100-40g", BF, "intensity", "matmul"]
     assert a100_40g / a100_sxm == pytest.approx(2.039 / 1.555)
@@ -1074,6 +1157,20 @@ def test_a_costed_function_is_a_cost_leaf() -> None:
     assert c["bytes", "primal", "elementwise", BF] == 2 * (3 + 3)
     assert c["bytes", "adjoint", "elementwise", BF] == 2 * (2 * 3 + 3)
     assert c.params == 0
+
+
+def test_set_cost_keeps_no_reference_to_the_function() -> None:
+    """The cost travels on the function; no registry outlives it."""
+
+    @set_cost(map_cost(primal=1, adjoint=1))
+    def act(x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    alive = weakref.ref(act)
+    del act
+    gc.collect()
+
+    assert alive() is None
 
 
 def test_map_cost_forwards_every_operand_count() -> None:
@@ -1261,6 +1358,6 @@ def test_scalar_leaf_formulas_and_composition() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

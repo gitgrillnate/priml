@@ -287,6 +287,11 @@ def test_one_cycle_peaks_where_its_ramp_ends() -> None:
     assert one_cycle(1.0, warmup_fraction=0.3) == pytest.approx(0.0)
 
 
+def test_one_cycle_starts_exactly_at_its_initial_fraction() -> None:
+    # Summing both legs and subtracting 1.0 rounds the start off ``initial``.
+    assert one_cycle(0.0, warmup_fraction=0.1) == 0.04
+
+
 def test_one_cycle_rises_then_falls() -> None:
     values = [one_cycle(index / 100, warmup_fraction=0.3) for index in range(101)]
     peak = values.index(max(values))
@@ -295,6 +300,7 @@ def test_one_cycle_rises_then_falls() -> None:
 
 
 def test_one_cycle_rejects_an_all_ramp_run() -> None:
+    assert one_cycle(0.0, warmup_fraction=0.0) == 1.0
     assert one_cycle(0.5, warmup_fraction=0.0) == pytest.approx(0.5)
     assert one_cycle(0.5, warmup_fraction=0.0, final=0.2) == pytest.approx(0.6)
     with pytest.raises(ValueError, match=r"warmup_fraction must lie in \[0, 1\)"):
@@ -388,7 +394,13 @@ def test_multiply_schedules_carries_a_phased_progress() -> None:
     assert multiply_schedules(ramp, half)(("warmup", 0.4)) == pytest.approx(0.2)
 
 
+@pytest.mark.parametrize("power", [-1.0, float("nan"), float("inf")])
+def test_polynomial_rejects_invalid_power(power: float) -> None:
+    with pytest.raises(ValueError, match="power"):
+        polynomial(1.0, power=power)
+
+
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

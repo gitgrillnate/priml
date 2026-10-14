@@ -23,7 +23,7 @@ import torch.distributed as dist
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from torch._ops import OpOverload
     from torch.distributed.device_mesh import DeviceMesh
@@ -31,12 +31,12 @@ if TYPE_CHECKING:
     from priml.distributed.testing import WarmPoolGetter
     from priml.math.custom_types import TensorFn
 
-from priml.lib.custom_json import DictCodec
+from treekle import from_plain
+
 from priml.model.attention.attention import Attention
 from priml.model.transformer.block import TransformerBlock
-from priml.testing import bfb
+from priml.testing import bfb, regenerate
 from priml.testing.bfb import (
-    _ENV_REGENERATE,
     _EXACT_F32_OPS,
     _FLOAT_FACTORIES,
     _assert_equal,
@@ -112,17 +112,31 @@ class _FixedResult:
 
 
 @pytest.fixture(autouse=True)
-def isolate_regenerate_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Clear ``BFB_REGENERATE`` so a global regen run cannot disable these tests.
+def isolate_regenerate_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ``--regenerate-b4b`` so a global regen run cannot disable these tests.
 
     The drift-detection and round-trip tests mint into ``tmp_path`` and must
-    compare, not regenerate. A suite-wide ``BFB_REGENERATE=1`` (set to remint
+    compare, not regenerate. A suite-wide ``--regenerate-b4b`` (set to remint
     committed goldens) would otherwise force every ``assert_bfb_against_golden``
     to regenerate, so the drift tests see no mismatch and fail "DID NOT RAISE".
     Tests that need regeneration call ``regenerate_golden``, which sets the flag
     locally.
     """
-    monkeypatch.delenv(_ENV_REGENERATE, raising=False)
+    regenerate.override(monkeypatch, b4b=False)
+
+
+@pytest.fixture(autouse=True)
+def deterministic_algorithms_unchanged() -> Iterator[None]:
+    """Fail a test that leaves deterministic algorithms toggled for the next one."""
+    before = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    yield
+    assert (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    ) == before
 
 
 def _build_min_linear() -> nn.Linear:
@@ -553,6 +567,48 @@ def test_write_back_maps_a_listed_result_onto_the_original() -> None:
     assert torch.equal(original, torch.full((2,), 0.5))
 
 
+# Each write goes through a view op the allowlist lacked: ``x[:, :n]`` over a whole
+# dimension issues ``alias``, a rollout of one buffer's every store.
+_VIEW_WRITES: Final[dict[str, Callable[[Tensor], object]]] = {
+    "alias": lambda base: base[:, : base.shape[1]].index_copy_(
+        0,
+        torch.tensor([1]),
+        torch.full((1, base.shape[1]), -2.5),
+    ),
+    "diagonal": lambda base: base.diagonal().copy_(torch.tensor([1.5, -2.5, 3.5])),
+    "unfold": lambda base: base.unfold(1, 2, 2).mul_(-3.0),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_VIEW_WRITES))
+def test_a_write_through_a_view_reaches_its_base(name: str) -> None:
+    """A view runs natively, so writes through it land in the base, not a copy.
+
+    Upcast, ``alias`` returned a narrowed float64 copy: an ``index_copy_`` into
+    a one-buffer rollout's storage wrote that copy and the storage kept zeros.
+    """
+    base = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    expected = base.clone()
+    _VIEW_WRITES[name](expected)
+    with host_agnostic_numerics():
+        _VIEW_WRITES[name](base)
+    assert torch.equal(base, expected)
+
+
+def test_every_view_op_runs_natively_and_aliases_its_input() -> None:
+    """The schema, not the allowlist, names the views: a new one cannot fall through."""
+    base = torch.zeros(3, 4)
+    with host_agnostic_numerics():
+        views = [
+            cast(Tensor, torch.ops.aten.alias(base)),
+            base.diagonal(),
+            base.unfold(1, 2, 2),
+            base[:, :4],
+        ]
+    assert all(view.data_ptr() == base.data_ptr() for view in views)
+    assert all(view.dtype == torch.float32 for view in views)
+
+
 def test_bfb_files_do_not_use_typing_any() -> None:
     paths = [
         _THIS,
@@ -675,7 +731,7 @@ def test_explicit_regeneration_of_an_existing_golden_returns_normally(
     )
     path = tmp_path / "linear_min.pt"
     before = _loaded_golden(path)["state_dict"]
-    monkeypatch.setenv(_ENV_REGENERATE, "1")
+    regenerate.override(monkeypatch, b4b=True)
 
     assert_bfb_against_golden(
         golden_dir=tmp_path,
@@ -886,7 +942,7 @@ def test_expect_golden_mismatch_blocks_bfb_regeneration(
         def forward(self, input: Tensor) -> Tensor:
             return super().forward(input) + 1e-3
 
-    monkeypatch.setenv(_ENV_REGENERATE, "1")
+    regenerate.override(monkeypatch, b4b=True)
     before = (tmp_path / "linear_min.pt").read_bytes()
     assert_bfb_against_golden(
         golden_dir=tmp_path,
@@ -948,7 +1004,7 @@ def test_regenerate_golden_helper_overwrites(tmp_path: Path) -> None:
         build_input=_build_min_input,
         seed=0,
     )
-    assert _ENV_REGENERATE not in os.environ
+    assert not regenerate.b4b()
     assert (tmp_path / "linear_min.pt").exists()
 
 
@@ -1077,9 +1133,9 @@ def test_stale_post_states_reports_then_clears_a_synthetic_golden(
 # annotation.
 def _loaded_golden(path: Path) -> dict[str, dict[str, Tensor]]:
     """Read a golden's two state dicts; a file with none (not a bfb golden) is empty."""
-    raw = DictCodec.coerce(
+    raw = from_plain(
         _torch_load(path, map_location="cpu", weights_only=False),
-        default=None,
+        dict[str, object],
     )
     if "state_dict" not in raw:
         return {}
@@ -2070,9 +2126,9 @@ def test_host_agnostic_numerics_loads_float32_checkpoints(tmp_path: Path) -> Non
     path = tmp_path / "state.pt"
     torch.save({"weight": saved}, path)
     with host_agnostic_numerics():
-        loaded = DictCodec.coerce(
+        loaded = from_plain(
             _torch_load(path, weights_only=True),
-            Tensor,
+            dict[str, Tensor],
         )
     assert torch.equal(loaded["weight"], saved)
 
@@ -2148,6 +2204,29 @@ def test_host_agnostic_numerics_preserves_explicit_output_dtype() -> None:
 
     assert actual.dtype == expected.dtype
     assert torch.equal(actual, expected)
+
+
+# A [2, 1] by [1, 2] product is the smallest one-term contraction x86's matrix
+# kernel stores as the product itself; aarch64 adds it to a zero accumulator.
+def test_host_agnostic_one_term_matmul_keeps_the_sign_of_a_zero_product() -> None:
+    left = torch.tensor([[-1.0], [1.0]])
+    right = torch.tensor([[0.0, -0.0]])
+
+    with host_agnostic_numerics():
+        product = torch.mm(left, right)
+
+    assert torch.signbit(product).tolist() == [[True, False], [False, True]]
+
+
+# A single output column takes x86's vector kernel, which adds to +0.0 too.
+def test_host_agnostic_matmul_by_a_single_column_adds_to_positive_zero() -> None:
+    left = torch.tensor([[-1.0], [1.0]])
+    right = torch.tensor([[0.0]])
+
+    with host_agnostic_numerics():
+        product = torch.mm(left, right)
+
+    assert torch.signbit(product).tolist() == [[False], [False]]
 
 
 def test_host_agnostic_numerics_preserves_mixed_foreach_dtypes() -> None:
@@ -3071,16 +3150,16 @@ def test_input_validation_distinguishes_container_and_scalar_types(
         _assert_same_input(live, stored, label="input")
 
 
-def test_regenerate_golden_preserves_existing_regenerate_env(
+def test_regenerate_golden_preserves_existing_regenerate_flag(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``regenerate_golden`` restores a caller-set ``BFB_REGENERATE``.
+    """``regenerate_golden`` restores a caller-set ``--regenerate-b4b``.
 
     Unconditionally clearing it would silently disable regeneration for later
-    tests in a process launched with ``BFB_REGENERATE=1``.
+    tests in a run launched with ``--regenerate-b4b``.
     """
-    monkeypatch.setenv(_ENV_REGENERATE, "1")
+    regenerate.override(monkeypatch, b4b=True)
     regenerate_golden(
         golden_dir=tmp_path,
         golden_name="clean",
@@ -3088,7 +3167,7 @@ def test_regenerate_golden_preserves_existing_regenerate_env(
         build_input=_build_min_input,
         seed=0,
     )
-    assert os.environ[_ENV_REGENERATE] == "1"
+    assert regenerate.b4b()
 
 
 def test_input_comparison_reports_nested_paths_and_container_lengths() -> None:
@@ -3792,13 +3871,19 @@ def test_replay_golden_moves_saved_input_to_module_device(
     def run(module: nn.Module, value: Tensor) -> Tensor:
         return cast(Tensor, module(value))
 
-    _replay_golden(
-        golden_path=path,
-        build_module=SmallModule,
-        build_input=lambda: torch.arange(6.0).reshape(2, 3),
-        seed=17,
-        run=run,
-    )
+    # `_replay_golden` enables deterministic algorithms; its public callers
+    # restore them, so a direct call must too or later tests inherit it.
+    original = _capture_torch_process_state()
+    try:
+        _replay_golden(
+            golden_path=path,
+            build_module=SmallModule,
+            build_input=lambda: torch.arange(6.0).reshape(2, 3),
+            seed=17,
+            run=run,
+        )
+    finally:
+        _restore_torch_process_state(original)
     assert devices == ["cpu"]
 
 
@@ -4191,10 +4276,6 @@ def test_run_unfused_addbmm_keeps_batched_product_sum_unfused() -> None:
     )
 
 
-def _run_unfused_op(name: str) -> OpOverload[..., object]:
-    return cast("OpOverload[..., object]", getattr(torch.ops.aten, name).default)
-
-
 def test_non_aten_run_forwards_keyword_arguments() -> None:
     with torch.library._scoped_library("bfb_run_unfused_probe", "FRAGMENT") as library:
         library.define("scale(Tensor value, float factor) -> Tensor")
@@ -4246,7 +4327,7 @@ def test_run_unfused_affine_dispatch_accepts_keyword_operands(
         operands["mat2"] = right
     if name == "_addmm_activation":
         operands["use_gelu"] = True
-    op = _run_unfused_op(name)
+    op = cast("OpOverload[..., object]", getattr(torch.ops.aten, name).default)
     if name == "addbmm":
         result = _run_unfused(op, (), operands)
         assert isinstance(result, Tensor)
@@ -4289,10 +4370,10 @@ def test_inplace_affine_alias_uses_functional_decomposition(
         bias = torch.zeros(2, dtype=torch.float64)
         right = torch.ones(4, dtype=torch.float64)
     sentinel = torch.full_like(bias, 23.0)
-    functional = _run_unfused_op(name)
+    functional = cast("OpOverload[..., object]", getattr(torch.ops.aten, name).default)
     monkeypatch.setitem(decomposition_table, functional, _FixedResult(result=sentinel))
     result = _run_unfused(
-        _run_unfused_op(name + "_"),
+        cast("OpOverload[..., object]", getattr(torch.ops.aten, (name + "_")).default),
         (bias, left, right),
         {"alpha": 0.5, "beta": 1.0},
     )
@@ -4386,12 +4467,16 @@ def test_run_unfused_routes_convolution_bias_forms(
             cudnn_enabled=False,
             allow_tf32=False,
         )
-    actual = _run_unfused(_run_unfused_op(name), arguments, options)
+    actual = _run_unfused(
+        cast("OpOverload[..., object]", getattr(torch.ops.aten, name).default),
+        arguments,
+        options,
+    )
     assert actual is result
     assert seen == [bias]
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

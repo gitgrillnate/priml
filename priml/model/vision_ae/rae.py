@@ -42,7 +42,16 @@ References:
 from __future__ import annotations
 
 from dataclasses import field
-from typing import TYPE_CHECKING, Protocol, Self, cast, override, runtime_checkable
+from types import MappingProxyType
+from typing import (
+    TYPE_CHECKING,
+    Final,
+    Protocol,
+    Self,
+    cast,
+    override,
+    runtime_checkable,
+)
 
 import math
 
@@ -68,6 +77,7 @@ from priml.math.position_embedding import sincos_position_table
 from priml.model.attention.kernel import attention_kernel_cost
 from priml.model.conv import conv_cost
 from priml.model.custom_types import ChannelsIn, propagate_attr
+from priml.model.legacy_keys import absorb_legacy_keys
 from priml.model.norm import LayerNorm
 from priml.model.vision_ae.checkpoint import HubFile
 from priml.model.vision_ae.custom_types import (
@@ -82,13 +92,35 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from safetensors.torch import load_file
-
-    import transformers
+    from transformers.models.dinov2_with_registers import (
+        configuration_dinov2_with_registers,
+        modeling_dinov2_with_registers,
+    )
 else:
     from wrapt import lazy_import
 
     load_file = lazy_import("safetensors.torch", "load_file")
-    transformers = lazy_import("transformers")
+    configuration_dinov2_with_registers = lazy_import(
+        "transformers.models.dinov2_with_registers.configuration_dinov2_with_registers",
+    )
+    modeling_dinov2_with_registers = lazy_import(
+        "transformers.models.dinov2_with_registers.modeling_dinov2_with_registers",
+    )
+
+
+_PUBLISHED_ATTENTION_NAMES: Final = MappingProxyType(
+    {
+        "attention.query": "q_proj",
+        "attention.key": "k_proj",
+        "attention.value": "v_proj",
+        "output.dense": "o_proj",
+    },
+)
+"""The published checkpoint's attention names, then transformers 5.19's.
+
+The tensors are unchanged; only the names moved, so a checkpoint or golden saved
+under either loads.
+"""
 
 
 @runtime_checkable
@@ -326,7 +358,7 @@ class Dinov2WithRegisters(nn.Module):
 
     def __init__(self, config: Config) -> None:
         super().__init__()
-        hf_config = transformers.Dinov2WithRegistersConfig(
+        hf_config = configuration_dinov2_with_registers.Dinov2WithRegistersConfig(
             hidden_size=config.channels_hidden,
             num_hidden_layers=config.num_layers,
             num_attention_heads=config.heads,
@@ -353,16 +385,21 @@ class Dinov2WithRegisters(nn.Module):
             # latent values by at most 3 float32 ULP.
             attn_implementation="eager",
         )
-        self.encoder: transformers.Dinov2WithRegistersModel = (
-            transformers.Dinov2WithRegistersModel(hf_config)
+        self.encoder: modeling_dinov2_with_registers.Dinov2WithRegistersModel = (
+            modeling_dinov2_with_registers.Dinov2WithRegistersModel(
+                hf_config,
+            )
         )
-        mlp_class = transformers.models.dinov2_with_registers.modeling_dinov2_with_registers.Dinov2WithRegistersMLP
-        for mlp in self.encoder.modules():
-            if isinstance(mlp, mlp_class):
+        mlp_class = modeling_dinov2_with_registers.Dinov2WithRegistersMLP
+        attention_class = modeling_dinov2_with_registers.Dinov2WithRegistersAttention
+        for module in self.encoder.modules():
+            if isinstance(module, mlp_class):
                 # HF registered its ``GELUActivation`` as a child module; a plain
                 # function cannot overwrite a child, so the child goes first.
-                del mlp.activation
-                mlp.activation = config.activation
+                del module.activation_fn
+                module.activation_fn = config.activation
+            elif isinstance(module, attention_class):
+                absorb_legacy_keys(module, renames=_PUBLISHED_ATTENTION_NAMES)
         if config.checkpoint is not None:
             state = load_file(str(config.checkpoint.make().path()))
             self.encoder.load_state_dict(state)

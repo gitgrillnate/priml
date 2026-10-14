@@ -246,6 +246,8 @@ def test_train_and_eval_losses_report_every_term_without_updating() -> None:
     )
 
 
+# Marked: an end-to-end freeze of three updates; three blocks are the fewest that
+# reach the dense encoder, the routed middle and the dense decoder.
 @pytest.mark.compute_training
 def test_exp_smoke_three_steps_bfb() -> None:
     """Freeze initialization, three forward/backward passes, and weight updates."""
@@ -311,7 +313,9 @@ class _SmokeSteps(nn.Module):
 
 def _smoke_input() -> dict[str, Tensor]:
     return {
+        # SpeedrunDiT.forward enforces cfg.in_channels and cfg.input_size.
         "image": torch.zeros(5, 3, 4, 4, dtype=torch.uint8),
+        # SpeedrunDiT.forward enforces cfg.in_channels and cfg.input_size.
         "latent": torch.arange(5 * 2 * 4 * 4, dtype=torch.float32)
         .reshape(5, 2, 4, 4)
         .remainder(97)
@@ -321,6 +325,6 @@ def _smoke_input() -> dict[str, Tensor]:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

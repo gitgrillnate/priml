@@ -13,6 +13,7 @@ reference itself; these run without a corpus or a network.
 from __future__ import annotations
 
 from collections.abc import Sized
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
 from unittest.mock import patch
@@ -31,6 +32,7 @@ import re
 import threading
 
 from pyarrow import parquet
+from treekle import ReadError, from_plain, json_loads
 
 import numpy as np
 import pyarrow as pa
@@ -45,7 +47,6 @@ from priml.baselines.nanochat.data import (
     Tokenizer,
     token_bytes_fingerprint,
 )
-from priml.lib.custom_json import DictCodec, ListCodec, loads
 from priml.metrics.bits_per_byte import BitsPerByte
 
 
@@ -175,11 +176,6 @@ def _data(corpus: Path, **overrides: object) -> NanoChatData:
     for name, value in overrides.items():
         setattr(config, name, value)
     return config.make()
-
-
-def _object_dict(value: object) -> dict[str, object]:
-    """Narrow a JSON object to a mutable string-keyed dictionary."""
-    return DictCodec.coerce(value, default=None)
 
 
 class _NumpyLoadSpy:
@@ -564,8 +560,31 @@ def test_loading_online_data_logs_the_shard_and_vocabulary(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.INFO, logger=data.__name__):
-        _data(corpus, train_shard_indices=(0,))
+        _data(corpus, train_shard_indices=(0,), num_train_shards=3)
     assert caplog.messages == [f"nanochat: 1 train shards, val shard 1, vocab {VOCAB}"]
+
+
+def test_every_dataset_path_resolves_beneath_base_dir() -> None:
+    """A path a sibling rebases and this one does not escapes the resource root."""
+    config = NanoChatData.Config()
+    config.base_dir = "/root"
+    config.tokenizer_dir = "/datasets/vocab"
+    config.reference_evaluation = ReferenceEvaluation.Config()
+    final = config.copy_tree().finalize()
+    assert final.tokenizer_dir == Path("/root/datasets/vocab")
+    assert final.working_dir == Path("/root/datasets/nanochat")
+    assert final.reference_evaluation is not None
+    assert final.reference_evaluation.path == Path(
+        "/root/datasets/nanochat/reference-eval/unigram.npz",
+    )
+
+
+def test_loading_restores_the_epoch_timer(corpus: Path) -> None:
+    dataset = _data(corpus)
+    dataset.load_state_dict(
+        {"batches": 0, "timer_epoch": {"global_count": 3, "global_sec": 1.5}},
+    )
+    assert dataset.timer_epoch.state_dict() == {"global_count": 3, "global_sec": 1.5}
 
 
 def test_a_byte_table_that_does_not_match_its_fingerprint_is_rejected(
@@ -815,9 +834,7 @@ def _refingerprint(directory: Path, table: np.ndarray) -> None:
     """Rewrite the recipe so the fingerprint matches a replaced table."""
     np.save(directory / "token_bytes.npy", table)
     recipe_path = directory / "tokenizer_recipe.json"
-    recipe = _object_dict(
-        DictCodec.coerce(loads(recipe_path.read_text()), default=None),
-    )
+    recipe = json_loads(recipe_path.read_text(), dict[str, object])
     recipe["token_bytes_sha256"] = token_bytes_fingerprint(table)
     recipe_path.write_text(json.dumps(recipe))
 
@@ -1005,8 +1022,8 @@ def test_prepared_evaluation_replays_packed_rows_and_primary_byte_rule(
         seen: list[list[int]] = []
         for batch in data.eval_dataloader():
             seen.extend(
-                ListCodec.coerce(row, int)
-                for row in ListCodec.coerce(batch["label"].tolist())
+                from_plain(row, list[int])
+                for row in from_plain(batch["label"].tolist(), list[object])
             )
             metric.update(torch.ones_like(batch["label"], dtype=torch.float32), **batch)
         assert seen == [[2, 0, 4, 1], [1, 2, 3, 0]]
@@ -1039,7 +1056,7 @@ def test_prepared_metadata_ignores_obsolete_checksums(
     prepared_config: NanoChatData.Config,
 ) -> None:
     path = Path(prepared_config.prepared_eval_manifest)
-    metadata = _object_dict(DictCodec.coerce(loads(path.read_text()), default=None))
+    metadata = json_loads(path.read_text(), dict[str, object])
     metadata["eval_x_sha256"] = "obsolete"
     metadata["eval_y_sha256"] = "obsolete"
     metadata["loaded_modules_and_assets"] = {
@@ -1066,13 +1083,9 @@ def test_prepared_manifest_batches_match_nonunit_eval_batch_geometry(
 ) -> None:
     train_path = Path(prepared_config.prepared_train_manifest)
     evaluation_path = Path(prepared_config.prepared_eval_manifest)
-    train_manifest = _object_dict(
-        DictCodec.coerce(loads(train_path.read_text()), default=None),
-    )
-    evaluation_manifest = _object_dict(
-        DictCodec.coerce(loads(evaluation_path.read_text()), default=None),
-    )
-    train = _object_dict(train_manifest["train"])
+    train_manifest = json_loads(train_path.read_text(), dict[str, object])
+    evaluation_manifest = json_loads(evaluation_path.read_text(), dict[str, object])
+    train = from_plain(train_manifest["train"], dict[str, object])
     train["seq_len"] = 2
     train_manifest["train"] = train
     evaluation_manifest["max_seq_len"] = 2
@@ -1097,11 +1110,11 @@ def test_prepared_manifest_batches_match_nonunit_eval_batch_geometry(
     literal = _load_array(eval_directory / "token_bytes_literal.npy").astype(
         np.int64,
     )
-    byte_tables = _object_dict(evaluation_manifest["byte_tables"])
-    primary_table = _object_dict(byte_tables["primary"])
+    byte_tables = from_plain(evaluation_manifest["byte_tables"], dict[str, object])
+    primary_table = from_plain(byte_tables["primary"], dict[str, object])
     primary_table["total_on_eval_y"] = int(primary[targets].sum(dtype=np.int64))
     byte_tables["primary"] = primary_table
-    literal_table = _object_dict(byte_tables["literal"])
+    literal_table = from_plain(byte_tables["literal"], dict[str, object])
     literal_table["total_on_eval_y"] = int(literal[targets].sum(dtype=np.int64))
     byte_tables["literal"] = literal_table
     byte_tables["scored_positions"] = int(np.count_nonzero(primary[targets]))
@@ -1119,7 +1132,7 @@ def test_prepared_batch_count_must_match_evaluation_rows(
     prepared_config: NanoChatData.Config,
 ) -> None:
     path = Path(prepared_config.prepared_eval_manifest)
-    manifest = _object_dict(DictCodec.coerce(loads(path.read_text()), default=None))
+    manifest = json_loads(path.read_text(), dict[str, object])
     manifest["batches"] = 1
     path.write_text(json.dumps(manifest))
     with pytest.raises(
@@ -1133,10 +1146,8 @@ def test_prepared_training_rows_must_contain_whole_batches(
     prepared_config: NanoChatData.Config,
 ) -> None:
     train_manifest_path = Path(prepared_config.prepared_train_manifest)
-    manifest = _object_dict(
-        DictCodec.coerce(loads(train_manifest_path.read_text()), default=None),
-    )
-    train = _object_dict(manifest["train"])
+    manifest = json_loads(train_manifest_path.read_text(), dict[str, object])
+    train = from_plain(manifest["train"], dict[str, object])
     train["batch_size"] = 2
     train["total_rows"] = 3
     manifest["train"] = train
@@ -1484,9 +1495,9 @@ def test_token_byte_fingerprint_uses_canonical_int64_bytes() -> None:
 
 
 def test_manifest_coercers_reject_missing_required_values() -> None:
-    with pytest.raises(TypeError, match="cannot coerce None to int"):
+    with pytest.raises(ReadError):
         data._integer(None)
-    with pytest.raises(TypeError, match="cannot coerce None to dict"):
+    with pytest.raises(ReadError):
         data._mapping(None)
 
 
@@ -1744,29 +1755,14 @@ def test_prefetched_stream_preserves_batches_and_worker_contract(
     assert batches[1][0].tolist() == (pair[0] + 10).tolist()
     assert stream.served == 2
     queue_spy.assert_called_once_with(maxsize=1)
-    assert thread_spy.call_args.kwargs == {
-        "target": thread_spy.call_args.kwargs["target"],
-        "name": "nanochat-packer",
-        "daemon": True,
-    }
+    assert thread_spy.call_args.kwargs["name"] == "nanochat-packer"
+    assert thread_spy.call_args.kwargs["daemon"] is True
 
 
 def test_prefetch_synchronizes_pinned_slot_before_reuse(
     monkeypatch: pytest.MonkeyPatch,
+    event_log: list[list[str]],
 ) -> None:
-    events: list[list[str]] = []
-
-    class EventSpy:
-        def __init__(self) -> None:
-            self.calls: list[str] = []
-            events.append(self.calls)
-
-        def synchronize(self) -> None:
-            self.calls.append("synchronize")
-
-        def record(self) -> None:
-            self.calls.append("record")
-
     original_empty = torch.empty
 
     def empty(
@@ -1788,7 +1784,6 @@ def test_prefetch_synchronizes_pinned_slot_before_reuse(
         property(pins_host_memory),
     )
     monkeypatch.setattr(torch, "empty", empty)
-    monkeypatch.setattr(torch.cuda, "Event", EventSpy)
     stream = data.PackedTokenStream(
         paths=[],
         tokenizer=None,
@@ -1804,12 +1799,13 @@ def test_prefetch_synchronizes_pinned_slot_before_reuse(
     _patch_row_pairs(monkeypatch, [pair] * 3)
 
     assert len(list(stream)) == 3
-    assert events == [
+    assert event_log == [
         ["synchronize", "record", "synchronize", "record"],
         ["synchronize", "record"],
     ]
 
 
+@pytest.mark.usefixtures("event_log")
 def test_serial_cuda_copy_uses_the_nonblocking_pinned_transfer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1867,9 +1863,106 @@ def test_serial_cuda_copy_uses_the_nonblocking_pinned_transfer(
     assert copy_modes == [False, False, True]
 
 
-def test_prefetched_copy_marks_nonblocking_transfer(
+class _EventSpy:
+    """Record the fence calls a staging slot makes, in order."""
+
+    def __init__(self, log: list[list[str]]) -> None:
+        self.calls: list[str] = []
+        log.append(self.calls)
+
+    def synchronize(self) -> None:
+        self.calls.append("synchronize")
+
+    def record(self) -> None:
+        self.calls.append("record")
+
+
+@pytest.fixture
+def event_log(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Replace ``torch.cuda.Event`` with spies that record into a fresh log."""
+    log: list[list[str]] = []
+    monkeypatch.setattr(torch.cuda, "Event", partial(_EventSpy, log))
+    return log
+
+
+def test_serial_pinned_stream_fences_the_slot_before_refilling_it(
+    monkeypatch: pytest.MonkeyPatch,
+    event_log: list[list[str]],
+) -> None:
+    """Eval takes the serial path, so it must wait on its copy like prefetch does."""
+    original_empty = torch.empty
+
+    def empty(
+        *size: int,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+        pin_memory: bool | None = None,
+    ) -> torch.Tensor:
+        del pin_memory
+        return original_empty(size, dtype=dtype, device=device)
+
+    def pins_host_memory(stream: data.PackedTokenStream) -> bool:
+        del stream
+        return True
+
+    monkeypatch.setattr(
+        data.PackedTokenStream,
+        "_pins_host_memory",
+        property(pins_host_memory),
+    )
+    monkeypatch.setattr(torch, "empty", empty)
+    stream = data.PackedTokenStream(
+        paths=[],
+        tokenizer=None,
+        token_bytes=torch.arange(7),
+        batch_size=2,
+        max_seq_len=3,
+        buffer_size=4,
+        device=torch.device("meta"),
+        max_batches=3,
+    )
+    pair = (torch.ones((2, 3)), torch.zeros((2, 3)))
+    _patch_row_pairs(monkeypatch, [pair] * 3)
+
+    assert len(list(stream._packed())) == 3
+    assert event_log == [["synchronize", "record"] * 3]
+
+
+@pytest.mark.gpu_torch_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_cuda_serial_stream_does_not_refill_a_slot_under_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A delayed copy must still read the batch it was issued for."""
+    stream = data.PackedTokenStream(
+        paths=[],
+        tokenizer=None,
+        token_bytes=torch.arange(7),
+        batch_size=2,
+        max_seq_len=3,
+        buffer_size=4,
+        device=torch.device("cuda"),
+        max_batches=2,
+    )
+    first = torch.arange(6).reshape(2, 3)
+    _patch_row_pairs(
+        monkeypatch,
+        [(first, first + 6), (first + 100, first + 106)],
+    )
+    batches = iter(stream._packed())
+    # Holds the device queue so the first copy runs only after the host has
+    # moved on to stage the second batch.
+    torch.cuda._sleep(1 << 30)
+    media = next(batches)["media"].clone()
+    next(batches)
+    torch.cuda.synchronize()
+    assert media.cpu().tolist() == first.tolist()
+
+
+def test_unpinned_prefetched_copy_is_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a pinned slot is fenced, so only a pinned slot may copy asynchronously."""
     stream = data.PackedTokenStream(
         paths=[],
         tokenizer=None,
@@ -1905,7 +1998,7 @@ def test_prefetched_copy_marks_nonblocking_transfer(
     batches = list(stream._prefetched())
 
     assert len(batches) == 1
-    assert copy_kwargs[-1] == {"non_blocking": True}
+    assert copy_kwargs[-1] == {"non_blocking": False}
     assert batches[0]["media"].device.type == "meta"
 
 
@@ -2073,7 +2166,7 @@ def test_tokenizer_rejects_a_null_bos_token(corpus: Path) -> None:
             },
         ),
     )
-    with pytest.raises(TypeError, match="cannot coerce None to str"):
+    with pytest.raises(ReadError):
         Tokenizer.from_directory(corpus / "tokenizer")
 
 
@@ -2434,6 +2527,20 @@ def test_prepared_evaluation_rejects_out_of_vocabulary_tokens(
         prepared_config.make()
 
 
+def test_prepared_training_rejects_out_of_vocabulary_tokens(
+    prepared_config: NanoChatData.Config,
+) -> None:
+    path = Path(prepared_config.prepared_train_manifest).parent / "train_rows.npy"
+    values = _load_array(path)
+    values[1, 2] = 5
+    np.save(path, values)
+    with pytest.raises(
+        ValueError,
+        match=r"^Prepared training contains an out-of-vocabulary token\.$",
+    ):
+        prepared_config.make()
+
+
 @pytest.mark.parametrize(
     "corruption",
     ["mask_mismatch", "special_nonzero", "ordinary_zero", "literal_negative"],
@@ -2444,9 +2551,7 @@ def test_prepared_byte_table_invariants_are_checked_independently(
 ) -> None:
     directory = Path(prepared_config.prepared_eval_manifest).parent
     manifest_path = Path(prepared_config.prepared_eval_manifest)
-    manifest = _object_dict(
-        DictCodec.coerce(loads(manifest_path.read_text()), default=None),
-    )
+    manifest = json_loads(manifest_path.read_text(), dict[str, object])
     primary_path = directory / "token_bytes_primary.npy"
     literal_path = directory / "token_bytes_literal.npy"
     primary = _load_array(primary_path)
@@ -2462,11 +2567,11 @@ def test_prepared_byte_table_invariants_are_checked_independently(
     np.save(primary_path, primary)
     np.save(literal_path, literal)
     targets = _load_array(directory / "eval_y.npy")
-    byte_tables = _object_dict(manifest["byte_tables"])
-    primary_table = _object_dict(byte_tables["primary"])
+    byte_tables = from_plain(manifest["byte_tables"], dict[str, object])
+    primary_table = from_plain(byte_tables["primary"], dict[str, object])
     primary_table["total_on_eval_y"] = int(primary[targets].sum(dtype=np.int64))
     byte_tables["primary"] = primary_table
-    literal_table = _object_dict(byte_tables["literal"])
+    literal_table = from_plain(byte_tables["literal"], dict[str, object])
     literal_table["total_on_eval_y"] = int(literal[targets].sum(dtype=np.int64))
     byte_tables["literal"] = literal_table
     byte_tables["scored_positions"] = int(np.count_nonzero(primary[targets]))
@@ -2518,12 +2623,12 @@ def test_prepared_scoring_totals_are_recomputed_from_evaluation_targets(
         Path(prepared_config.prepared_eval_manifest).parent
         / "packed-eval-manifest.json"
     )
-    manifest = _object_dict(DictCodec.coerce(loads(path.read_text()), default=None))
-    byte_tables = _object_dict(manifest["byte_tables"])
+    manifest = json_loads(path.read_text(), dict[str, object])
+    byte_tables = from_plain(manifest["byte_tables"], dict[str, object])
     if field == "scored_positions":
         byte_tables[field] = value
     else:
-        table = _object_dict(byte_tables[field])
+        table = from_plain(byte_tables[field], dict[str, object])
         table["total_on_eval_y"] = value
         byte_tables[field] = table
     manifest["byte_tables"] = byte_tables
@@ -2557,7 +2662,7 @@ def test_prepared_evaluation_manifest_must_match_its_packing(
         Path(prepared_config.prepared_eval_manifest).parent
         / "packed-eval-manifest.json"
     )
-    manifest = _object_dict(DictCodec.coerce(loads(path.read_text()), default=None))
+    manifest = json_loads(path.read_text(), dict[str, object])
     manifest[field] = value
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="geometry"):
@@ -2591,6 +2696,6 @@ def test_cpu_serial_stream_skips_redundant_device_copy(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

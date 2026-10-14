@@ -19,9 +19,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Final, cast
 
-import json
-
 from numpy.typing import NDArray
+from treekle import json_loads
 
 import numpy as np
 import pytest
@@ -44,7 +43,12 @@ from priml.baselines.convextok.presolver.presolve import (
     presolve,
 )
 from priml.baselines.convextok.program import LinearProgram, build_program
-from priml.lib.custom_json import DictCodec, IntCodec, ListCodec
+from priml.baselines.convextok.testing import (
+    TESTDATA,
+    Candidates,
+    Corpus,
+    Pretokens,
+)
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -93,21 +97,25 @@ def two_numba_threads() -> Iterator[None]:
     torch.set_num_threads(torch_threads)
 
 
-# Compiled: the first presolve in a process JIT-compiles every kernel it reaches,
-# about 45 s on x86 with a cold Numba cache, so this is one test, not one per program.
+# Compiled, so marked: the first case in a process JIT-compiles every kernel it
+# reaches, about 45 s on x86 with a cold Numba cache. Later cases, and every case
+# under a warm cache, take milliseconds. The fuzz programs with the fixture execute
+# every reachable kernel line, so together these cases compile every kernel the
+# presolve can call.
 @pytest.mark.compute_large_fixture
 @pytest.mark.parametrize("kernels", ["compiled"], indirect=True)
 @pytest.mark.usefixtures("two_numba_threads")
-def test_compiled_kernels_match_pslp_on_every_program() -> None:
-    """Every kernel compiles, and the compiled presolve still matches PSLP.
-
-    The fuzz programs with the fixture execute every reachable kernel line, so
-    together they compile every kernel the presolve can call.
-    """
+def test_compiled_kernels_match_pslp_on_fixture() -> None:
     with _npz(_TESTDATA / "presolve.npz") as golden:
         _assert_reduced_like(presolve(fixture_program(), _CPU), golden)
-    for path in _FUZZ:
-        _assert_matches_pslp(path)
+
+
+@pytest.mark.compute_large_fixture
+@pytest.mark.parametrize("kernels", ["compiled"], indirect=True)
+@pytest.mark.parametrize("path", [pytest.param(path, id=path.stem) for path in _FUZZ])
+@pytest.mark.usefixtures("two_numba_threads")
+def test_compiled_kernels_match_pslp_on_fuzz_program(path: Path) -> None:
+    _assert_matches_pslp(path)
 
 
 @pytest.mark.compute_large_fixture
@@ -115,19 +123,31 @@ def test_compiled_kernels_match_pslp_on_every_program() -> None:
 @pytest.mark.usefixtures("two_numba_threads")
 def test_index_dtypes_share_one_kernel_specialization() -> None:
     # A second specialization of a cached kernel can segfault a later process.
+    # ``new_state`` fixes every kernel argument's dtype, so building the state
+    # compiles only what the assertion reads, not the whole presolve.
     program = fixture_program()
-    wide = replace(
-        program,
-        crow_indices=program.crow_indices.long(),
-        col_indices=program.col_indices.long(),
-    )
-    narrow_result, wide_result = presolve(program, _CPU), presolve(wide, _CPU)
-    assert torch.equal(narrow_result.program.values, wide_result.program.values)
+    new_state(program, _CPU)
+    new_state(_wide_indices(program), _CPU)
     # ``new_core`` is the Python entry that registers the struct proxies first;
     # the compiled kernel behind it is ``_new_core``.
     kernel = core._new_core
     assert isinstance(kernel, Dispatcher)
     assert len(kernel.signatures) == 1
+
+
+def test_index_dtypes_reduce_to_the_same_program() -> None:
+    # A 121-entry fuzz program that presolve cuts to 51: the fixture's 2,553
+    # entries cost 0.12 s for the two presolves on x86.
+    with _npz(_TESTDATA / "presolve_fuzz" / "general_00801.npz") as golden:
+        wide = _input_program(golden)
+    narrow = replace(
+        wide,
+        crow_indices=wide.crow_indices.int(),
+        col_indices=wide.col_indices.int(),
+    )
+    narrow_result = presolve(narrow, _CPU)
+    wide_result = presolve(wide, _CPU)
+    assert torch.equal(narrow_result.program.values, wide_result.program.values)
 
 
 def test_snapshot_names_the_reduced_program() -> None:
@@ -383,21 +403,13 @@ def test_program_beyond_int32_positions_raises() -> None:
 
 def fixture_program() -> LinearProgram:
     """Build the eight-document fixture's program from upstream's pretokens."""
-    pretokens = _read_json("pretokens.json")
+    pretokens = json_loads((TESTDATA / "pretokens.json").read_text(), Pretokens)
     return build_program(
         dict(
-            zip(
-                ListCodec.coerce(pretokens.get("pretokens"), str, default=None),
-                ListCodec.coerce(pretokens.get("frequencies"), int, default=None),
-                strict=True,
-            ),
+            zip(pretokens["pretokens"], pretokens["frequencies"], strict=True),
         ),
-        ListCodec.coerce(
-            _read_json("candidates.json").get("tokens"),
-            str,
-            default=None,
-        ),
-        budget=IntCodec.coerce(_read_json("corpus.json").get("budget"), default=None),
+        json_loads((TESTDATA / "candidates.json").read_text(), Candidates)["tokens"],
+        budget=json_loads((TESTDATA / "corpus.json").read_text(), Corpus)["budget"],
     ).program
 
 
@@ -452,15 +464,19 @@ def _input_program(golden: np.lib.npyio.NpzFile) -> LinearProgram:
     )
 
 
+def _wide_indices(program: LinearProgram) -> LinearProgram:
+    """Return ``program`` with 64-bit row and column indices."""
+    return replace(
+        program,
+        crow_indices=program.crow_indices.long(),
+        col_indices=program.col_indices.long(),
+    )
+
+
 def _npz(path: Path) -> np.lib.npyio.NpzFile:
     loaded = cast(object, np.load(path))
     assert isinstance(loaded, np.lib.npyio.NpzFile)
     return loaded
-
-
-def _read_json(name: str) -> dict[str, object]:
-    raw = cast(object, json.loads((_TESTDATA / name).read_text()))
-    return dict(DictCodec.coerce(raw, default=None))
 
 
 def _stub_trivial_core(
@@ -496,6 +512,6 @@ def _stub_trivial_core(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

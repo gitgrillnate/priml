@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
+import pytest
 import torch
 
 from priml.math.diffusion.euler_maruyama import (
@@ -14,10 +13,6 @@ from priml.math.diffusion.euler_maruyama import (
     velocity_to_drift,
     velocity_to_score,
 )
-
-
-if TYPE_CHECKING:
-    import pytest
 
 
 def test_scalar_drift_helpers() -> None:
@@ -202,7 +197,24 @@ def test_integration_uses_two_stream_noise_then_a_deterministic_final_step(
     assert times == [1.0, 0.5]
 
 
+@pytest.mark.parametrize("num_steps", [0, -1])
+def test_grid_requires_an_integration_step(num_steps: int) -> None:
+    with pytest.raises(ValueError, match="num_steps"):
+        euler_maruyama_grid(num_steps)
+
+
+@pytest.mark.parametrize("length", [0, 1])
+def test_integration_rejects_short_grid(length: int) -> None:
+    with pytest.raises(ValueError, match="grid"):
+        integrate_two_streams(
+            torch.zeros(2, 3),
+            torch.zeros(2, 4),
+            torch.zeros(length),
+            lambda media, cls, _time: (media, cls),
+        )
+
+
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

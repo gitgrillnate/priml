@@ -199,6 +199,6 @@ def test_quantize_and_dequantize_apply_one_table_per_row() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

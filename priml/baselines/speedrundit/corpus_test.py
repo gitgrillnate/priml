@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 
 import json
 
+from treekle import from_plain, json_loads
+
 import pytest
 import torch
 
@@ -26,7 +28,6 @@ from priml.baselines.speedrundit.latent_codec import (
     FloatCodec,
     ScalarTableCodec,
 )
-from priml.lib.custom_json import DictCodec, loads
 from priml.model.vision_ae.custom_types import posterior_mode
 from priml.model.vision_ae.invae import INVAE
 from priml.model.vision_ae.latent_norm import ScaleLatents
@@ -74,7 +75,7 @@ def test_non_finite_latents_are_refused_before_publication(
 def test_identity_collects_only_encoding_checkpoints() -> None:
     """Raw encoding depends on the encoder, not on decoding or normalization."""
     identity = autoencoder_identity(rae_dinov2_base())
-    encoding = DictCodec.coerce(identity["encoding"], default=None)
+    encoding = from_plain(identity["encoding"], dict[str, object])
     assert "decoder" not in encoding
     assert "latent_norm" not in encoding
     assert "model.safetensors" in json.dumps(encoding)
@@ -191,7 +192,7 @@ def test_a_receipt_of_another_format_is_refused(tmp_path: Path) -> None:
         table_sha256=None,
         details={},
     )
-    receipt = DictCodec.coerce(loads(path.read_text()), default=None)
+    receipt = json_loads(path.read_text(), dict[str, object])
     _ = path.write_text(json.dumps({**receipt, "format": 1}))
     with pytest.raises(CorpusMismatchError, match="format 1"):
         verify_receipt(
@@ -228,6 +229,6 @@ def test_a_fitted_codec_without_its_table_is_refused(tmp_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

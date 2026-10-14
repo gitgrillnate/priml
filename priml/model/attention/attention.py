@@ -15,7 +15,7 @@ from priml.cost import (
     Cost,
     cost,
     matmul_cost,
-    resolve_dtype,
+    nbytes,
 )
 from priml.model.attention.kernel import SdpaFused
 from priml.model.attention.kvcache import KVCache
@@ -26,6 +26,7 @@ from priml.model.custom_types import (
     ChannelsIn,
     DepthIndex,
     HasResetParameters,
+    LayerCache,
     RotaryConfig,
     TensorModule,
     infer_same_width,
@@ -133,6 +134,7 @@ class AttentionProjections(nn.Module):
             batch_size: int,
             dtype: torch.dtype | None,
             memory_len: int = -1,
+            context_len: int = 0,
             **kwargs: object,
         ) -> Cost:
             """Cost the projections, norms, and rotary; no kernel here.
@@ -144,12 +146,15 @@ class AttentionProjections(nn.Module):
               memory_len: Memory positions per sequence the keys and values
                 are projected from; -1 projects them from the sequence itself.
                 Projections from a memory are not rotated.
+              context_len: Tokens already cached. Only the ``seq_len`` new
+                tokens are projected, so it changes nothing here.
               **kwargs: The open bus, forwarded to every child.
 
             Returns:
               cost: Whole-invocation cost over ``seq_len`` and ``batch_size``.
 
             """
+            del context_len
             rows = seq_len * batch_size
             dt = dtype
             inner = self.num_heads * self.channels_head
@@ -250,13 +255,9 @@ class AttentionProjections(nn.Module):
             channels_in=config.channels_in,
             num_heads=config.num_heads,
             channels_head=config.channels_head,
+            num_heads_kv=config.num_heads_kv,
         )
         super().__init__()
-        if config.num_heads % config.num_heads_kv != 0:
-            raise ValueError(
-                f"num_heads={config.num_heads} must be divisible by "
-                f"num_heads_kv={config.num_heads_kv}.",
-            )
         self.num_heads = config.num_heads
         self.channels_head = config.channels_head
         self.num_heads_kv = config.num_heads_kv
@@ -361,6 +362,7 @@ def _validate_head_dims(
     channels_in: int,
     num_heads: int,
     channels_head: int,
+    num_heads_kv: int,
 ) -> None:
     """Reject geometry that stayed unresolved after finalize."""
     if channels_head == -1 and channels_in != -1:
@@ -377,6 +379,12 @@ def _validate_head_dims(
         raise ValueError(
             f"Need at least two of channels_in={channels_in}, "
             f"num_heads={num_heads}, channels_head={channels_head}.",
+        )
+    # Zero key/value heads builds empty projections without complaint, so it is
+    # checked here; the modulo would otherwise divide by it.
+    if num_heads_kv == 0 or num_heads % num_heads_kv:
+        raise ValueError(
+            f"num_heads={num_heads} must be divisible by num_heads_kv={num_heads_kv}.",
         )
 
 
@@ -432,6 +440,7 @@ class Attention(AttentionProjections):
             batch_size: int,
             dtype: torch.dtype | None,
             memory_len: int = -1,
+            context_len: int = 0,
             **kwargs: object,
         ) -> Cost:
             """Add the kernel's products and, for self-attention, the per-token KV cache.
@@ -447,22 +456,25 @@ class Attention(AttentionProjections):
               memory_len: Memory positions per sequence the queries attend to;
                 -1 attends to the sequence itself. A memory is attended
                 without a cache, so it carries no state.
+              context_len: Tokens each sequence already holds in its KV cache.
+                The ``seq_len`` queries attend to those and to their own keys,
+                so ``seq_len=1`` is one decode step. A memory ignores it.
               **kwargs: The open bus, forwarded to every child.
 
             Returns:
               cost: Whole-invocation cost over ``seq_len`` and ``batch_size``.
 
             """
-            # Cross-attention prices ``seq_len`` queries against ``memory_len`` keys.
-            reach = {} if memory_len < 0 else {"seq_len": memory_len, "rows": seq_len}
             kernel = cost(
                 self.attn_kernel,
-                **{"seq_len": seq_len} | reach,
+                seq_len=memory_len if memory_len >= 0 else context_len + seq_len,
+                rows=seq_len,
                 batch_size=batch_size,
                 dtype=dtype,
                 num_heads=self.num_heads,
                 channels_head=self.channels_head,
                 dropout_p=self.dropout,
+                **kwargs,
             )
             return replace(
                 super().cost(
@@ -470,15 +482,13 @@ class Attention(AttentionProjections):
                     batch_size=batch_size,
                     dtype=dtype,
                     memory_len=memory_len,
+                    context_len=context_len,
                     **kwargs,
                 )
                 + kernel,
                 bytes_state=0
                 if memory_len >= 0
-                else resolve_dtype(dtype).itemsize
-                * 2
-                * self.num_heads_kv
-                * self.channels_head,
+                else nbytes(2 * self.num_heads_kv * self.channels_head, dtype),
             )
 
     def __init__(self, config: Config) -> None:
@@ -528,8 +538,8 @@ class Attention(AttentionProjections):
             num_heads=self.num_heads_kv,
             max_seq=max_seq,
             channels_head=self.channels_head,
-            device=device,
-            dtype=dtype,
+            device=self.proj_qkv.weight.device if device is None else device,
+            dtype=self.proj_qkv.weight.dtype if dtype is None else dtype,
         )
 
     @override
@@ -538,69 +548,27 @@ class Attention(AttentionProjections):
         x: Tensor,
         *,
         memory: Tensor | None = None,
-        positions: Tensor | list[Tensor] | None = None,
+        cache: LayerCache | None = None,
+        positions: Tensor | None = None,
         cos_sin: tuple[Tensor, Tensor] | None = None,
         dropout_p: float | None = None,
         is_causal: bool | None = None,
         attn_mask: Tensor | None = None,
+        window: int = -1,
         **kwargs: object,
     ) -> Tensor:
-        out, _ = self._forward(
+        return self._forward(
             x,
             memory=memory,
-            positions=positions,
-            cos_sin=cos_sin,
-            cache=None,
-            dropout_p=dropout_p,
-            is_causal=is_causal,
-            attn_mask=attn_mask,
-            **kwargs,
-        )
-        return out
-
-    def forward_cached(
-        self,
-        x: Tensor,
-        *,
-        cache: KVCache,
-        positions: Tensor | list[Tensor] | None = None,
-        cos_sin: tuple[Tensor, Tensor] | None = None,
-        dropout_p: float | None = None,
-        is_causal: bool | None = None,
-        attn_mask: Tensor | None = None,
-        **kwargs: object,
-    ) -> tuple[Tensor, KVCache]:
-        """Attend using and updating ``cache``.
-
-        Args:
-          x: Input query tensor.
-          cache: Pre-allocated KVCache to update with new keys/values.
-          positions: Token position indices for RoPE; None = sequential.
-          cos_sin: Pre-computed rotation angles (cos, sin); None = compute.
-          dropout_p: Dropout probability (0.0 to 1.0); None = no dropout.
-          is_causal: Mask future positions; None = no causal masking.
-          attn_mask: Custom attention mask; None = no additional masking.
-          **kwargs: Extra arguments passed to _forward.
-
-        Returns:
-          output: Attention output.
-          updated_cache: The cache with this step's keys and values appended.
-
-        """
-        out, updated = self._forward(
-            x,
-            memory=None,
             positions=positions,
             cos_sin=cos_sin,
             cache=cache,
             dropout_p=dropout_p,
             is_causal=is_causal,
             attn_mask=attn_mask,
+            window=window,
             **kwargs,
         )
-        if updated is None:
-            raise ValueError("Expected updated is not None.")
-        return out, updated
 
     def project_queries(self, x: Tensor) -> Tensor:
         """Project queries through the first ``num_heads`` heads of ``proj_qkv``.
@@ -648,15 +616,21 @@ class Attention(AttentionProjections):
         x: Tensor,
         *,
         memory: Tensor | None = None,
-        positions: Tensor | list[Tensor] | None,
+        positions: Tensor | None,
         cos_sin: tuple[Tensor, Tensor] | None,
-        cache: KVCache | None,
+        cache: LayerCache | None,
         dropout_p: float | None,
         is_causal: bool | None,
         attn_mask: Tensor | None,
+        window: int,
         **kwargs: object,
-    ) -> tuple[Tensor, KVCache | None]:
+    ) -> Tensor:
         S = x.shape[-2]
+        kv_cache: KVCache | None = None
+        if cache is not None:
+            state = cache[self.depth_index]
+            assert isinstance(state, KVCache)
+            kv_cache = state
 
         # proj_qkv: [..., S, C] -> [..., S, num_ensemble, channels_head].
         if memory is not None:
@@ -664,8 +638,8 @@ class Attention(AttentionProjections):
             # causal call meant for self-attention reaches this one too.
             if (
                 self.causal
-                or is_causal
-                or kwargs.get("window", -1) != -1
+                or is_causal is True
+                or window != -1
                 or self.rope is not None
                 or cos_sin is not None
                 or cache is not None
@@ -697,16 +671,15 @@ class Attention(AttentionProjections):
             q, k = RoPE.rotate(q, k, cos, sin)
         elif self.rope is not None:
             if positions is None:
-                offset = cache.seen if cache is not None else 0
+                offset = kv_cache.seen if kv_cache is not None else 0
                 positions = torch.arange(offset, offset + S, device=x.device)
-            assert isinstance(positions, Tensor)
             cos, sin = self.rope(positions)
             q, k = RoPE.rotate(q, k, cos, sin)
 
         # The cache stores [..., H, S, D]; the kernels take [..., S, H, D].
         q, k, v = (t.movedim(-3, -2) for t in (q, k, v))
-        if cache is not None:
-            k, v = cache.update(k, v)
+        if kv_cache is not None:
+            k, v = kv_cache.update(k, v)
 
         if self.kv_groups > 1:
             k = k.repeat_interleave(self.kv_groups, dim=-3)
@@ -717,9 +690,10 @@ class Attention(AttentionProjections):
         # chunk and honor ``window``; ``window_mask`` does both when finite, else
         # ``causal_chunk_mask`` gives the causal fallback. A single-token chunk needs
         # only ``window``, applied by the kernel's own fallback.
-        if attn_mask is None and self.causal and S > 1:
-            window = kwargs.get("window", -1)
-            assert isinstance(window, int)
+        causal = self.causal if is_causal is None else is_causal
+        # A caller's mask keeps the flag, so the kernel folds causality into it.
+        flag = causal and (k.shape[-3] == S or attn_mask is not None)
+        if attn_mask is None and causal and S > 1:
             attn_mask = window_mask(q, k, window=window)
             if attn_mask is None:
                 attn_mask = causal_chunk_mask(q, k)
@@ -733,10 +707,9 @@ class Attention(AttentionProjections):
                 if dropout_p is None
                 else dropout_p
             ),
-            is_causal=(
-                self.causal and k.shape[-3] == S if is_causal is None else is_causal
-            ),
+            is_causal=flag,
             attn_mask=attn_mask,
+            window=window,
             **kwargs,
         )
 
@@ -744,5 +717,4 @@ class Attention(AttentionProjections):
         out = out.flatten(-2)
         if self.norm_out is not None:
             out = self.norm_out(out)
-        out = self.proj_out(out)
-        return out, cache
+        return self.proj_out(out)

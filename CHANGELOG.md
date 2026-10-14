@@ -36,6 +36,13 @@ All notable priml changes are documented here. This project follows
   `images/source.json` binds the crops every corpus shares to their ImageNet
   source, and a rerun resumes only with the same source, producers, seed, and
   (for a seeded corpus) batch size.
+- `cost(..., context_len=...)` prices a step after `context_len` cached
+  tokens: `Attention`, `GatedAttention`, and `MultiStreamAttention` attend
+  their `seq_len` queries to `context_len + seq_len` keys. One decode step is
+  `cost(model, seq_len=1, context_len=T, ...)`, and `utilization` places it
+  against a device's ridge. `MultiHeadLatentAttention` raises
+  `NotImplementedError` for a cached step.
+- `priml.cost.nbytes` returns the bytes a count of values occupies at a dtype.
 
 ### Changed
 
@@ -56,6 +63,13 @@ All notable priml changes are documented here. This project follows
   (`shadow_kind="param_dict"`); the module-copy default could not deepcopy the
   composable `replicate` model, so every distributed run failed at its first
   EMA update. EMA state saved under the old default does not load into it.
+- `Cost` and `Report` carry their `axes`, so a slice answers by the axes it
+  kept whether or not it holds a cell. An empty slice used to accept any axis
+  and read a sub-table where a full one read zero.
+- Naming every axis of a sub-table, such as `cost["flops"]["primal",
+  "matmul", torch.bfloat16]`, is a `KeyError`; read it with `.sum()`, or name
+  all four axes on the full table. A three-value `Report` lookup is typed
+  `float | Report`: a three-axis report reads a value, `peak()` a sub-table.
 
 ### Fixed
 
@@ -71,6 +85,62 @@ All notable priml changes are documented here. This project follows
   cost counts the projector when no depth projects.
 - SpeedrunDiT: the corpus loader refuses two files naming one pair, and an
   image that is not `[3, H, W]` uint8.
+- Costs at `torch.float4_e2m1fn_x2` count two values per byte. Every byte
+  count multiplied by `itemsize`, which is one byte per two packed fp4 values,
+  so fp4 traffic and cache state were doubled.
+
+## 0.1.6 - 2026-10-07
+
+### Added
+
+- `priml.data.passes.Passes` wraps a function that draws one pass of
+  batches, so a training loader iterates afresh at every epoch boundary
+  instead of handing back an exhausted generator.
+- `priml.runtime.best_device()` returns the best accelerator this process
+  can use, else CPU.
+- `priml.testing.golden.assert_pprint_golden(test_file=..., name=...,
+  config=...)` compares a config's full finalized pprint with a
+  test-local golden, with an optional `normalize`; it replaces
+  `configgle.testing.assert_pprint_golden`. `priml.testing.regenerate`
+  adds the `--regenerate-golden` pytest option.
+- ARC evaluation can write ranked per-task pass@k JSON.
+- An ETTh1 DLinear forecasting baseline (`priml.baselines.etth1`).
+
+### Changed
+
+- **Breaking:** runtime `device` defaults to `None`, which selects the best
+  usable accelerator, else CPU. The `"auto"` spelling is gone:
+  `get_device("auto")` now raises. `get_device(None)` returns the device
+  being built under (`torch.get_default_device()`).
+- A CUDA build on a machine with no usable GPU resolves the default device
+  to CPU instead of failing on its first allocation. Processors and model
+  loaders default to their build-time device; explicitly configured
+  devices are kept.
+- **Breaking:** `RoPE`'s `dtype` defaults to `torch.float32` (was `None`).
+  Fixed frequencies stay float32 through module casts; learned frequencies
+  follow the module dtype. Numerics are unchanged.
+- **Breaking:** the vendored `priml.lib.custom_json` is replaced by
+  `priml.lib.codec`. Dataset metadata, manifests and training checkpoints
+  are read with its typed parser.
+- Reductions normalize their axes and reject invalid dimensions; dataset
+  recipes, resume state, model configs and optimizer inputs are validated
+  up front.
+- Development: the bundled typeshed patch and pytest options are updated, and
+  a worker-count helper is vendored as `priml.lib.worker_count`. Runtime
+  dependencies and the supported Python versions (3.12+) are unchanged.
+
+### Fixed
+
+- Transformer mixers are no longer passed an absent cache.
+- A missing false-accept count is treated as zero during evaluation.
+- Fixes to attention, sampling, metrics, image processing, checkpoint
+  handling, and parallel data and distributed workflows.
+
+### Removed
+
+- **Breaking:** `priml.testing.fixtures.get_device`; use
+  `priml.runtime.best_device()`.
+- `Checkpointer.has_pending_write`.
 
 ## 0.1.5 - 2026-10-03
 
@@ -160,6 +230,16 @@ All notable priml changes are documented here. This project follows
   Ubuntu 24.04 does not ship, and the repository's
   `install-libjpeg-turbo.sh` installs it.
 - The package ships `py.typed`, so type checkers read priml's annotations.
+- `setup_logging` requires its `level`; it defaulted to `"INFO"`.
+- `lazy_torch_compile` forwards only keyword arguments to `torch.compile`.
+  A positional argument other than the decorated function raises
+  `TypeError`.
+- A mesh dimension below -1 raises `ValueError` instead of acting as -1
+  (auto).
+- `q_lambda_targets` no longer rounds the discount to bf16 when its inputs
+  are bf16, and bf16 Q-values beside fp32 rewards stay in bf16 instead of
+  reaching fp32 through the done mask. bf16 targets can move by a rounding
+  step; fp32 targets are unchanged.
 
 ### Added
 
@@ -234,6 +314,12 @@ All notable priml changes are documented here. This project follows
   as CUDA graphs, and its GPU evaluation works.
 - The nanochat baseline's Torch 2.9 runtime project installs configgle, which
   every priml module imports, so the FA3 build command runs in it.
+- The ARC-AGI-1 baseline's `PassK` merges every rank's votes before ranking
+  answers, so a multi-GPU evaluation no longer counts a puzzle whose samples
+  span ranks once per rank.
+- The mean of `cross_entropy_with_batched_smoothing` divides by the exact
+  count of non-ignored targets. In bf16 that count was summed in bf16, which
+  rounds above 256.
 
 ## 0.1.4 - 2026-08-19
 

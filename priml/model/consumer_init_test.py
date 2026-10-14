@@ -5,12 +5,12 @@ from pathlib import Path
 from typing import Final
 
 from torch import Tensor, nn
+from treekle import from_plain
 
 import pytest
 import torch
 
 from priml.baselines.nanochat.model import NanoChatLM
-from priml.lib.custom_json import DictCodec
 from priml.model.attention.attention import Attention
 from priml.model.attention.mla import MultiHeadLatentAttention
 from priml.model.attention.multi_stream import MultiStreamAttention
@@ -76,7 +76,7 @@ def test_reference_initialization(kind: str, std: float) -> None:
         )
     torch.manual_seed(13)
     model = config.make()
-    initial_state = DictCodec.coerce(model.state_dict(), Tensor)
+    initial_state = from_plain(model.state_dict(), dict[str, Tensor])
     initial: dict[str, Tensor] = {
         name: value.clone() for name, value in initial_state.items()
     }
@@ -84,7 +84,7 @@ def test_reference_initialization(kind: str, std: float) -> None:
     torch.manual_seed(13)
     model.reset_parameters()
     assert torch.equal(torch.get_rng_state(), initial_rng)
-    state = DictCodec.coerce(model.state_dict(), Tensor)
+    state = from_plain(model.state_dict(), dict[str, Tensor])
     for name, value in state.items():
         assert torch.equal(value, initial[name]), name
     for name, module in model.named_modules():
@@ -303,7 +303,7 @@ def _constructor_values(module: nn.Module, inp: Tensor, *, kind: str) -> Tensor:
         cfg_nano.block.attn.channels_head = 2
         cfg_nano.block.attn.gate_channels = 2
         model = cfg_nano.make()
-    state = DictCodec.coerce(model.state_dict(), Tensor)
+    state = from_plain(model.state_dict(), dict[str, Tensor])
     # The fingerprint pins the draw count in 8 values instead of the 5 KB
     # Mersenne state.
     values: list[Tensor] = [
@@ -322,6 +322,6 @@ def _constructor_values(module: nn.Module, inp: Tensor, *, kind: str) -> Tensor:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

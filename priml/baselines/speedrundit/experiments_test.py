@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 import math
 
 from configgle.pprinting import pformat
-from configgle.testing import assert_pprint_golden
 
 import pytest
 import torch
@@ -28,6 +27,7 @@ from priml.model.vision_ae.vtp import VTP
 from priml.optimizers.composite import CompositeOptimizer
 from priml.optimizers.muon import Muon
 from priml.runtime import SingleProcess
+from priml.testing.golden import assert_pprint_golden
 from priml.train.parallelism import NoParallel
 
 
@@ -156,6 +156,6 @@ def test_every_experiment_finalizes_without_reading_files() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

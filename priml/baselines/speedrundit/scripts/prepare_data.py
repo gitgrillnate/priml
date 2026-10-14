@@ -34,6 +34,7 @@ import logging
 import random
 
 from PIL import Image
+from treekle import from_plain, json_loads
 
 from priml.baselines.speedrundit import experiments
 from priml.baselines.speedrundit.corpus import (
@@ -53,7 +54,6 @@ from priml.baselines.speedrundit.corpus import (
 from priml.baselines.speedrundit.latent_codec import FittedCodec, ScalarTableCodec
 from priml.data.processors.labels import ImagenetSynsetToIndex
 from priml.data.sources.extracted_imagenet import ExtractedImageNetSource
-from priml.lib.custom_json import DictCodec, loads
 from priml.paths import validated_output_path
 
 
@@ -248,7 +248,7 @@ def prepare(
     recorded = previous.get("preparation")
     if recorded is not None:
         problems = mismatches(
-            DictCodec.coerce(recorded, default=None),
+            from_plain(recorded, dict[str, object]),
             expected=preparation,
         )
         if problems:
@@ -405,7 +405,7 @@ def ensure_image_source(
     """
     path = root / "images" / IMAGE_SOURCE
     if path.is_file():
-        bound = DictCodec.coerce(loads(path.read_text()), default=None)
+        bound = json_loads(path.read_text(), dict[str, object])
         problems = mismatches(bound, expected=identity)
         if problems:
             raise CorpusMismatchError(
@@ -484,6 +484,26 @@ def record_receipt(
     return count
 
 
+def require_imagenet_train(source: Path) -> None:
+    """Refuse a source whose ``train/`` is not exactly the 1,000 synset directories.
+
+    Args:
+      source: Extracted ImageNet directory.
+
+    Raises:
+      ValueError: A synset directory is missing, or an unexpected one is present.
+
+    """
+    synsets = set(ImagenetSynsetToIndex.Config().make().synset_to_idx)
+    present = {path.name for path in (source / "train").iterdir() if path.is_dir()}
+    if present != synsets:
+        raise ValueError(
+            f"{source / 'train'} must hold one directory per ImageNet synset; "
+            f"{len(synsets - present)} are missing and "
+            f"{len(present - synsets)} are unexpected.",
+        )
+
+
 def main() -> int:
     """Prepare one experiment's latent corpus.
 
@@ -492,6 +512,8 @@ def main() -> int:
 
     Raises:
       SystemExit: ``--source`` is missing when encoding.
+      ValueError: The corpus directory is unusable or aliases ``--source``, or
+        ``--source`` does not hold exactly the 1,000 ImageNet training synsets.
 
     """
     parser = argparse.ArgumentParser(
@@ -503,7 +525,14 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     config = dataset_config(flags.experiment)
     if flags.directory is not None:
-        config.working_dir = validated_output_path(flags.directory)
+        config.working_dir = flags.directory
+    config.working_dir = validated_output_path(
+        config.working_dir,
+        protected=[] if flags.source is None else [flags.source],
+    )
+    if flags.source is not None:
+        # A partial extraction would otherwise train on fewer classes without a word.
+        require_imagenet_train(flags.source)
     if flags.receipt_only:
         print(record_receipt(config, imagenet=flags.source))
         return 0

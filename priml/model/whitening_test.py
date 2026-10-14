@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Final
 
+import textwrap
+
 from torch import Tensor, nn
 
 import pytest
@@ -19,14 +21,13 @@ from priml.testing.golden import assert_text_golden
 _CWD: Final = Path(__file__).resolve().parent
 
 
-def _whitening() -> PCAWhiteningConv2d:
-    return PCAWhiteningConv2d(2, 16, kernel_size=2, bias=False)
-
-
 def test_orientation_undoes_an_eigenvector_sign_flip() -> None:
     """A per-eigenvector sign flip, as another LAPACK returns, orients identically."""
     torch.manual_seed(0)
-    reference, flipped = _whitening(), _whitening()
+    reference, flipped = (
+        PCAWhiteningConv2d(2, 16, kernel_size=2, bias=False),
+        PCAWhiteningConv2d(2, 16, kernel_size=2, bias=False),
+    )
     train_images = torch.randn(3, 2, 4, 5)
     reference.init_whiten(train_images)
 
@@ -51,6 +52,22 @@ def test_init_whiten_rejects_wrong_out_channels():
     images = torch.randn(16, 3, 8, 9)
     with pytest.raises(ValueError, match="out_channels"):
         layer.init_whiten(images, decompose=pca_eigh)
+
+
+def test_the_documented_usage_runs() -> None:
+    """The class docstring's example is code a reader copies; run it verbatim."""
+    doc = PCAWhiteningConv2d.__doc__
+    assert doc is not None
+    usage = textwrap.dedent(doc.split("Typical usage::", 1)[1]).strip()
+    torch.manual_seed(0)
+    namespace: dict[str, object] = {
+        "PCAWhiteningConv2d": PCAWhiteningConv2d,
+        "train_images": torch.randn(8, 3, 6, 7),
+    }
+    exec(usage, namespace)  # noqa: S102 -- executes this module's own docstring.
+    layer = namespace["layer"]
+    assert isinstance(layer, PCAWhiteningConv2d)
+    assert not layer.weight.requires_grad
 
 
 def test_init_whiten_shape():
@@ -140,12 +157,11 @@ def test_weights_frozen():
     assert not layer.weight.requires_grad
 
 
-def test_whitening_text(request: pytest.FixtureRequest) -> None:
+def test_whitening_text() -> None:
     assert_text_golden(
-        request,
         test_file=__file__,
         name="whitening",
-        rendered=repr(_whitening()),
+        rendered=repr(PCAWhiteningConv2d(2, 16, kernel_size=2, bias=False)),
     )
 
 
@@ -159,7 +175,12 @@ def test_whitening_bfb(device: str) -> None:
     assert_bfb_against_golden(
         golden_dir=_CWD / "testdata",
         golden_name="whitening",
-        build_module=lambda: _whitening().to(device),
+        build_module=lambda: PCAWhiteningConv2d(
+            2,
+            16,
+            kernel_size=2,
+            bias=False,
+        ).to(device),
         # Kernel size 2 requires spatial inputs at least 2x2.
         build_input=lambda: (torch.randn(3, 2, 4, 5), torch.randn(3, 2, 4, 5)),
         seed=0,
@@ -168,6 +189,6 @@ def test_whitening_bfb(device: str) -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

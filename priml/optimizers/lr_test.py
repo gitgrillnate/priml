@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from torch import nn
+from treekle import ReadError
 
 import pytest
 import torch
@@ -62,7 +63,7 @@ def test_learning_rate_rejects_a_non_numeric_group_value() -> None:
     optimizer = torch.optim.SGD([nn.Parameter(torch.zeros(2))], lr=0.3)
     optimizer.param_groups[0]["lr"] = "invalid"
 
-    with pytest.raises(TypeError, match="cannot coerce"):
+    with pytest.raises(ReadError):
         learning_rate(optimizer)
 
 
@@ -84,6 +85,6 @@ def test_optimizer_helpers_step_zero_and_clip_gradients() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

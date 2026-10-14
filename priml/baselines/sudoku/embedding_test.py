@@ -14,8 +14,8 @@ from priml.baselines.sudoku.embedding import (
     GridChannel,
     GridEmbedding,
     PredictionFeedback,
-    scaled_normal,
 )
+from priml.model.init import scaled_normal
 from priml.testing.cost import assert_cost_matches_torch
 
 
@@ -289,6 +289,6 @@ def _ordered(tokens: Tensor, *, swap: bool) -> Tensor:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

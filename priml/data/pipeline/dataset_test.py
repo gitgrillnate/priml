@@ -872,7 +872,7 @@ def test_datapipeline_len_raises_for_non_sized_source():
             del config
 
         def __iter__(self) -> Iterator[Sample]:
-            yield cast(Sample, {"key": "a"})
+            yield {"key": "a"}
 
     config = DataPipeline.Config(source=_Unsized.Config())
     pipeline = DataPipeline(config)
@@ -1133,6 +1133,6 @@ def test_create_loader_defaults_to_single_process() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

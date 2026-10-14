@@ -11,12 +11,12 @@ import re
 
 from torch import Tensor, nn
 from torch.optim import Optimizer
+from treekle import ReadError, from_plain
 
 import pytest
 import torch
 
 from priml.baselines.nanochat import optimizers
-from priml.lib.custom_json import DictCodec, FloatCodec
 from priml.optimizers.composite import CompositeOptimizer
 from priml.optimizers.normuon import NorMuon
 
@@ -29,12 +29,6 @@ def _tensor(state: dict[str, object], name: str) -> Tensor:
     value = state[name]
     assert isinstance(value, Tensor)
     return value
-
-
-def _number(value: object) -> float:
-    if isinstance(value, Tensor):
-        return float(value)
-    return FloatCodec.coerce(value, None)
 
 
 @dataclass(slots=True, kw_only=True)
@@ -84,7 +78,7 @@ def test_zero_beta_rmsprop_survives_checkpoint_and_positive_beta_update(
     dtype: torch.dtype,
     sparse: bool,
 ) -> None:
-    """Zero decay replaces moments and must not break the cumulative log state."""
+    """Zero decay replaces moments; a checkpoint must reproduce the next update."""
     weight = torch.nn.Parameter(torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=dtype))
     config = optimizers.BiasCorrectedRMSProp.Config(
         lr=0.25,
@@ -104,12 +98,6 @@ def test_zero_beta_rmsprop_survives_checkpoint_and_positive_beta_update(
         _tensor(_state(optimizer, weight), "second_moment"),
         torch.tensor([[4.0], [0.0]]),
     )
-    if sparse:
-        state = _state(optimizer, weight)
-        sparse_scalars = DictCodec.coerce(state["sparse_scalars"])
-        assert _number(state["cum_log"]) == -math.inf
-        assert _number(sparse_scalars["cum_before"]) == 0.0
-        assert _number(sparse_scalars["cum_after"]) == -math.inf
 
     restored_weight = torch.nn.Parameter(weight.detach().clone())
     restored = config.make()([restored_weight])
@@ -126,12 +114,6 @@ def test_zero_beta_rmsprop_survives_checkpoint_and_positive_beta_update(
         _tensor(_state(restored, restored_weight), "second_moment"),
         _tensor(_state(optimizer, weight), "second_moment"),
     )
-    if sparse:
-        for state in (_state(optimizer, weight), _state(restored, restored_weight)):
-            sparse_scalars = DictCodec.coerce(state["sparse_scalars"])
-            assert _number(state["cum_log"]) == -math.inf
-            assert _number(sparse_scalars["cum_before"]) == -math.inf
-            assert _number(sparse_scalars["cum_after"]) == -math.inf
 
 
 @pytest.mark.parametrize(
@@ -195,7 +177,7 @@ def test_rowwise_checkpoint_preserves_state_precision_and_next_update(
         elif isinstance(value, dict):
             for key, scalar in cast(dict[str, object], value).items():
                 assert isinstance(scalar, torch.Tensor)
-                after_scalars = DictCodec.coerce(after[name], Tensor)
+                after_scalars = from_plain(after[name], dict[str, Tensor])
                 assert after_scalars[key].dtype == scalar.dtype, key
                 assert torch.equal(after_scalars[key], scalar), key
     sink.mul_(0.37)
@@ -289,9 +271,9 @@ def test_ffn_multiplier_changes_both_rectangular_projections() -> None:
     config.optimizer.compile = False
     optimizer = config.make()(parameters)
     rates = {
-        tuple(cast("list[Tensor]", group["params"])[0].shape): FloatCodec.coerce(
+        tuple(cast("list[Tensor]", group["params"])[0].shape): from_plain(
             cast(object, group["lr"]),
-            None,
+            float,
         )
         for group in optimizer.param_groups
     }
@@ -364,7 +346,9 @@ def test_scheduled_update_drives_each_optimizer_family() -> None:
     matrix = nn.Parameter(torch.ones(2, 3))
     table = nn.Parameter(torch.ones(3, 4))
     dense = nn.Parameter(torch.ones(4, 5))
-    muon = NorMuon.Config(lr=0.1, weight_decay=0.01).make()([matrix])
+    # Eager: these parameters hold no gradients, so no update is ever issued,
+    # and only wrapping the step in torch.compile would cost seconds.
+    muon = NorMuon.Config(lr=0.1, weight_decay=0.01, compile=False).make()([matrix])
     rmsprop = optimizers.BiasCorrectedRMSProp.Config(lr=0.1).make()([table])
     adam = torch.optim.Adam([dense], lr=0.2, betas=(0.8, 0.99))
     members = CompositeOptimizer([muon, rmsprop, adam])
@@ -433,7 +417,6 @@ def test_sparse_cpu_reference_receives_int64_indices() -> None:
             ("lr", 0.1),
             ("beta2", 0.9),
             ("eps", 1e-8),
-            ("one_minus_lr_wd", 1.0),
         )
     }
     with patch.object(optimizers, "_sparse_rmsprop_reference") as reference:
@@ -441,7 +424,6 @@ def test_sparse_cpu_reference_receives_int64_indices() -> None:
             parameter,
             torch.ones_like(parameter),
             torch.zeros(2, 1),  # sparse_rmsprop_rows requires [rows, 1] moments.
-            torch.zeros(2, dtype=torch.int32),
             torch.tensor([0, 1], dtype=torch.uint8),
             torch.zeros(2, dtype=torch.int32),
             torch.zeros((), dtype=torch.int32),
@@ -452,7 +434,7 @@ def test_sparse_cpu_reference_receives_int64_indices() -> None:
     assert reference.call_count == 1
     call_args = reference.call_args
     assert call_args is not None
-    rows = call_args.args[4]
+    rows = call_args.args[3]
     assert isinstance(rows, Tensor)
     assert rows.dtype == torch.int64
     assert rows.tolist() == [1]
@@ -463,23 +445,11 @@ def test_sparse_rmsprop_cuda_route_passes_each_buffer() -> None:
     gradient = torch.ones_like(parameter)
     # sparse_rmsprop_rows keeps one FP32 second moment per row: [rows, 1].
     moment = torch.zeros(2, 1)
-    last_step = torch.zeros(2, dtype=torch.int32)
     bitmap = torch.tensor([0, 1], dtype=torch.uint8)
     index = torch.full((2,), -1, dtype=torch.int32)
     count = torch.zeros((), dtype=torch.int32)
     scratch = torch.full((3,), -1, dtype=torch.int32)
-    scalars = {
-        name: torch.tensor(0.0)
-        for name in (
-            "step",
-            "lr",
-            "beta2",
-            "eps",
-            "one_minus_lr_wd",
-            "cum_before",
-            "cum_after",
-        )
-    }
+    scalars = {name: torch.tensor(0.0) for name in ("step", "lr", "beta2", "eps")}
 
     with (
         patch.object(Tensor, "is_cuda", new_callable=PropertyMock, return_value=True),
@@ -489,7 +459,6 @@ def test_sparse_rmsprop_cuda_route_passes_each_buffer() -> None:
             parameter,
             gradient,
             moment,
-            last_step,
             bitmap,
             index,
             count,
@@ -501,7 +470,6 @@ def test_sparse_rmsprop_cuda_route_passes_each_buffer() -> None:
         parameter,
         gradient,
         moment,
-        last_step,
         bitmap,
         index,
         count,
@@ -509,9 +477,6 @@ def test_sparse_rmsprop_cuda_route_passes_each_buffer() -> None:
         scalars["lr"],
         scalars["beta2"],
         scalars["eps"],
-        scalars["one_minus_lr_wd"],
-        scalars["cum_before"],
-        scalars["cum_after"],
     )
 
 
@@ -529,28 +494,26 @@ def test_sparse_rmsprop_initializes_exact_row_state_and_errors() -> None:
         "sparse_index": ((3,), torch.int32),
         "sparse_count": ((), torch.int32),
         "sparse_scratch": ((4,), torch.int32),
-        "last_step": ((3,), torch.int32),
     }
     for name, (shape, dtype) in expected.items():
         value = _tensor(state, name)
         assert value.shape == shape, name
         assert value.dtype == dtype, name
         assert value.device.type == "cpu", name
-    sparse_scalars = DictCodec.coerce(state["sparse_scalars"], Tensor)
-    assert set(sparse_scalars) == {
+    assert set(state) == {
         "step",
-        "lr",
-        "beta2",
-        "eps",
-        "one_minus_lr_wd",
-        "cum_before",
-        "cum_after",
+        "second_moment",
+        "sparse_index",
+        "sparse_count",
+        "sparse_scratch",
+        "sparse_scalars",
     }
+    sparse_scalars = from_plain(state["sparse_scalars"], dict[str, Tensor])
+    assert set(sparse_scalars) == {"step", "lr", "beta2", "eps"}
     assert all(
         value.shape == () and value.dtype == torch.float32
         for value in sparse_scalars.values()
     )
-    assert _number(sparse_scalars["one_minus_lr_wd"]) == 1.0
     assert torch.equal(
         _tensor(state, "sparse_index"),
         torch.tensor([1, 0, 0], dtype=torch.int32),
@@ -576,8 +539,7 @@ def test_sparse_rmsprop_requests_state_factory_dtype_and_device() -> None:
         call(3, dtype=torch.int32, device=device),
         call((), dtype=torch.int32, device=device),
         call(4, dtype=torch.int32, device=device),
-        call(3, dtype=torch.int32, device=device),
-        *[call((), dtype=torch.float32, device=device) for _ in range(7)],
+        *[call((), dtype=torch.float32, device=device) for _ in range(4)],
     ]
 
 
@@ -585,22 +547,10 @@ def test_sparse_cuda_launcher_passes_all_buffers_and_fixed_grid() -> None:
     parameter = torch.ones(3, 512)
     gradient = torch.ones_like(parameter)
     moment = torch.zeros(3, 1)  # _sparse_rmsprop_rows_cuda uses [rows, 1] moments.
-    last_step = torch.zeros(3, dtype=torch.int32)
     bitmap = torch.tensor([0, 1, 0], dtype=torch.uint8)
     index = torch.zeros(3, dtype=torch.int32)
     count = torch.zeros((), dtype=torch.int32)
-    scalars = {
-        name: torch.zeros(())
-        for name in (
-            "step",
-            "lr",
-            "beta2",
-            "eps",
-            "one_minus_lr_wd",
-            "cum_before",
-            "cum_after",
-        )
-    }
+    scalars = {name: torch.zeros(()) for name in ("step", "lr", "beta2", "eps")}
     inactive_kernel = MagicMock()
     sparse_kernel = MagicMock()
     inactive_launch: MagicMock = MagicMock()
@@ -623,7 +573,6 @@ def test_sparse_cuda_launcher_passes_all_buffers_and_fixed_grid() -> None:
             parameter,
             gradient,
             moment,
-            last_step,
             bitmap,
             index,
             count,
@@ -631,9 +580,6 @@ def test_sparse_cuda_launcher_passes_all_buffers_and_fixed_grid() -> None:
             scalars["lr"],
             scalars["beta2"],
             scalars["eps"],
-            scalars["one_minus_lr_wd"],
-            scalars["cum_before"],
-            scalars["cum_after"],
         )
     assert compiled_inactive.call_count == 1
     assert compiled_sparse.call_count == 1
@@ -650,16 +596,12 @@ def test_sparse_cuda_launcher_passes_all_buffers_and_fixed_grid() -> None:
             parameter,
             gradient,
             moment,
-            last_step,
             index,
             count,
             scalars["step"],
             scalars["lr"],
             scalars["beta2"],
             scalars["eps"],
-            scalars["one_minus_lr_wd"],
-            scalars["cum_before"],
-            scalars["cum_after"],
         ),
         n_cols=512,
         programs=8192,
@@ -725,11 +667,10 @@ def test_sparse_cuda_inactive_grid_covers_row_boundaries(rows: int, grid: int) -
             parameter,
             torch.ones_like(parameter),
             torch.zeros(rows, 1),
-            torch.zeros(rows, dtype=torch.int32),
             torch.zeros(rows, dtype=torch.uint8),
             torch.zeros(rows, dtype=torch.int32),
             torch.zeros((), dtype=torch.int32),
-            *(torch.zeros(()) for _ in range(7)),
+            *(torch.zeros(()) for _ in range(4)),
         )
     inactive_kernel.__getitem__.assert_called_once_with((grid,))
 
@@ -767,11 +708,10 @@ def test_sparse_cuda_rejects_invalid_kernel_geometry(
             torch.ones_like(parameter),
             # _sparse_rmsprop_rows_cuda takes one FP32 second moment per row.
             torch.zeros(3, 1),
-            torch.zeros(3, dtype=torch.int32),
             bitmap,
             torch.zeros(3, dtype=torch.int32),
             torch.zeros((), dtype=torch.int32),
-            *(torch.zeros(()) for _ in range(7)),
+            *(torch.zeros(()) for _ in range(4)),
             block_w=block_w,
         )
 
@@ -845,9 +785,8 @@ def test_sparse_rmsprop_rejects_uncoercible_scalars(field: str) -> None:
     optimizer.gradient_sinks[parameter] = torch.ones_like(parameter)
     optimizer.param_groups[0][field] = "invalid"
 
-    with pytest.raises(TypeError) as error:
+    with pytest.raises(ReadError):
         optimizer.step()
-    assert str(error.value) == "cannot coerce 'invalid' to float"
 
 
 def test_sparse_rmsprop_uses_per_row_moments_and_bias_correction() -> None:
@@ -870,7 +809,6 @@ def test_sparse_rmsprop_uses_per_row_moments_and_bias_correction() -> None:
         _tensor(state, "second_moment"),
         torch.tensor([[1.0], [4.0], [0.0]]),
     )
-    assert _number(state["cum_log"]) == math.log(0.5)
     denominator = (torch.tensor([[1.0], [4.0], [0.0]]) / 0.5).sqrt() + 1.0
     expected = (
         torch.ones(3, 2).double() - 0.1 * (gradient / denominator).double()
@@ -907,21 +845,20 @@ def test_sparse_state_allocations_follow_parameter_device_and_dtype() -> None:
 
     group = cast(dict[str, object], optimizer.param_groups[0])
     assert tensor_factory.call_args == call(
-        FloatCodec.coerce(group["beta2"], None),
+        from_plain(group["beta2"], float),
         dtype=torch.float32,
     )
     expected = {
         "sparse_index": ((3,), torch.int32),
         "sparse_count": ((), torch.int32),
         "sparse_scratch": ((4,), torch.int32),
-        "last_step": ((3,), torch.int32),
     }
     for name, (shape, dtype) in expected.items():
         value = _tensor(state, name)
         assert value.shape == shape, name
         assert value.dtype == dtype, name
         assert value.device.type == "meta", name
-    scalars = DictCodec.coerce(state["sparse_scalars"], Tensor)
+    scalars = from_plain(state["sparse_scalars"], dict[str, Tensor])
     assert all(value.device.type == "meta" for value in scalars.values())
 
 
@@ -1030,6 +967,6 @@ def test_rmsprop_dense_decay_and_update_match_hand_calculation() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

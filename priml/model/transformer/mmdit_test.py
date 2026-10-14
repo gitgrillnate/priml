@@ -1,8 +1,8 @@
-"""Tests for MMDiT block.
+r"""Tests for MMDiT block.
 
 Regenerate bit-for-bit goldens after an intentional numeric change::
 
-    BFB_REGENERATE=1 uv --quiet run --frozen pytest \
+    uv --quiet run --frozen pytest \ --regenerate-b4b
         priml/model/transformer/mmdit_test.py
 
 Run regeneration through pytest so priml's conftest establishes the required
@@ -14,7 +14,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Final
 
-from configgle.testing import assert_pprint_golden
 from torch import Tensor, nn
 
 import pytest
@@ -38,6 +37,7 @@ from priml.testing.bfb import (
     randomize_parameters,
 )
 from priml.testing.cost import assert_cost_matches_torch
+from priml.testing.golden import assert_pprint_golden
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -57,10 +57,6 @@ def _cfg(
     return cfg
 
 
-def _canonical_adaln_config() -> AdaLNZero.Config:
-    return AdaLNZero.Config(channels_in=4, cond_dim=2)
-
-
 def _canonical_mmdit_config() -> MMDiTBlock.Config:
     config = MMDiTBlock.Config(channels_in=4, num_streams=2)
     config.attn = MultiStreamAttention.Config(num_heads=2, channels_head=2)
@@ -72,7 +68,7 @@ def test_adaln_zero_config_pprint() -> None:
     assert_pprint_golden(
         test_file=__file__,
         name="ada_ln_zero",
-        config=_canonical_adaln_config(),
+        config=AdaLNZero.Config(channels_in=4, cond_dim=2),
     )
 
 
@@ -80,7 +76,7 @@ def test_adaln_zero_bfb() -> None:
     assert_bfb_against_golden(
         golden_dir=_CWD / "testdata",
         golden_name="ada_ln_zero",
-        build_module=_canonical_adaln_config().make,
+        build_module=AdaLNZero.Config(channels_in=4, cond_dim=2).make,
         build_input=lambda: torch.randn(3, 2),
         seed=0,
         run=_run_adaln,
@@ -702,6 +698,6 @@ def _run_mmdit(module: nn.Module, streams: list[Tensor]) -> Tensor:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

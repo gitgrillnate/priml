@@ -22,7 +22,6 @@ from functools import cache
 from pathlib import Path
 from typing import Final
 
-from configgle.testing import assert_pprint_golden
 from torch import Tensor, nn
 from torch.nn import functional
 from torch.utils.flop_counter import FlopCounterMode
@@ -43,7 +42,7 @@ from priml.model.vision_ae.rae import (
 )
 from priml.testing.bfb import assert_bfb_against_golden, host_agnostic_numerics
 from priml.testing.cost import assert_cost_matches_torch
-from priml.testing.golden import mismatches, read_tensors
+from priml.testing.golden import assert_pprint_golden, mismatches, read_tensors
 
 
 # Imported at collection: the model class costs ~1 s on first import, which would
@@ -442,20 +441,25 @@ def test_published_decoder_keeps_the_checkpoint_names_and_order() -> None:
     assert len(decoder) == 456
 
 
-def test_published_encoder_keeps_the_checkpoint_names() -> None:
-    state = _published_state()
-    encoder = {
-        key.removeprefix("encoder.encoder."): shape
-        for key, shape in state.items()
-        if key.startswith("encoder.")
-    }
+def test_published_encoder_loads_the_checkpoint_names() -> None:
     layers = {
         f"encoder.layer.{index}.{name}": shape
         for index in range(12)
         for name, shape in _ENCODER_LAYER
     }
-    assert encoder == {**dict(_ENCODER_EMBEDDINGS), **layers}
-    assert len(encoder) == 224 - 2
+    published = {**dict(_ENCODER_EMBEDDINGS), **layers}
+    assert len(published) == 224 - 2
+    config = rae_dinov2_base().encoder
+    assert isinstance(config, Dinov2WithRegisters.Config)
+    config.checkpoint = None
+    with torch.device("meta"):
+        encoder = config.make()
+        # Strict: every published name and shape lands, whichever names the
+        # installed transformers gives its attention projections.
+        _ = encoder.encoder.load_state_dict(
+            {name: torch.empty(shape) for name, shape in published.items()},
+            assign=True,
+        )
 
 
 def test_encoder_registers_before_decoder() -> None:
@@ -494,6 +498,6 @@ def test_encode_refuses_a_float_image() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

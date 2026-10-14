@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import json
 
 from torch import Tensor
+from treekle import ReadError, from_plain, json_loads
 
 import numpy as np
 import pytest
@@ -16,16 +17,13 @@ import torch
 from priml.baselines.sudoku import puzzle_data
 from priml.baselines.sudoku.puzzle_data import (
     PuzzleDataset,
-    _build_dihedral_indices,
-    _get_device,
     _PuzzleBatchIterator,
     _subset_eval_iterator,
     augment_sudoku,
+    dihedral_indices,
     load_puzzle_dataset,
-    resolve_working_dir,
 )
 from priml.baselines.sudoku.puzzle_spec import SudokuSpec
-from priml.lib.custom_json import IntCodec, ListCodec
 
 
 def _write(
@@ -115,7 +113,6 @@ def test_dataset_validates_indices_and_spec_and_subset(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match=r".") as error:
         wrong.make().train_dataloader()
     assert str(error.value) == "Prepared grid does not match dataset spec."
-    assert _get_device("auto").type in {"cpu", "cuda", "mps"}
     iterator = _PuzzleBatchIterator(tmp_path, "cpu", 3, spec=SudokuSpec())
     assert next(iter(iterator))["valid_count"] == 2
 
@@ -141,7 +138,10 @@ def test_dataset_starts_with_empty_epoch_state(tmp_path: Path) -> None:
 
     assert dataset._train_epochs == 0
     assert dataset._active_train_iter is None
-    assert dataset.state_dict() == {"train_epochs": 0}
+    assert dataset.state_dict() == {
+        "train_epochs": 0,
+        "timer_epoch": dataset.timer_epoch.state_dict(),
+    }
 
 
 def test_train_loader_forwards_config_and_tracks_active_epoch(tmp_path: Path) -> None:
@@ -194,13 +194,19 @@ def test_train_loader_forwards_config_and_tracks_active_epoch(tmp_path: Path) ->
     )
     torch.testing.assert_close(augmented["media"], expected_inputs, rtol=0, atol=0)
     torch.testing.assert_close(augmented["label"], expected_labels, rtol=0, atol=0)
-    assert dataset.state_dict() == {"train_epochs": 1}
+    assert dataset.state_dict() == {
+        "train_epochs": 1,
+        "timer_epoch": dataset.timer_epoch.state_dict(),
+    }
     resumed = dataset.train_dataloader()
-    assert resumed._epoch == 1
+    assert resumed.epoch == 1
     assert dataset._active_train_iter is resumed
     dataset.load_state_dict({"train_epochs": 4})
-    assert resumed._epoch == 4
-    assert dataset.state_dict() == {"train_epochs": 4}
+    assert resumed.epoch == 4
+    assert dataset.state_dict() == {
+        "train_epochs": 4,
+        "timer_epoch": dataset.timer_epoch.state_dict(),
+    }
 
 
 def test_train_loader_applies_instance_cap_without_sample_cap(tmp_path: Path) -> None:
@@ -275,28 +281,46 @@ def test_dataset_subset_bounds_and_state_load(tmp_path: Path) -> None:
     assert dataset.state_dict().get("train_epochs") == 3
 
 
-def test_resolve_working_dir_keeps_logical_path_beneath_base() -> None:
-    assert resolve_working_dir(None, "/datasets/sudoku") == Path(
-        "/opt/scratch/datasets/sudoku",
-    )
-    assert resolve_working_dir("/runs", "nested/data") == Path("/runs/nested/data")
-    assert resolve_working_dir("/runs", "X/nested") == Path("/runs/X/nested")
-
-
-@pytest.mark.parametrize(
-    ("cuda_available", "mps_available", "expected"),
-    [(True, True, "cuda"), (False, True, "mps"), (False, False, "cpu")],
-)
-def test_auto_device_prefers_cuda_then_mps_then_cpu(
-    monkeypatch: pytest.MonkeyPatch,
-    cuda_available: bool,
-    mps_available: bool,
-    expected: str,
+def test_working_dir_str_resolves_beneath_base_and_path_is_literal(
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
-    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: mps_available)
+    assert PuzzleDataset.Config().finalize().working_dir == Path(
+        "/opt/scratch/datasets/sudoku-extreme",
+    )
+    owned = PuzzleDataset.Config(base_dir="/runs", working_dir="nested/data")
+    assert owned.finalize().working_dir == Path("/runs/nested/data")
+    literal = PuzzleDataset.Config(base_dir="/runs", working_dir=tmp_path)
+    assert literal.finalize().working_dir == tmp_path
 
-    assert _get_device("auto") == torch.device(expected)
+
+def test_metadata_must_be_an_object_with_integer_fields(tmp_path: Path) -> None:
+    _write(tmp_path)
+    for text in ("[]", '{"vocab_size": 11}', '{"vocab_size": "11", "seq_len": 81}'):
+        (tmp_path / "train" / "dataset.json").write_text(text)
+        with pytest.raises(ReadError):
+            load_puzzle_dataset(tmp_path, "train")
+
+
+def test_epoch_order_reads_the_bounds_without_a_per_instance_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``int(tensor)`` per instance is a host sync; an epoch needs at most two."""
+    _write_split(tmp_path, "train", [1, 2, 3, 4, 5])
+    shuffled = _PuzzleBatchIterator(tmp_path, "cpu", 2, seed=3, spec=SudokuSpec())
+    ordered = _PuzzleBatchIterator(tmp_path, "cpu", 2, shuffle=False, spec=SudokuSpec())
+    synced: list[int] = []
+    original = Tensor.__int__
+
+    def counted(self: Tensor) -> int:
+        synced.append(1)
+        return original(self)
+
+    monkeypatch.setattr(Tensor, "__int__", counted)
+    shuffled._order()
+    assert synced == []
+    assert ordered._order().tolist() == [0, 1, 2, 3, 4]
+    assert len(synced) == 2  # Only the first and last bound.
 
 
 def test_augmentation_preserves_tokens_and_pairing() -> None:
@@ -570,7 +594,7 @@ def test_iterator_emits_exact_order_and_pads_final_batch(tmp_path: Path) -> None
     assert iterator.augment is False
     assert iterator.augment_digits_only is False
     assert iterator._augment_generator is None
-    assert iterator._epoch == 1
+    assert iterator.epoch == 1
 
 
 def test_full_batches_skip_padding_allocation() -> None:
@@ -579,7 +603,7 @@ def test_full_batches_skip_padding_allocation() -> None:
     iterator.n_instances = 2
     iterator.shuffle = False
     iterator.seed = None
-    iterator._epoch = 0
+    iterator.epoch = 0
     iterator.inputs = torch.arange(8).reshape(4, 2)
     iterator.labels = iterator.inputs + 100
     iterator.batch_size = 2
@@ -605,14 +629,14 @@ def _ordered_first_epoch(root: Path, seed: int) -> list[int]:
         num_instances=2,
         max_samples=6,
     ).make()
-    return ListCodec.coerce(
+    return from_plain(
         torch.cat(
             [
                 batch["media"][: batch["valid_count"], 0]
                 for batch in dataset.train_dataloader()
             ],
         ).tolist(),
-        int,
+        list[int],
     )
 
 
@@ -664,11 +688,11 @@ def test_iterator_shuffle_advances_seed_by_epoch(tmp_path: Path) -> None:
         patch.object(torch, "randperm", wraps=torch.randperm) as randperm,
     ):
         next(iter(iterator))
-        assert iterator._epoch == 1
+        assert iterator.epoch == 1
         second_epoch = next(iter(iterator))["media"][:, 0].tolist()
-        assert iterator._epoch == 2
+        assert iterator.epoch == 2
         third_epoch = next(iter(iterator))["media"][:, 0].tolist()
-        assert iterator._epoch == 3
+        assert iterator.epoch == 3
 
     assert all(
         call.kwargs["device"] == torch.device("cpu")
@@ -721,7 +745,7 @@ def test_loader_caps_rows_and_clips_group_boundaries(tmp_path: Path) -> None:
     assert empty["group_indices"].tolist() == [0]
 
     (split / "dataset.json").write_text("{}")
-    with pytest.raises(TypeError, match="cannot coerce None to int"):
+    with pytest.raises(ReadError):
         load_puzzle_dataset(tmp_path, "train")
 
 
@@ -837,9 +861,9 @@ def test_loader_preserves_mmap_and_metadata_contract(
     np.save(split / "all__labels.npy", source_labels)
 
     load = Mock(wraps=np.load)
-    coerce = Mock(wraps=IntCodec.coerce)
+    parse_metadata = Mock(wraps=json_loads)
     monkeypatch.setattr(np, "load", load)
-    monkeypatch.setattr(IntCodec, "coerce", coerce)
+    monkeypatch.setattr(puzzle_data, "json_loads", parse_metadata)
 
     data = load_puzzle_dataset(tmp_path, "test", max_samples=5)
 
@@ -870,9 +894,8 @@ def test_loader_preserves_mmap_and_metadata_contract(
         "r",
         "r",
     ]
-    assert [call.kwargs.get("default", object()) for call in coerce.call_args_list] == [
-        None,
-        None,
+    assert [call.args[0] for call in parse_metadata.call_args_list] == [
+        '{"vocab_size":11,"seq_len":4}',
     ]
 
 
@@ -883,7 +906,7 @@ def test_augmentation_pins_digit_only_output_and_dihedral_device(
     inputs = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=torch.int16)
     labels = torch.tensor([[3, 2, 1, 0], [0, 1, 2, 3]], dtype=torch.int64)
     arange = Mock(wraps=torch.arange)
-    original_build = _build_dihedral_indices
+    original_build = dihedral_indices
     devices: list[torch.device | None] = []
 
     def build(n: int, device: torch.device) -> Tensor:
@@ -916,7 +939,7 @@ def test_augmentation_pins_digit_only_output_and_dihedral_device(
     monkeypatch.setattr(torch, "arange", arange)
     monkeypatch.setattr(torch, "rand", rand)
     monkeypatch.setattr(torch, "randint", randint)
-    monkeypatch.setattr(puzzle_data, "_build_dihedral_indices", build)
+    monkeypatch.setattr(puzzle_data, "dihedral_indices", build)
 
     augmented_inputs, augmented_labels = augment_sudoku(
         inputs,
@@ -942,7 +965,18 @@ def test_augmentation_pins_digit_only_output_and_dihedral_device(
     assert devices == [inputs.device]
 
 
+def test_the_epoch_timer_survives_a_checkpoint(tmp_path: Path) -> None:
+    """The loop counts epochs on the dataset, so resuming must restore them."""
+    data = PuzzleDataset(PuzzleDataset.Config(working_dir=tmp_path))
+    data.timer_epoch.global_count = 3
+    restored = PuzzleDataset(PuzzleDataset.Config(working_dir=tmp_path))
+    restored.load_state_dict(data.state_dict())
+    assert restored.timer_epoch.global_count == 3
+    restored.load_state_dict({})
+    assert restored.timer_epoch.global_count == 3
+
+
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

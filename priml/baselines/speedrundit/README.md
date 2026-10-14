@@ -20,7 +20,40 @@ own code was shown bit-for-bit equal to it, so the test does not need the REG
 repository or `timm` at runtime. The CPU check does not establish bitwise
 identity across different GPU kernels or distributed launches.
 
-## Data
+## Reproduce
+
+Training reads paired RGB images and raw autoencoder latents from the
+experiment's corpus. DINOv2 targets are computed online from the images; they
+are not stored as latent files.
+
+### Prerequisites
+
+- **ImageNet.** The ILSVRC2012 training set is licensed. Request access at
+  <https://image-net.org/download.php>, accept its terms, and download
+  `ILSVRC2012_img_train.tar` (about 138 GB). Extract it so each of the 1,000
+  synsets is one directory of JPEGs:
+
+  ```bash
+  mkdir -p /data/imagenet/train && tar -xf ILSVRC2012_img_train.tar -C /data/imagenet/train
+  cd /data/imagenet/train && for f in *.tar; do mkdir "${f%.tar}" && tar -xf "$f" -C "${f%.tar}" && rm "$f"; done
+  ```
+
+  The result is `/data/imagenet/train/<synset>/<synset>_<id>.JPEG`. The
+  preparation reads only `train/` and refuses a tree without exactly the
+  1,000 synset directories.
+- **Weights.** The preparation downloads the experiment's autoencoder
+  checkpoint from Hugging Face at a pinned revision and checks its SHA-256.
+  Training loads DINOv2 ViT-B/14 through `torch.hub` from
+  `facebookresearch/dinov2` and its published weights. No credentials are
+  needed.
+- **GPU.** The preparation encodes on one CUDA GPU. `exp000` through `exp004`
+  are data-parallel runs of 32 images per GPU; eight GPUs make REG's global
+  batch of 256. `exp_smoke` runs on one device, CPU included.
+- **Disk.** The shared `images/` directory holds one 256-pixel PNG per
+  training image, about 1.28 million; each corpus adds its latents (see
+  [Latent storage](#latent-storage)).
+
+### Data
 
 An experiment owns its corpus. `dataset.source` names the autoencoder that
 encodes it, the storage codec that writes it, and the subdirectory it lives in
@@ -45,20 +78,49 @@ and refuses a mismatch or a corpus whose preparation has not finished.
 Prepare an experiment's corpus from extracted ImageNet:
 
 ```sh
-uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --experiment exp003 --source /datasets/imagenet --device cuda
+uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --experiment exp003 --source /data/imagenet --device cuda
 ```
 
 The preparer builds exactly the autoencoder and codec the experiment declares,
 fits a fitted codec first on a sample of every source image, and resumes an
 interrupted run when the source, producers, seed, and (for a seeded corpus)
-batch size are unchanged. Autoencoder weights are pinned Hugging Face revisions
-with SHA-256 digests and download into the Hugging Face cache. An existing REG
-corpus is admitted without re-encoding; `--source` also binds crops that record
-no source, so other corpora can be prepared beside it:
+batch size are unchanged. Autoencoder weights download into the Hugging Face
+cache. An existing REG corpus is admitted without re-encoding; `--source` also
+binds crops that record no source, so other corpora can be prepared beside it:
 
 ```sh
-uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --experiment exp000 --receipt-only --source /datasets/imagenet
+uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --experiment exp000 --receipt-only --source /data/imagenet
 ```
+
+### Experiments
+
+```bash
+uv --quiet run --frozen python -m priml priml.baselines.speedrundit.experiments.exp_smoke
+uv --quiet run --frozen python -m torch.distributed.run --standalone --nproc_per_node=8 -m priml priml.baselines.speedrundit.experiments.exp000
+```
+
+The other experiments launch as `exp000` does.
+
+| Experiment | Reads | Writes | Recorded result |
+|---|---|---|---|
+| `exp_smoke` | `datasets/speedrundit/vae-in/` | `runs/speedrundit/exp_smoke` | Installation check: five updates |
+| `exp000` | `datasets/speedrundit/vae-in/` | `runs/speedrundit/exp000` | TBD |
+| `exp001` | `datasets/speedrundit/vae-in/` | `runs/speedrundit/exp001` | TBD |
+| `exp002` | `datasets/speedrundit/vtp-large/` | `runs/speedrundit/exp002` | TBD |
+| `exp003` | `datasets/speedrundit/rae-dinov2-base-f16/` | `runs/speedrundit/exp003` | TBD |
+| `exp004` | `datasets/speedrundit/rae-dinov2-base-u8/` | `runs/speedrundit/exp004` | TBD |
+
+Each reads its corpus beside the shared `images/`, prepared by the data step
+for that experiment. Paths sit beneath `/opt/scratch`. Every experiment except
+`exp_smoke` trains for 400,000 steps, writes a checkpoint every 10,000, and
+evaluates nothing during training; REG scores generated images separately.
+
+### The base_dir knob
+
+Every default sits beneath `/opt/scratch`. To move everything, pick a root:
+pass `--directory /data/root/datasets/speedrundit` to the data step and
+`--override base_dir=/data/root` to each launch. The launch then reads from
+`/data/root/datasets/speedrundit` and writes to `/data/root/runs/speedrundit`.
 
 ## Latent storage
 
@@ -82,7 +144,7 @@ variances span 1,120x across channels (and at most 3.2x across positions
 within one). Before a uint8 corpus replaces the float16 one, measure it:
 
 ```sh
-uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.benchmark_codec --experiment exp003 --source /datasets/imagenet --decode --device cuda --output /opt/scratch/artifacts/speedrundit/codecs.json
+uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.benchmark_codec --experiment exp003 --source /data/imagenet --decode --device cuda --output /opt/scratch/artifacts/speedrundit/codecs.json
 ```
 
 It scores every candidate codec (float32, bfloat16, float16, and uint8 tables

@@ -106,9 +106,8 @@ class _PassthroughModule(nn.Module):
         return torch.cat((self.read(input), self.read_write(input)))
 
 
-def test_passthrough_text(request: pytest.FixtureRequest) -> None:
+def test_passthrough_text() -> None:
     assert_text_golden(
-        request,
         test_file=__file__,
         name="passthrough",
         rendered=str(_PassthroughModule()),
@@ -179,7 +178,21 @@ def test_read_write_passthrough_delegates_existing_attributes() -> None:
         wrapper.typo = 4
 
 
+def test_read_write_passthrough_rejects_public_writes_before_target_exists() -> None:
+    wrapper = _ReadWrite.__new__(_ReadWrite)
+
+    with pytest.raises(AttributeError) as error:
+        wrapper.value = 3
+
+    assert str(error.value) == (
+        "_ReadWrite passthrough targets have no attribute 'value'."
+    )
+    wrapper.inner = _Target()
+    wrapper.value = 5
+    assert wrapper.inner.value == 5
+
+
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

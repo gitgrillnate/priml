@@ -8,16 +8,17 @@ from typing import Final
 import json
 
 from torch import Tensor
+from treekle import from_plain
 
 import numpy as np
 import pytest
 import torch
 
-from priml.baselines.arcagi1.augmentation import ColorDihedral
 from priml.baselines.sudoku import data
 from priml.baselines.sudoku.data import SudokuData, _load_split, augment_sudoku
+from priml.baselines.sudoku.puzzle_data import PuzzleDataset
 from priml.baselines.sudoku.puzzle_spec import SudokuSpec
-from priml.lib.custom_json import ListCodec
+from priml.data.color_dihedral import ColorDihedral
 from priml.math.seed import salt
 from priml.runtime import get_device
 from priml.testing.golden import assert_tensor_golden, stored
@@ -73,9 +74,9 @@ def test_batches_are_always_full_width(dataset_dir: Path) -> None:
     assert sorted(
         row
         for batch in batches
-        for row in ListCodec.coerce(
+        for row in from_plain(
             batch["media"][: batch["valid_count"], 0].tolist(),
-            int,
+            list[int],
         )
     ) == list(range(2, 8))
     assert torch.equal(tail["media"][:2], tail["label"][:2])
@@ -134,7 +135,7 @@ def test_shuffle_factories_receive_resolved_cpu_device(
     original_randperm = torch.randperm
 
     def traced_get_device(
-        device: torch.device | str | None = "auto",
+        device: torch.device | str | None = None,
     ) -> torch.device:
         resolved.append(device)
         return original_get_device(device)
@@ -356,7 +357,7 @@ def test_augmentation_uses_the_dataset_spec() -> None:
     )
     assert actual.shape == (2, 16)
     assert torch.equal(actual, labels)
-    assert set(ListCodec.coerce(actual.flatten().tolist(), int)) == {2, 3, 4, 5}
+    assert set(from_plain(actual.flatten().tolist(), list[int])) == {2, 3, 4, 5}
 
 
 def test_augmentation_moves_the_label_with_the_input() -> None:
@@ -397,7 +398,7 @@ def test_augmentation_preserves_empties_and_padding() -> None:
     grid = torch.full((2, 81), 1, dtype=torch.long)  # Every cell empty.
     grid[:, :5] = 0  # Padding.
     inputs, _ = augment_sudoku(grid, grid.clone(), spec=SudokuSpec())
-    assert set(ListCodec.coerce(inputs.flatten().tolist(), int)) <= {0, 1}
+    assert set(from_plain(inputs.flatten().tolist(), list[int])) <= {0, 1}
 
 
 def test_augmentation_is_seedable() -> None:
@@ -438,23 +439,18 @@ def test_seeded_augmentation_resumes_at_the_next_epoch(dataset_dir: Path) -> Non
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("batch_size", 0),
-        ("batch_size", -1),
-        ("eval_batch_size", 0),
-        ("eval_batch_size", -1),
-    ],
+    "field",
+    ["batch_size", "eval_batch_size", "num_train_puzzles", "num_eval_puzzles"],
 )
-def test_nonpositive_batch_size_is_rejected(
+@pytest.mark.parametrize("value", [0, -1])
+def test_nonpositive_sizes_are_rejected_at_construction(
     dataset_dir: Path,
     field: str,
     value: int,
 ) -> None:
     with pytest.raises(ValueError, match="positive") as error:
         _data(dataset_dir, **{field: value})
-    expected_field = "eval_batch_size" if field == "eval_batch_size" else "batch_size"
-    assert str(error.value) == (f"{expected_field} must be positive; got {value}.")
+    assert str(error.value) == f"{field} must be positive; got {value}."
 
 
 def test_num_puzzles_keeps_a_prefix_of_whole_puzzles(dataset_dir: Path) -> None:
@@ -472,9 +468,9 @@ def test_num_puzzles_keeps_a_prefix_of_whole_puzzles(dataset_dir: Path) -> None:
     assert sorted(
         value
         for batch in train_batches
-        for value in ListCodec.coerce(
+        for value in from_plain(
             batch["media"][: batch["valid_count"], 0].tolist(),
-            int,
+            list[int],
         )
     ) == [2, 3]
 
@@ -497,10 +493,15 @@ def test_prepared_data_must_match_the_spec(
     dataset_dir: Path,
     spec: SudokuSpec,
     match: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data = _data(dataset_dir, spec=spec)
+    sudoku = _data(dataset_dir, spec=spec)
+    placed: list[object] = []
+    monkeypatch.setattr(data, "get_device", placed.append)
     with pytest.raises(ValueError, match="does not match") as error:
-        data.train_dataloader()
+        sudoku.train_dataloader()
+    # The split is rejected before any of it is copied to the device.
+    assert placed == []
     expected_message = (
         "Prepared vocabulary does not match dataset spec."
         if match == "vocabulary"
@@ -579,6 +580,65 @@ def test_restoring_no_loader_rewinds_a_live_loader_to_the_epoch_count(
     assert live.epoch == 0
 
 
+@pytest.mark.parametrize("live_first", [True, False])
+def test_checkpointed_epoch_survives_a_missing_loader_cursor(
+    dataset_dir: Path,
+    live_first: bool,
+) -> None:
+    """``epoch`` alone resumes the shuffle sequence, live loader or not."""
+    trained = _data(dataset_dir, augment=False, seed=6)
+    for _ in range(2):
+        list(trained.train_dataloader())
+    expected = next(iter(trained.train_dataloader()))["media"]
+
+    restored = _data(dataset_dir, augment=False, seed=6)
+    live = restored.train_dataloader() if live_first else None
+    restored.load_state_dict({"epoch": 2, "loader": None})
+    loader = live or restored.train_dataloader()
+    assert loader.epoch == 2
+    assert restored.state_dict()["epoch"] == 2
+    assert torch.equal(next(iter(loader))["media"], expected)
+
+
+def test_a_path_working_dir_is_literal(tmp_path: Path) -> None:
+    config = SudokuData.Config()
+    config.base_dir = Path("/owner")
+    config.working_dir = tmp_path
+    assert config.finalize().working_dir == tmp_path
+    config = SudokuData.Config()
+    config.base_dir = "/owner"
+    assert config.finalize().working_dir == Path("/owner/datasets/sudoku-extreme")
+
+
+def test_an_unowned_config_resolves_like_every_sudoku_dataset() -> None:
+    assert (
+        SudokuData.Config().finalize().working_dir
+        == PuzzleDataset.Config().finalize().working_dir
+        == Path("/opt/scratch/datasets/sudoku-extreme")
+    )
+
+
+def test_epoch_order_reads_the_bounds_without_a_per_puzzle_sync(
+    dataset_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``int(tensor)`` per puzzle is a host sync; a whole epoch needs at most two."""
+    synced: list[int] = []
+    original = Tensor.__int__
+
+    def counted(self: Tensor) -> int:
+        synced.append(1)
+        return original(self)
+
+    data = _data(dataset_dir, augment=False, seed=0)
+    train, test = data.train_dataloader(), data.eval_dataloader()
+    monkeypatch.setattr(Tensor, "__int__", counted)
+    train._order(0)
+    assert synced == []
+    test._order(0)
+    assert len(synced) == 2  # Only the first and last bound.
+
+
 def test_missing_data_names_the_preparer(tmp_path: Path) -> None:
     data = _data(tmp_path)
     with pytest.raises(FileNotFoundError) as error:
@@ -592,6 +652,6 @@ def test_missing_data_names_the_preparer(tmp_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

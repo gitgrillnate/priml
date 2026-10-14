@@ -36,17 +36,12 @@ Both `copy_tree().finalize()`, so you see the tree after propagation. Eg,
 sentinels filled in. That is why it is the debugging tool -- it shows what
 `make()` will use, not what you typed. Pass `finalize=False` for raw input.
 
-The default view is already a diff against the class defaults, so comparing two
-experiments is the same call on each:
+Compare experiments with `udiff`; never hand-roll `difflib` over `pformat`:
 
 ```python
-difflib.unified_diff(
-    exp000().pformat().splitlines(),
-    exp001().pformat().splitlines(),
-    "exp000",
-    "exp001",
-    lineterm="",
-)
+print(exp000().udiff(exp001()))  # Unified diff, defaults included.
+print(exp000().udiff(exp001(), mode="fields"))  # One row per changed path.
+print(exp000().udiff(exp001(), exp002(), mode="sxs"))  # Side by side.
 ```
 
 `exp().pprint()` is the single best way to debug an experiment!
@@ -618,7 +613,7 @@ steps_per_epoch = NUM_TRAIN_SAMPLES // cfg.dataset.batch_size
 
 ## 6. Writing an experiment
 
-Directories are named after the dataset -- `mnist`, `cifar10`, `arcagi1`;
+Directories are named after the dataset -- `mnist`, `cifar10`, `arcagi`;
 `nanochat` and `sudoku` are exceptions, better known than their datasets. Layout
 mirrors priml: `data.py`, `model.py`, `train_step.py`, `experiments.py`, each
 with a `*_test.py`, plus `testdata/` and `scripts/prepare_data.py`. Data staging
@@ -725,11 +720,11 @@ never by copying the number.
 
 ### Pprint golden tests
 
-Use the public Configgle harness when a config's defaults and finalized
-propagation are part of its tested contract:
+Use priml's pprint harness when a config's defaults and finalized propagation
+are part of its tested contract:
 
 ```python
-from configgle.testing import assert_pprint_golden
+from priml.testing.golden import assert_pprint_golden
 
 
 def test_sandwich_config_pprint() -> None:
@@ -746,13 +741,13 @@ stores `testdata/<name>.txt` beside the test. After an intentional change, read
 the diff, regenerate, inspect the file, then rerun without regeneration:
 
 ```bash
-CONFIGGLE_REGENERATE_GOLDEN=1 uv --quiet run --frozen pytest <test_file>::<test_nodeid>
+uv --quiet run --frozen pytest <test_file>::<test_nodeid> --regenerate-golden
 uv --quiet run --frozen pytest <test_file>::<test_nodeid>
 ```
 
-Import from `configgle.testing`, never through a consumer package's testing
-facade. Do not call `pformat` manually at the callsite; the harness owns the
-full finalized rendering policy.
+Tensor goldens regenerate with `--regenerate-b4b` instead. Do not call
+`pformat` manually at the callsite; the harness owns the full finalized
+rendering policy.
 
 ### Bit-for-bit goldens
 

@@ -13,9 +13,8 @@ from pathlib import Path
 from typing import Final, cast
 from unittest.mock import patch
 
-import json
-
 from torch import Tensor
+from treekle import json_loads
 
 import numpy as np
 import torch
@@ -28,26 +27,31 @@ from priml.baselines.convextok.program import (
     build_program,
     token_edges,
 )
-from priml.lib.custom_json import DictCodec, IntCodec, ListCodec
+from priml.baselines.convextok.testing import (
+    TESTDATA,
+    Candidates,
+    Corpus,
+    Pretokens,
+)
 
 
 _CWD: Final = Path(__file__).resolve().parent
 
 
 def test_program_matches_upstream_golden() -> None:
-    pretokens = _read_json("pretokens.json")
-    candidates = _read_json("candidates.json")
-    corpus = _read_json("corpus.json")
+    pretokens = json_loads((TESTDATA / "pretokens.json").read_text(), Pretokens)
+    candidates = json_loads((TESTDATA / "candidates.json").read_text(), Candidates)
+    corpus = json_loads((TESTDATA / "corpus.json").read_text(), Corpus)
     built = build_program(
         dict(
             zip(
-                ListCodec.coerce(pretokens.get("pretokens"), str, default=None),
-                ListCodec.coerce(pretokens.get("frequencies"), int, default=None),
+                pretokens["pretokens"],
+                pretokens["frequencies"],
                 strict=True,
             ),
         ),
-        ListCodec.coerce(candidates.get("tokens"), str, default=None),
-        budget=IntCodec.coerce(corpus.get("budget"), default=None),
+        candidates["tokens"],
+        budget=corpus["budget"],
     )
     program = built.program
     with _npz("program.npz") as golden:
@@ -284,12 +288,7 @@ def _npz(name: str) -> np.lib.npyio.NpzFile:
     return loaded
 
 
-def _read_json(name: str) -> dict[str, object]:
-    raw = cast(object, json.loads((_CWD / "testdata" / name).read_text()))
-    return dict(DictCodec.coerce(raw, default=None))
-
-
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

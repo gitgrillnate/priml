@@ -9,13 +9,13 @@ from __future__ import annotations
 
 from configgle import PartialConfig
 from configgle.pprinting import pformat
-from configgle.testing import assert_pprint_golden
 
 from priml.baselines.imagenet.data import NUM_TRAIN_SAMPLES
 from priml.baselines.imagenet.experiments import exp000, exp_smoke
 from priml.data.pipeline.batching import Batcher
 from priml.data.pipeline.dataset import DataPipeline
 from priml.math.schedules import cyclic
+from priml.testing.golden import assert_pprint_golden
 
 
 def test_exp000_pprint() -> None:
@@ -53,6 +53,6 @@ def test_exp_smoke_shrinks_only_the_budget_and_batch() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

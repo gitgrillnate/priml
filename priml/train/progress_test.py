@@ -6,9 +6,10 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
+from treekle import json_loads
+
 import pytest
 
-from priml.lib.custom_json import DictCodec, loads
 from priml.train import progress
 from priml.train.progress import write_progress
 
@@ -25,7 +26,7 @@ def test_write_progress_lands_step_total_metrics(tmp_path: Path) -> None:
         metrics={"loss": 0.25},
     )
     assert path == tmp_path / "progress.json"
-    data = DictCodec.coerce(loads(path.read_text()))
+    data = json_loads(path.read_text(), dict[str, object])
     assert data["step"] == 5
     assert data["total"] == 100
     assert data["metrics"] == {"loss": 0.25}
@@ -58,7 +59,7 @@ def test_write_progress_uses_utc_iso_timestamp(
 
     path = write_progress(1, 2, working_dir=tmp_path)
 
-    data = DictCodec.coerce(loads(path.read_text()))
+    data = json_loads(path.read_text(), dict[str, object])
     assert data["updated_at"] == "2025-02-03T04:05:06Z"
     clock.now.assert_called_once_with(tz=UTC)
 
@@ -67,11 +68,11 @@ def test_write_progress_overwrites_atomically(tmp_path: Path) -> None:
     """Successive writes replace the file; no tmp residue is left behind."""
     _ = write_progress(1, 10, working_dir=tmp_path)
     path = write_progress(2, 10, working_dir=tmp_path)
-    assert DictCodec.coerce(loads(path.read_text()))["step"] == 2
+    assert json_loads(path.read_text(), dict[str, object])["step"] == 2
     assert sorted(p.name for p in tmp_path.iterdir()) == ["progress.json"]
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

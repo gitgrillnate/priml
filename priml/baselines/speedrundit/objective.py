@@ -40,13 +40,17 @@ def interpolant(
     """
     if path == "linear":
         return 1 - t, t, -torch.ones_like(t), torch.ones_like(t)
-    angle = math.pi * t / 2
-    return (
-        angle.cos(),
-        angle.sin(),
-        -(math.pi / 2) * angle.sin(),
-        (math.pi / 2) * angle.cos(),
-    )
+    if path == "cosine":
+        angle = math.pi * t / 2
+        return (
+            angle.cos(),
+            angle.sin(),
+            -(math.pi / 2) * angle.sin(),
+            (math.pi / 2) * angle.cos(),
+        )
+    raise ValueError(
+        f"unsupported flow path: {path}",
+    )  # pyright: ignore[reportUnreachable] -- Runtime guard protects untyped callers.
 
 
 def projection_loss(
@@ -60,7 +64,8 @@ def projection_loss(
       teacher_features: Teacher token features at matching depths.
 
     Returns:
-      loss: Per-sample sum of mean token alignment losses.
+      loss: Per-sample mean, over depths, of each depth's mean token
+        alignment loss.
 
     Raises:
       ValueError: Projection counts or token shapes do not match.
@@ -74,8 +79,12 @@ def projection_loss(
         selected = teacher_target
         if prediction.ids_keep is not None:
             selected = teacher_target.gather(
-                1,
-                prediction.ids_keep[..., None].expand(-1, -1, teacher_target.shape[-1]),
+                dim=1,
+                index=prediction.ids_keep[..., None].expand(
+                    -1,
+                    -1,
+                    teacher_target.shape[-1],
+                ),
             )
         if prediction.tokens.shape != selected.shape:
             raise ValueError("teacher tokens do not match the student projection")
@@ -118,14 +127,14 @@ class SpeedrunObjective:
     """Combine SiT velocity, REG alignment, CLS diffusion, and CFM.
 
     Attributes:
-      path: Probability path that corrupts latents and CLS features.
-      weighting: Flow-time distribution: uniform, or lognormal in sigma.
-      cfm_weighting: Contrastive flow term weighted uniformly or by flow time.
-      projection_coeff: REG projection loss weight.
-      cls_coeff: CLS flow loss weight.
-      cfm_coeff: Contrastive flow loss weight.
-      shift_time: Shift sampled times toward noise for larger latents.
-      shift_base: Reference latent dimension for time shifting.
+      path: Probability path; see :func:`interpolant`.
+      weighting: Flow-time sampling distribution.
+      cfm_weighting: Time weighting of the contrastive term.
+      projection_coeff: Weight of REG alignment.
+      cls_coeff: Weight of CLS-token diffusion.
+      cfm_coeff: Weight of contrastive flow matching.
+      shift_time: Shift sampled times by latent size.
+      shift_base: Latent size at which the shift is identity.
 
     """
 
@@ -136,7 +145,17 @@ class SpeedrunObjective:
     cls_coeff: float = 0.03
     cfm_coeff: float = 0.05
     shift_time: bool = True
-    shift_base: int = 4096
+    shift_base: int = 4_096
+
+    def __post_init__(self) -> None:
+        """Reject a choice the objective has no branch for."""
+        for name, value, known in (
+            ("path", self.path, ("linear", "cosine")),
+            ("weighting", self.weighting, ("uniform", "lognormal")),
+            ("cfm_weighting", self.cfm_weighting, ("uniform", "linear")),
+        ):
+            if value not in known:
+                raise ValueError(f"unsupported {name}: {value}")
 
     def sample_time(self, latents: Tensor) -> Tensor:
         """Draw and optionally shift one flow time per latent sample.
@@ -179,21 +198,21 @@ class SpeedrunObjective:
         """Corrupt latents and CLS features, run the model, and score losses.
 
         Args:
-          model: Called positionally as ``model(noisy, time, labels, cls_noisy)``.
-          latents: ``[B, ...]`` clean diffusion-space latents.
-          labels: ``[B]`` class labels.
-          teacher_features: Teacher token features per projection depth; the
-            last one's first token is the clean CLS feature.
-          time: ``[B]`` flow times; ``None`` draws them with :meth:`sample_time`.
-          noise: Latent noise; ``None`` draws standard normal noise.
-          cls_noise: CLS noise; ``None`` draws standard normal noise.
+          model: Student called as ``model(noisy, time, labels, cls_noisy)``.
+          latents: Clean latents ``[B, ...]``, any rank of at least two.
+          labels: Class labels ``[B]``.
+          teacher_features: Teacher tokens per projection depth; the last
+            carries the CLS token at position 0.
+          time: Flow times ``[B]``; sampled when omitted.
+          noise: Latent noise like ``latents``; sampled when omitted.
+          cls_noise: CLS noise ``[B, C]``; sampled when omitted.
 
         Returns:
-          terms: The unreduced objective, its components, and the model output.
+          terms: Per-sample ``loss`` and its components, their batch-mean
+            ``mean_loss``, and the model output.
 
         Raises:
-          ValueError: ``labels`` and ``latents`` differ in batch size, or no
-            teacher feature map is given.
+          ValueError: Batch sizes differ, or no teacher features are given.
 
         """
         if latents.shape[0] != labels.shape[0]:
@@ -211,7 +230,9 @@ class SpeedrunObjective:
         cls_noisy = alpha[:, None] * cls_clean + sigma[:, None] * cls_noise
         cls_target = d_alpha[:, None] * cls_clean + d_sigma[:, None] * cls_noise
         output = model(noisy, time, labels, cls_noisy)
-        velocity = (output.velocity - target).square().mean(dim=(1, 2, 3))
+        velocity = (
+            (output.velocity - target).square().mean(dim=tuple(range(1, target.ndim)))
+        )
         cls = (output.cls_velocity - cls_target).square().mean(dim=1)
         projection = projection_loss(
             output.projections,

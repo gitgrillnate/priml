@@ -16,6 +16,7 @@ import os
 import sys
 
 from torch import nn
+from treekle import ReadError
 
 import pytest
 import torch
@@ -432,7 +433,7 @@ def test_load_hf_checkpoint_rejects_a_non_object_config(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text(json.dumps([1, 2]))
     torch.save({}, tmp_path / "pytorch_model.bin")
 
-    with pytest.raises(TypeError, match="dict"):
+    with pytest.raises(ReadError):
         load_hf_checkpoint(tmp_path, dtype=None)
 
 
@@ -470,7 +471,7 @@ def test_load_hf_checkpoint_rejects_a_non_object_remote_config(
     hf_model.config.to_dict.return_value = ["not", "an", "object"]
     monkeypatch.setattr(hub, "load_transformers_model", Mock(return_value=hf_model))
 
-    with pytest.raises(TypeError, match="cannot coerce"):
+    with pytest.raises(ReadError):
         load_hf_checkpoint("org/tiny", dtype=None)
 
 
@@ -551,7 +552,7 @@ def test_load_torch_hub_distributed_rank_zero_broadcasts_success() -> None:
         result = hub.load_torch_hub_distributed("owner/repo", "entry")
 
     assert result is model
-    load.assert_called_once_with("owner/repo", "entry")
+    load.assert_called_once_with("owner/repo", "entry", skip_validation=False)
     broadcast.assert_called_once_with([None], src=0)
 
 
@@ -568,7 +569,7 @@ def test_load_torch_hub_distributed_nonzero_rank_loads_after_broadcast() -> None
         result = hub.load_torch_hub_distributed("owner/repo", "entry")
 
     assert result is model
-    load.assert_called_once_with("owner/repo", "entry")
+    load.assert_called_once_with("owner/repo", "entry", skip_validation=False)
     broadcast.assert_called_once_with([None], src=0)
 
 
@@ -590,8 +591,34 @@ def test_torch_hub_distributed_loads_directly_without_process_group(
         result = hub.load_torch_hub_distributed("owner/repo", "entry")
 
     assert result is model
-    load.assert_called_once_with("owner/repo", "entry")
+    load.assert_called_once_with("owner/repo", "entry", skip_validation=False)
     broadcast.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("initialized", "rank"),
+    [(False, 0), (True, 0), (True, 1)],
+)
+def test_load_torch_hub_distributed_forwards_skip_validation(
+    initialized: bool,
+    rank: int,
+) -> None:
+    model = nn.Linear(2, 3)
+    with (
+        patch("torch.distributed.is_available", return_value=True),
+        patch("torch.distributed.is_initialized", return_value=initialized),
+        patch("torch.distributed.get_rank", return_value=rank),
+        patch("torch.distributed.broadcast_object_list"),
+        patch("torch.hub.load", return_value=model) as load,
+    ):
+        result = hub.load_torch_hub_distributed(
+            "owner/repo:0123abc",
+            "entry",
+            skip_validation=True,
+        )
+
+    assert result is model
+    load.assert_called_once_with("owner/repo:0123abc", "entry", skip_validation=True)
 
 
 def test_load_torch_hub_distributed_broadcasts_remote_failure() -> None:
@@ -702,6 +729,6 @@ def test_load_transformers_model_fallback_keeps_caller_options() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

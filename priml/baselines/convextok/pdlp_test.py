@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Final, cast, override
 
 import math
+import re
 
 import numpy as np
 import pytest
@@ -98,17 +99,6 @@ def test_iteration_limit_stops_unconverged() -> None:
     config = Pdlp.Config()
     config.iteration_limit = 10
     result = config.make()(_program(0))
-    assert not result.optimal
-
-
-def test_restart_state_is_used_before_a_negative_period_restarts() -> None:
-    config = Pdlp.Config()
-    config.restart_period = -1
-    config.iteration_limit = 2
-
-    result = config.make()(_small_program())
-
-    assert result.iterations == 2
     assert not result.optimal
 
 
@@ -216,44 +206,33 @@ def test_necessary_reduction_tracks_rising_error() -> None:
     assert result.primal_weight == pytest.approx(0.2082765327409026, rel=1e-12)
 
 
-def test_sufficient_reduction_thresholds_select_restarts() -> None:
-    weights: list[float] = []
-    for reduction in (
-        0.1,
-        0.2,
-        0.21,
-        0.22,
-        0.23,
-        0.24,
-        0.25,
-        0.3,
-        0.35,
-        0.36,
-        0.37,
-        0.38,
-        0.39,
-        0.4,
-        0.45,
-        0.5,
-        1.0,
-        2.0,
-        100.0,
-    ):
-        config = Pdlp.Config()
-        config.tolerance = 1e-12
-        config.iteration_limit = 20
-        config.restart_period = 4
-        config.sufficient_reduction = reduction
-        config.necessary_reduction = 0.0
-        config.artificial_restart = 100.0
-        weights.append(config.make()(_small_program()).primal_weight)
-
-    assert weights == pytest.approx(
-        [
-            *([0.086306313778881] * 4),
-            *([0.05797185827273946] * 5),
-            *([0.01699754655360023] * 10),
-        ],
+@pytest.mark.parametrize(
+    ("reduction", "weight"),
+    [
+        *((reduction, 0.086306313778881) for reduction in (0.1, 0.2, 0.21, 0.22)),
+        *(
+            (reduction, 0.05797185827273946)
+            for reduction in (0.23, 0.24, 0.25, 0.3, 0.35)
+        ),
+        *(
+            (reduction, 0.01699754655360023)
+            for reduction in (0.36, 0.37, 0.38, 0.39, 0.4, 0.45, 0.5, 1.0, 2.0, 100.0)
+        ),
+    ],
+)
+def test_sufficient_reduction_thresholds_select_restarts(
+    reduction: float,
+    weight: float,
+) -> None:
+    config = Pdlp.Config()
+    config.tolerance = 1e-12
+    config.iteration_limit = 20
+    config.restart_period = 4
+    config.sufficient_reduction = reduction
+    config.necessary_reduction = 0.0
+    config.artificial_restart = 100.0
+    assert config.make()(_small_program()).primal_weight == pytest.approx(
+        weight,
         rel=1e-12,
     )
 
@@ -770,7 +749,96 @@ def _npz(name: str) -> np.lib.npyio.NpzFile:
     return loaded
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("restart_period", 0, "restart_period must be at least 1; got 0."),
+        ("restart_period", -1, "restart_period must be at least 1; got -1."),
+        ("iteration_limit", -1, "iteration_limit must be nonnegative; got -1."),
+        ("ruiz_iterations", -1, "ruiz_iterations must be nonnegative; got -1."),
+        ("tolerance", -1.0, "tolerance must be nonnegative; got -1.0."),
+        ("tolerance", math.nan, "tolerance must be nonnegative; got nan."),
+    ],
+)
+def test_invalid_settings_are_rejected_at_construction(
+    field: str,
+    value: float,
+    message: str,
+) -> None:
+    config = Pdlp.Config()
+    setattr(config, field, value)
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+        config.make()
+
+
+def test_unit_restart_period_decides_a_restart_every_iteration() -> None:
+    config = Pdlp.Config()
+    config.restart_period = 1
+    config.iteration_limit = 2
+
+    result = config.make()(_small_program())
+
+    assert result.iterations == 2
+    assert not result.optimal
+
+
+def test_the_default_solve_is_bounded() -> None:
+    # Nothing but the limit ends a solve of an infeasible program, so an
+    # unbounded default would spin forever on one.
+    limit = Pdlp.Config().iteration_limit
+    assert limit >= 0
+
+
+def test_an_infeasible_program_stops_unconverged_at_the_limit() -> None:
+    # One column pinned to 1 by its first row and to 2 by its second.
+    config = Pdlp.Config()
+    config.iteration_limit = 30
+
+    result = config.make()(_infeasible_program())
+
+    assert not result.optimal
+    assert result.iterations == 30
+
+
+def test_check_cadence_keeps_growing_past_one_hundred_thousand() -> None:
+    assert _check_interval(100_000) == 10_000
+    assert "every 1,000 beyond" not in (pdlp.__doc__ or "")
+
+
+def test_a_zero_constraint_matrix_solves() -> None:
+    program = replace(
+        _feasible_zero_program(),
+        values=torch.zeros(2, dtype=torch.float64),
+        objective=torch.tensor([1.0, -1.0, 0.5], dtype=torch.float64),
+    )
+
+    result = Pdlp.Config().make()(program)
+
+    assert result.optimal
+    assert result.step_size == 0.998
+    torch.testing.assert_close(
+        result.primal,
+        torch.tensor([0.0, 1.0, 0.0], dtype=torch.float64),
+        rtol=0.0,
+        atol=1e-4,
+    )
+
+
+def _infeasible_program() -> LinearProgram:
+    return LinearProgram(
+        crow_indices=torch.tensor([0, 1, 2]),
+        col_indices=torch.tensor([0, 0]),
+        values=torch.ones(2, dtype=torch.float64),
+        num_columns=1,
+        row_lower=torch.tensor([1.0, 2.0], dtype=torch.float64),
+        row_upper=torch.tensor([1.0, 2.0], dtype=torch.float64),
+        objective=torch.zeros(1, dtype=torch.float64),
+        lower=torch.zeros(1, dtype=torch.float64),
+        upper=torch.full((1,), 3.0, dtype=torch.float64),
+    )
+
+
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)
