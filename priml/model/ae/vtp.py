@@ -31,6 +31,7 @@ import torch
 
 from priml.cost import (
     Cost,
+    cost,
     elementwise_cost,
     matmul_cost,
     reduction_cost,
@@ -169,7 +170,7 @@ class Encoder(nn.Module):
         def cost(
             self,
             *,
-            image_size: int,
+            input_grid: int,
             batch_size: int,
             dtype: torch.dtype | None,
             dtype_autocast: torch.dtype | None = None,
@@ -182,7 +183,7 @@ class Encoder(nn.Module):
             in ``dtype``.
 
             Args:
-              image_size: Image side ``S``.
+              input_grid: Image side ``S``.
               batch_size: Images per invocation.
               dtype: The weights' dtype; ``None`` is torch's default.
               dtype_autocast: The autocast dtype; ``None`` runs all in ``dtype``.
@@ -192,16 +193,16 @@ class Encoder(nn.Module):
               cost: Integer FLOPs and logical bytes for the complete invocation.
 
             Raises:
-              ValueError: ``image_size`` is not a multiple of ``patch_size``.
+              ValueError: ``input_grid`` is not a multiple of ``patch_size``.
 
             """
             del kwargs
-            if image_size % self.patch_size:
+            if input_grid % self.patch_size:
                 raise ValueError(
-                    f"image_size {image_size} must be divisible by "
+                    f"input_grid {input_grid} must be divisible by "
                     f"patch_size {self.patch_size}.",
                 )
-            side = image_size // self.patch_size
+            side = input_grid // self.patch_size
             width = self.channels_hidden
             compute = dtype if dtype_autocast is None else dtype_autocast
             patch_embed = conv_cost(
@@ -211,7 +212,7 @@ class Encoder(nn.Module):
                 ndim=2,
                 groups=1,
                 bias=True,
-                input_grid=(image_size, image_size),
+                input_grid=(input_grid, input_grid),
                 batch_size=batch_size,
                 stride=self.patch_size,
                 padding=0,
@@ -350,7 +351,7 @@ class Decoder(nn.Module):
         def cost(
             self,
             *,
-            latent_size: int,
+            input_grid: int,
             batch_size: int,
             dtype: torch.dtype | None,
             **kwargs: object,
@@ -358,7 +359,7 @@ class Decoder(nn.Module):
             """Cost one forward and backward on ``[batch_size, channels_in, s, s]``.
 
             Args:
-              latent_size: Latent side ``s``.
+              input_grid: Latent side ``s``.
               batch_size: Latents per invocation.
               dtype: Activation dtype; ``None`` is torch's default.
               **kwargs: The open bus, unread.
@@ -369,7 +370,7 @@ class Decoder(nn.Module):
             """
             del kwargs
             width = self.channels_hidden
-            grid = (latent_size, latent_size)
+            grid = (input_grid, input_grid)
             proj_in = conv_cost(
                 channels_in=self.channels_in,
                 channels_out=width,
@@ -388,7 +389,7 @@ class Decoder(nn.Module):
                 heads=self.heads,
                 expansion=self.expansion,
                 num_layers=self.num_layers,
-                side=latent_size,
+                side=input_grid,
                 prefix=0,
                 batch_size=batch_size,
                 dtype=dtype,
@@ -546,11 +547,15 @@ class VTP(nn.Module):
                 decoder=decoder,
                 image_size=from_plain(config["image_size"], int),
             )
-            # Each published size has its own statistics; match by architecture.
+            # Each published size has its own statistics; match by architecture. No
+            # statistics exist for any other, so its normalizer refuses to build
+            # rather than standardize with another size's.
+            parsed.latent_norm = ChannelLatentStats.Config()
             for size in PUBLISHED:
                 published = _published(size)
                 if _architecture(published) == _architecture(parsed):
                     parsed.latent_norm = published.latent_norm
+                    break
             return parsed
 
         def latent_shape(self) -> tuple[int, int, int]:
@@ -582,22 +587,33 @@ class VTP(nn.Module):
             Args:
               batch_size: Images per invocation.
               dtype: The weights' dtype; ``None`` is torch's default.
-              **kwargs: The open bus, unread.
+              **kwargs: The open bus, forwarded to both halves.
 
             Returns:
               cost: Primal integer FLOPs and logical bytes.
 
             """
-            del kwargs
             if self.encoder is None or self.decoder is None:
                 raise ValueError("VTP.Config.cost prices both halves; one is None.")
             channels, side, _ = self.latent_shape()
-            full = self.encoder.cost(
-                image_size=self.image_size,
-                batch_size=batch_size,
-                dtype=dtype,
-                dtype_autocast=self.dtype_autocast,
-            ) + self.decoder.cost(latent_size=side, batch_size=batch_size, dtype=dtype)
+            full = cost(
+                self.encoder,
+                **{
+                    **kwargs,
+                    "input_grid": self.image_size,
+                    "batch_size": batch_size,
+                    "dtype": dtype,
+                    "dtype_autocast": self.dtype_autocast,
+                },
+            ) + cost(
+                self.decoder,
+                **{
+                    **kwargs,
+                    "input_grid": side,
+                    "batch_size": batch_size,
+                    "dtype": dtype,
+                },
+            )
             autocast = self.dtype_autocast
             if autocast is not None and autocast != resolve_dtype(dtype):
                 latents = batch_size * channels * side * side
@@ -654,13 +670,11 @@ class VTP(nn.Module):
                 "VTP needs finite pixel statistics and a nonzero std; got mean "
                 f"{config.pixel_mean}, std {config.pixel_std}.",
             )
-        patch = (
-            config.encoder.patch_size
-            if config.encoder is not None
-            else config.decoder.upscale_factor
-            if config.decoder is not None
-            else 0
-        )
+        if config.encoder is not None:
+            patch = config.encoder.patch_size
+        else:
+            assert config.decoder is not None
+            patch = config.decoder.upscale_factor
         if config.image_size % patch:
             raise ValueError(
                 f"image_size {config.image_size} must be divisible by patch_size {patch}.",

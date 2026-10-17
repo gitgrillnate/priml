@@ -316,6 +316,19 @@ def test_cost_matches_torch_for_a_forward_round_trip() -> None:
     assert analytical["flops", "primal", "elementwise"].sum() > 0
 
 
+def test_cost_prices_the_pixel_maps_at_the_configured_channels() -> None:
+    """Grayscale in: the uint8 read and the float maps cover one channel, not three."""
+    rgb, gray = tiny(), tiny()
+    assert gray.encoder is not None
+    gray.encoder.channels_in = 1
+    rgb_cost, gray_cost = (
+        cost(config, batch_size=2, dtype=None) for config in (rgb, gray)
+    )
+    pixels = 2 * 16 * 16
+    key = ("bytes", "primal", "elementwise", torch.uint8)
+    assert rgb_cost[key] - gray_cost[key] == 2 * pixels
+
+
 def _round_trip_decode(module: nn.Module, image: Tensor) -> Tensor:
     assert isinstance(module, INVAE)
     return module.decode(module.encode(image).sample())

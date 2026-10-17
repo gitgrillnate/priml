@@ -957,8 +957,7 @@ class DecodeVideo:
             except OSError:
                 return None
             stdout = process.stdout
-            if stdout is None:
-                raise ValueError("Popen(stdout=PIPE) always sets it.")
+            assert stdout is not None
             frame_bytes = height * width * 3
             chunks: list[bytes] = []
             try:

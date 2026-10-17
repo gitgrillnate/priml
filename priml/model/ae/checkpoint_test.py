@@ -234,6 +234,29 @@ class _Response(io.BytesIO):
     headers: ClassVar[dict[str, str]] = {}
 
 
+def test_a_verified_file_is_hashed_once_until_it_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both halves of an autoencoder verify one weights file."""
+    path, digest = _file(tmp_path)
+    hashed: list[Path] = []
+
+    def counting_sha256(target: Path) -> str:
+        hashed.append(target)
+        return sha256_file(target)
+
+    monkeypatch.setattr("priml.model.ae.checkpoint.sha256_file", counting_sha256)
+    source = LocalFile.Config(path=path, sha256=digest)
+    for _ in range(2):
+        _ = source.make().path()
+    assert len(hashed) == 1
+    _ = path.write_bytes(b"other weights")
+    with pytest.raises(RuntimeError, match="hashes to"):
+        _ = source.make().path()
+    assert len(hashed) == 2
+
+
 def test_sha256_file_matches_hashlib(tmp_path: Path) -> None:
     path, digest = _file(tmp_path, payload=b"x" * 100_000)
     assert sha256_file(path) == digest

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 from urllib import parse
 
+import functools
 import hashlib
 import re
 
@@ -324,6 +325,22 @@ def verify_sha256(path: Path, expected: str) -> None:
     """
     if not expected:
         return
+    stat = path.stat()
+    _verify_sha256(
+        path.resolve(),
+        size=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+        expected=expected,
+    )
+
+
+# Both halves of an autoencoder read one weights file; without the cache, every build
+# hashed that file once per half. The size and mtime in the key re-verify a file
+# rewritten in place. A mismatch raises, and ``cache`` does not store exceptions.
+@functools.cache
+def _verify_sha256(path: Path, *, size: int, mtime_ns: int, expected: str) -> None:
+    """Raise unless ``path`` hashes to ``expected``; remembered per file version."""
+    del size, mtime_ns
     actual = sha256_file(path)
     if actual != expected:
         raise RuntimeError(

@@ -425,7 +425,9 @@ class INVAE(nn.Module):
             if self.encoder is None or self.decoder is None:
                 raise ValueError("INVAE.Config.cost prices both halves; one is None.")
             channels, side, _ = self.latent_shape()
-            pixels = batch_size * 3 * self.image_size**2
+            area = batch_size * self.image_size**2
+            pixels_in = area * self.encoder.channels_in
+            pixels_out = area * self.decoder.channels_out
             latents = batch_size * channels * side * side
             f32 = torch.float32
             full = (
@@ -451,11 +453,16 @@ class INVAE(nn.Module):
                 + traffic(
                     "primal",
                     kernel="elementwise",
-                    elements=pixels,
+                    elements=pixels_in,
                     dtype=torch.uint8,
                 )
-                + traffic("primal", kernel="elementwise", elements=pixels, dtype=f32)
-                + _pointwise(pixels, flops=1, dtype=f32).tile(2)
+                + traffic(
+                    "primal",
+                    kernel="elementwise",
+                    elements=pixels_in,
+                    dtype=f32,
+                )
+                + _pointwise(pixels_in, flops=1, dtype=f32).tile(2)
                 # Clamp the log-variance; ``exp(0.5 * logvar)``.
                 + _pointwise(latents, flops=2, dtype=dtype)
                 + _pointwise(latents, flops=1, dtype=dtype).tile(2)
@@ -463,8 +470,8 @@ class INVAE(nn.Module):
                 + traffic("primal", kernel="elementwise", elements=latents, dtype=dtype)
                 + _pointwise(latents, flops=1, inputs=2, dtype=dtype).tile(2)
                 # ``(x + 1) / 2`` and a two-sided clamp out.
-                + _pointwise(pixels, flops=1, dtype=dtype).tile(2)
-                + _pointwise(pixels, flops=2, dtype=dtype)
+                + _pointwise(pixels_out, flops=1, dtype=dtype).tile(2)
+                + _pointwise(pixels_out, flops=2, dtype=dtype)
             )
             return Cost(
                 cells=full.only("primal").cells,

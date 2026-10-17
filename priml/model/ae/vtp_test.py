@@ -177,11 +177,12 @@ def test_from_hf_parses_each_published_architecture_into_its_factory(
     assert parsed.latent_shape() == (64, 16, 16)
 
 
-def test_from_hf_of_an_unpublished_architecture_keeps_the_default_statistics() -> None:
+def test_from_hf_of_an_unpublished_architecture_has_no_statistics() -> None:
     hf = _json("vtp_small_config.json")
     hf["vision_depth"] = 3
     parsed = VTP.Config.from_hf(hf)
-    assert parsed.latent_norm == VTP.Config().latent_norm
+    with pytest.raises(ValueError, match="needs a stats file"):
+        _ = parsed.latent_norm.make()
 
 
 def test_published_halves_load_exactly_the_published_tensors() -> None:
@@ -420,7 +421,7 @@ def test_encoder_keeps_the_norms_in_the_weights_dtype_under_autocast() -> None:
     config = tiny().encoder
     assert config is not None
     analytical = config.cost(
-        image_size=8,
+        input_grid=8,
         batch_size=2,
         dtype=None,
         dtype_autocast=torch.bfloat16,
@@ -446,7 +447,7 @@ def test_encoder_cost_matches_torch() -> None:
         analytical = assert_cost_matches_torch(
             config,
             build_input=lambda: torch.randn(2, 3, 8, 8, requires_grad=True),
-            image_size=8,
+            input_grid=8,
             batch_size=2,
             dtype=None,
         )
@@ -460,7 +461,7 @@ def test_decoder_cost_matches_torch() -> None:
         analytical = assert_cost_matches_torch(
             config,
             build_input=lambda: torch.randn(2, 4, 2, 2, requires_grad=True),
-            latent_size=2,
+            input_grid=2,
             batch_size=2,
             dtype=None,
         )
@@ -487,11 +488,11 @@ def test_cost_charges_the_decoder_cast_under_autocast() -> None:
     assert config.decoder is not None
     analytical = cost(config, batch_size=2, dtype=None)
     parts = config.encoder.cost(
-        image_size=8,
+        input_grid=8,
         batch_size=2,
         dtype=None,
         dtype_autocast=torch.bfloat16,
-    ) + config.decoder.cost(latent_size=2, batch_size=2, dtype=None)
+    ) + config.decoder.cost(input_grid=2, batch_size=2, dtype=None)
     latents = 2 * 4 * 2 * 2
     assert (
         analytical["bytes", "primal", "elementwise", torch.bfloat16]
@@ -503,7 +504,7 @@ def test_encoder_cost_rejects_a_side_off_the_patch_grid() -> None:
     config = tiny().encoder
     assert config is not None
     with pytest.raises(ValueError, match="divisible by patch_size 4"):
-        _ = config.cost(image_size=10, batch_size=2, dtype=None)
+        _ = config.cost(input_grid=10, batch_size=2, dtype=None)
 
 
 def _decode_encode(module: nn.Module, image: Tensor) -> Tensor:
