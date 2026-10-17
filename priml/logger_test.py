@@ -17,6 +17,7 @@ from priml import logger
 from priml.logger import (
     CustomFormatter,
     Timer,
+    _ReplayBufferHandler,
     _StdoutStreamHandler,
     bind_logging_to_current_stdout,
     replay_buffered_logs,
@@ -469,6 +470,49 @@ class TestReplayBufferedLogs:
         # Second call is a no-op (no buffer left).
         replay_buffered_logs()
         assert len(root.handlers) == 1
+
+    def test_buffer_stops_at_capacity_without_replay(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A run that never replays must not keep every record it logs."""
+        monkeypatch.setattr(logger, "_REPLAY_BUFFER_CAPACITY", 3)
+        root = logging.getLogger()
+        root.handlers.clear()
+        setup_logging(level="INFO")
+        stream, buffer = root.handlers
+        assert isinstance(stream, _StdoutStreamHandler)
+        assert isinstance(buffer, _ReplayBufferHandler)
+        stream.setStream(io.StringIO())
+
+        for step in range(10):
+            logging.getLogger("test.capacity").info("step %d", step)
+
+        assert [record.getMessage() for record in buffer.records] == [
+            "step 0",
+            "step 1",
+            "step 2",
+        ]
+
+    def test_replay_notes_records_past_capacity(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Replay says how many records it no longer holds."""
+        monkeypatch.setattr(logger, "_REPLAY_BUFFER_CAPACITY", 2)
+        logging.getLogger().handlers.clear()
+        setup_logging(level="INFO")
+        for step in range(5):
+            logging.getLogger("test.capacity").info("step %d", step)
+        capsys.readouterr()
+
+        replay_buffered_logs()
+
+        replayed = capsys.readouterr().out
+        assert "step 1" in replayed
+        assert "step 2" not in replayed
+        assert "3 later records not replayed" in replayed
 
     def test_replay_without_setup_is_noop(self) -> None:
         """Replay with no buffer installed does nothing and does not raise."""

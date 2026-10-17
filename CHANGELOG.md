@@ -127,6 +127,11 @@ All notable priml changes are documented here. This project follows
 - Indexing `CompositeOptimizer.state` with a parameter that has no entry yet
   creates the entry on its member, as torch's defaultdict does, instead of
   raising `KeyError`. `filter_name` no longer returns a memory address.
+- `setup_logging`'s startup replay buffer keeps at most 10,000 records. It
+  used to keep every record for the life of the process unless a W&B tracker
+  replayed it, which is off by default, so a run held each step line and any
+  exception traceback (frames included) until exit. A replay past the cap
+  says how many records it skipped.
 
 ## 0.1.6 - 2026-10-07
 
