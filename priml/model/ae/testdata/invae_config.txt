@@ -1,0 +1,34 @@
+INVAE.Config(
+        encoder=Encoder.Config(
+            channels_in=3,
+            channels_hidden=(128, 128, 256, 256, 512),
+            blocks_per_stage=2,
+            attention=(False, False, False, False, True),
+            channels_latent=32,
+            num_groups=32,
+            eps=1e-06,
+            checkpoint=HubFile.Config(
+                repo_id='REPA-E/e2e-invae-hf',
+                filename='diffusion_pytorch_model.safetensors',
+                revision='523ddf74b061c01ed0aebb7904c6bdb2f33e06d0',
+                sha256='6b1f754e414a841893fd242ca233c5aeec4bbdb7d2eeab2f7956adf48742e500'
+            )
+        ),
+        decoder=Decoder.Config(
+            channels_out=3,
+            channels_hidden=(128, 128, 256, 256, 512),
+            blocks_per_stage=3,
+            attention=(False, False, False, False, True),
+            channels_latent=32,
+            num_groups=32,
+            eps=1e-06,
+            checkpoint=HubFile.Config(
+                repo_id='REPA-E/e2e-invae-hf',
+                filename='diffusion_pytorch_model.safetensors',
+                revision='523ddf74b061c01ed0aebb7904c6bdb2f33e06d0',
+                sha256='6b1f754e414a841893fd242ca233c5aeec4bbdb7d2eeab2f7956adf48742e500'
+            )
+        ),
+        image_size=256,
+        latent_norm=ScaleLatents.Config(scale=0.3099)
+    )

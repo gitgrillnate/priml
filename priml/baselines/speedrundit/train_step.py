@@ -14,8 +14,8 @@ import torch
 from priml.baselines.speedrundit.model import ModelOutput, SpeedrunDiT
 from priml.baselines.speedrundit.objective import LossTerms, SpeedrunObjective
 from priml.baselines.speedrundit.optimizers import speedrundit_optimizer
+from priml.model.ae.latent_norm import LatentNormalizer
 from priml.model.dinov2 import DinoV2Teacher
-from priml.model.vision_ae.custom_types import LatentNormalizer
 from priml.train.custom_types import EMAProtocol
 from priml.train.ema import EMA
 from priml.train.train_step import TrainStep, _assert_uniform_microbatch_count

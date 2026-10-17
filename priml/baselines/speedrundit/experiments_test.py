@@ -21,9 +21,9 @@ from priml.baselines.speedrundit.experiments import (
     exp_smoke,
 )
 from priml.baselines.speedrundit.latent_codec import FloatCodec, ScalarTableCodec
-from priml.model.vision_ae.latent_norm import ChannelLatentStats
-from priml.model.vision_ae.rae import RAE
-from priml.model.vision_ae.vtp import VTP
+from priml.model.ae.latent_norm import ChannelLatentStats
+from priml.model.ae.rae import RAE
+from priml.model.ae.vtp import VTP
 from priml.optimizers.composite import CompositeOptimizer
 from priml.optimizers.muon import Muon
 from priml.runtime import SingleProcess
@@ -153,6 +153,13 @@ def test_exp004_changes_only_the_storage_codec() -> None:
 def test_every_experiment_finalizes_without_reading_files() -> None:
     for recipe in (exp000, exp001, exp002, exp003, exp004, exp_smoke):
         assert recipe().copy_tree().finalize() is not None
+
+
+def test_a_step_latent_norm_set_by_hand_is_kept() -> None:
+    config = exp000()
+    config.step.latent_norm = ChannelLatentStats.Config()
+    finalized = config.copy_tree().finalize()
+    assert finalized.step.latent_norm == ChannelLatentStats.Config()
 
 
 if __name__ == "__main__":

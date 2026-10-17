@@ -9,11 +9,11 @@ from torch import Tensor
 import pytest
 import torch
 
-from priml.model.vision_ae.checkpoint import LocalFile
-from priml.model.vision_ae.custom_types import LatentNormalizer
-from priml.model.vision_ae.latent_norm import (
+from priml.model.ae.checkpoint import LocalFile
+from priml.model.ae.latent_norm import (
     ChannelLatentStats,
     ElementwiseLatentStats,
+    LatentNormalizer,
     ScaleLatents,
 )
 

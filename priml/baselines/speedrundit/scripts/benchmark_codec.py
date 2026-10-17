@@ -68,7 +68,8 @@ if TYPE_CHECKING:
 
     from priml.baselines.speedrundit.latent_codec import LatentCodec
     from priml.baselines.speedrundit.scripts.prepare_data import Record
-    from priml.model.vision_ae.custom_types import Autoencoder, LatentNormalizer
+    from priml.model.ae.custom_types import Autoencoder
+    from priml.model.ae.latent_norm import LatentNormalizer
 else:
     from wrapt import lazy_import
 
@@ -311,6 +312,7 @@ def run(
             device=device,
             batch_size=batch_size,
             latent_shape=config.autoencoder.latent_shape(),
+            sample=config.sample,
         )
         for chosen_records in (fit_records, eval_records)
     )
@@ -358,7 +360,7 @@ def main() -> int:
 
     """
     parser = argparse.ArgumentParser(
-        description=(__doc__ or "").split("\n", 2)[2],
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_arguments(parser)
@@ -415,6 +417,7 @@ def _encode_all(
     device: str,
     batch_size: int,
     latent_shape: tuple[int, int, int],
+    sample: bool,
 ) -> Tensor:
     """Encode records to one float32 CPU tensor."""
     return torch.cat(
@@ -424,6 +427,7 @@ def _encode_all(
                 images=images,
                 device=device,
                 latent_shape=latent_shape,
+                sample=sample,
             )
             for _, images in batches(
                 listed,

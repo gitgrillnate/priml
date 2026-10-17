@@ -28,11 +28,10 @@ from priml.baselines.speedrundit.latent_codec import (
     FloatCodec,
     ScalarTableCodec,
 )
-from priml.model.vision_ae.custom_types import posterior_mode
-from priml.model.vision_ae.invae import INVAE
-from priml.model.vision_ae.latent_norm import ScaleLatents
-from priml.model.vision_ae.rae import RAE, rae_dinov2_base
-from priml.model.vision_ae.vtp import VTP
+from priml.model.ae.invae import INVAE
+from priml.model.ae.latent_norm import ScaleLatents
+from priml.model.ae.rae import RAE, rae_dinov2_base
+from priml.model.ae.vtp import VTP
 
 
 if TYPE_CHECKING:
@@ -74,7 +73,7 @@ def test_non_finite_latents_are_refused_before_publication(
 
 def test_identity_collects_only_encoding_checkpoints() -> None:
     """Raw encoding depends on the encoder, not on decoding or normalization."""
-    identity = autoencoder_identity(rae_dinov2_base())
+    identity = autoencoder_identity(rae_dinov2_base(), sample=True)
     encoding = from_plain(identity["encoding"], dict[str, object])
     assert "decoder" not in encoding
     assert "latent_norm" not in encoding
@@ -82,27 +81,30 @@ def test_identity_collects_only_encoding_checkpoints() -> None:
     assert identity["latent_shape"] == [768, 16, 16]
 
 
-def test_encoding_policy_is_part_of_identity() -> None:
-    assert autoencoder_identity(INVAE.Config()) != autoencoder_identity(
-        INVAE.Config(latent_fn=posterior_mode),
+def test_draw_or_mode_is_part_of_identity() -> None:
+    assert autoencoder_identity(INVAE.Config(), sample=True) != autoencoder_identity(
+        INVAE.Config(),
+        sample=False,
     )
 
 
 def test_normalization_and_decoding_do_not_change_raw_identity() -> None:
     config = RAE.Config()
-    before = autoencoder_identity(config)
+    before = autoencoder_identity(config, sample=True)
     config.latent_norm = ScaleLatents.Config()
-    config.decoder.checkpoint = None
-    assert autoencoder_identity(config) == before
+    config.decoder = None
+    assert autoencoder_identity(config, sample=True) == before
 
 
-def test_vtp_pixel_decoder_does_not_change_raw_identity() -> None:
+def test_vtp_decoder_does_not_change_raw_identity() -> None:
     config = VTP.Config()
-    before = autoencoder_identity(config)
-    config.pixel_decoder.num_layers = 1
-    assert autoencoder_identity(config) == before
-    config.trunk.patch_size = 8
-    assert autoencoder_identity(config) != before
+    before = autoencoder_identity(config, sample=True)
+    config.decoder = None
+    assert autoencoder_identity(config, sample=True) == before
+    config.encoder = VTP.Config().encoder
+    assert config.encoder is not None
+    config.encoder.patch_size = 8
+    assert autoencoder_identity(config, sample=True) != before
 
 
 def test_interrupted_save_does_not_publish_partial_latent(
@@ -128,6 +130,7 @@ def test_a_matching_receipt_verifies(tmp_path: Path) -> None:
     _ = write_receipt(
         tmp_path,
         autoencoder=autoencoder,
+        sample=True,
         codec_config=codec_config,
         codec=codec,
         table_sha256=None,
@@ -136,6 +139,7 @@ def test_a_matching_receipt_verifies(tmp_path: Path) -> None:
     verify_receipt(
         tmp_path,
         autoencoder=autoencoder,
+        sample=True,
         codec_config=codec_config,
         codec=codec,
         table_sha256=None,
@@ -147,6 +151,7 @@ def test_every_mismatched_identity_is_named(tmp_path: Path) -> None:
     _ = write_receipt(
         tmp_path,
         autoencoder=INVAE.Config(),
+        sample=True,
         codec_config=codec_config,
         codec=codec_config.make(),
         table_sha256=None,
@@ -157,12 +162,14 @@ def test_every_mismatched_identity_is_named(tmp_path: Path) -> None:
         verify_receipt(
             tmp_path,
             autoencoder=INVAE.Config(image_size=128),
+            sample=False,
             codec_config=other,
             codec=other.make(),
             table_sha256=None,
         )
     message = str(caught.value)
     assert "autoencoder.latent_shape" in message
+    assert "autoencoder.sample" in message
     assert "codec.stored_dtype" in message
 
 
@@ -187,6 +194,7 @@ def test_a_receipt_of_another_format_is_refused(tmp_path: Path) -> None:
     path = write_receipt(
         tmp_path,
         autoencoder=INVAE.Config(),
+        sample=True,
         codec_config=codec_config,
         codec=codec_config.make(),
         table_sha256=None,
@@ -198,6 +206,7 @@ def test_a_receipt_of_another_format_is_refused(tmp_path: Path) -> None:
         verify_receipt(
             tmp_path,
             autoencoder=INVAE.Config(),
+            sample=True,
             codec_config=codec_config,
             codec=codec_config.make(),
             table_sha256=None,
@@ -205,9 +214,11 @@ def test_a_receipt_of_another_format_is_refused(tmp_path: Path) -> None:
 
 
 def test_a_lambda_cannot_identify_a_corpus() -> None:
-    config = INVAE.Config(latent_fn=lambda posterior: posterior.mode())
+    config = RAE.Config()
+    assert config.encoder is not None
+    config.encoder.activation = lambda x: x
     with pytest.raises(ValueError, match="module-level function"):
-        _ = autoencoder_identity(config)
+        _ = autoencoder_identity(config, sample=True)
 
 
 def test_concurrent_writers_never_share_a_staging_file(tmp_path: Path) -> None:

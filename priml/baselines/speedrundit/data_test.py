@@ -26,7 +26,7 @@ from priml.baselines.speedrundit.data import (
     SpeedrunImageNetData,
 )
 from priml.baselines.speedrundit.latent_codec import FloatCodec, ScalarTableCodec
-from priml.model.vision_ae.invae import INVAE
+from priml.model.ae.invae import INVAE
 
 
 if TYPE_CHECKING:
@@ -113,9 +113,13 @@ def test_a_corpus_from_another_autoencoder_is_refused(tmp_path: Path) -> None:
     """A receipt naming other weights fails, and the message names the field."""
     _corpus(tmp_path, config=_source(tmp_path), count=2)
     autoencoder = INVAE.Config(image_size=32)
-    autoencoder.checkpoint = None
+    assert autoencoder.encoder is not None
+    autoencoder.encoder.checkpoint = None
     config = _source(tmp_path, autoencoder=autoencoder)
-    with pytest.raises(CorpusMismatchError, match=r"autoencoder\.encoding\.checkpoint"):
+    with pytest.raises(
+        CorpusMismatchError,
+        match=r"autoencoder\.encoding\.encoder\.checkpoint",
+    ):
         _ = config.make()
 
 
@@ -192,6 +196,7 @@ def test_a_uint8_corpus_decodes_through_its_table(tmp_path: Path) -> None:
     write_receipt(
         latent_dir,
         autoencoder=source.autoencoder,
+        sample=source.sample,
         codec_config=source.codec,
         codec=codec,
         table_sha256=save_table(latent_dir, codec=codec),
@@ -374,6 +379,7 @@ def _corpus(
     write_receipt(
         latent_dir,
         autoencoder=config.autoencoder,
+        sample=config.sample,
         codec_config=config.codec,
         codec=config.codec.make(),
         table_sha256=None,
@@ -400,6 +406,12 @@ def _assert_sequential_sampler(sampler: object) -> None:
 
 def _assert_distributed_sampler(sampler: object) -> None:
     assert isinstance(sampler, DistributedSampler)
+
+
+def test_a_source_base_dir_set_by_hand_is_kept(tmp_path: Path) -> None:
+    config = SpeedrunImageNetData.Config(base_dir=tmp_path)
+    config.source.base_dir = tmp_path / "elsewhere"
+    assert config.finalize().source.base_dir == tmp_path / "elsewhere"
 
 
 if __name__ == "__main__":

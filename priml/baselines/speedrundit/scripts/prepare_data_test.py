@@ -28,9 +28,9 @@ from priml.baselines.speedrundit.corpus import (
 from priml.baselines.speedrundit.data import PairedImageLatentDataset
 from priml.baselines.speedrundit.latent_codec import FloatCodec, ScalarTableCodec
 from priml.baselines.speedrundit.scripts import prepare_data
-from priml.model.vision_ae.custom_types import LatentNormalizer, posterior_mode
-from priml.model.vision_ae.invae_test import tiny
-from priml.model.vision_ae.latent_norm import ScaleLatents
+from priml.model.ae.distribution import PointMass
+from priml.model.ae.invae_test import tiny
+from priml.model.ae.latent_norm import LatentNormalizer, ScaleLatents
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -48,7 +48,7 @@ def test_prepared_corpus_loads_back_as_the_encoder_wrote_it(tmp_path: Path) -> N
     dataset = config.make()
     assert len(dataset) == 3
     sample = dataset[1]
-    expected = _MeanAutoencoder.Config().make().encode(sample["image"][None])[0]
+    expected = _MeanAutoencoder.Config().make().encode(sample["image"][None]).mode()[0]
     assert torch.equal(sample["latent"], expected)
 
 
@@ -168,7 +168,7 @@ def test_a_table_left_without_a_receipt_is_refitted_for_its_new_producer(
             prepare_data.prepare(config, imagenet=raw, device="cpu")
     directory = Path(config.working_dir) / config.latent_subdir
     orphan = table_path(directory).read_bytes()
-    config.autoencoder.latent_fn = posterior_mode
+    config.sample = False
     _ = prepare_data.prepare(config, imagenet=raw, device="cpu")
     assert table_path(directory).read_bytes() != orphan
     assert len(config.make()) == 3
@@ -270,9 +270,9 @@ def test_latents_of_the_wrong_shape_are_refused_before_publication(
     assert not any((Path(config.working_dir) / config.latent_subdir).rglob("*.npy"))
 
 
-def _three_channel_encode(model: nn.Module, images: Tensor) -> Tensor:
+def _three_channel_encode(model: nn.Module, images: Tensor) -> PointMass:
     del model
-    return torch.zeros(images.shape[0], 3, *_GRID)
+    return PointMass(torch.zeros(images.shape[0], 3, *_GRID))
 
 
 def test_fit_sample_is_distinct_sorted_and_in_range() -> None:
@@ -403,9 +403,9 @@ def test_non_finite_encoder_output_is_refused_before_coding(
     assert not table_path(Path(config.working_dir) / config.latent_subdir).exists()
 
 
-def _non_finite_encode(model: nn.Module, images: Tensor) -> Tensor:
+def _non_finite_encode(model: nn.Module, images: Tensor) -> PointMass:
     del model
-    return torch.full((images.shape[0], 4, *_GRID), float("nan"))
+    return PointMass(torch.full((images.shape[0], 4, *_GRID), float("nan")))
 
 
 def test_seeded_posterior_is_stable_after_resume(tmp_path: Path) -> None:
@@ -433,11 +433,11 @@ def test_seeded_posterior_is_stable_after_resume(tmp_path: Path) -> None:
 def test_an_unseeded_resume_encodes_with_the_same_random_weights(
     tmp_path: Path,
 ) -> None:
-    """``posterior_mode`` is deterministic, so only the weights can differ."""
+    """The mode is deterministic, so only the weights can differ."""
     raw = _imagenet(tmp_path, count=2)
     full, resumed = _source(tmp_path / "full"), _source(tmp_path / "resumed")
     full.autoencoder = tiny()
-    full.autoencoder.latent_fn = posterior_mode
+    full.sample = resumed.sample = False
     resumed.autoencoder = full.autoencoder.copy_tree()
     prepare_data.prepare(full, imagenet=raw, device="cpu", batch_size=1)
     prepare_data.prepare(resumed, imagenet=raw, device="cpu", batch_size=1, limit=1)
@@ -575,10 +575,10 @@ class _MeanAutoencoder(nn.Module):
         super().__init__()
         del config
 
-    def encode(self, image: Tensor, /) -> Tensor:
+    def encode(self, image: Tensor, /) -> PointMass:
         """Return ``[B, 4, 2, 3]`` pooled channel means."""
         means = functional.adaptive_avg_pool2d(image.float(), _GRID)
-        return torch.cat([means, means[:, :1]], dim=1)
+        return PointMass(torch.cat([means, means[:, :1]], dim=1))
 
     def decode(self, latent: Tensor, /) -> Tensor:
         """Return a flat image of the first three channels' means."""
@@ -587,7 +587,7 @@ class _MeanAutoencoder(nn.Module):
 
     @override
     def forward(self, image: Tensor) -> Tensor:
-        return self.encode(image)
+        return self.encode(image).mode()
 
 
 def _gradient(size: tuple[int, int]) -> Image.Image:

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import fields, is_dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final, Protocol, cast
 
 import hashlib
 import json
@@ -28,25 +28,26 @@ import os
 import tempfile
 import types
 
+from configgle import Makeable
 from configgle.pprinting import pformat
 from treekle import from_plain, json_loads
 
 import numpy as np
 import torch
 
-from priml.model.vision_ae.custom_types import CheckpointFile
+from priml.model.ae.checkpoint import CheckpointFile
+from priml.model.ae.custom_types import Autoencoder
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
     from typing import BinaryIO
 
-    from configgle import Makeable
     from numpy.typing import NDArray
     from torch import Tensor
 
     from priml.baselines.speedrundit.latent_codec import FittedCodec, LatentCodec
-    from priml.model.vision_ae.custom_types import VisionAutoencoderConfig
+    from priml.model.ae.latent_norm import LatentNormalizer
 
 
 RECEIPT: Final = "corpus.json"
@@ -58,14 +59,33 @@ CODEC_TABLE: Final = "codec.pt"
 LABELS: Final = "dataset.json"
 """The REG label manifest, beside the receipt."""
 
-FORMAT_VERSION: Final = 2
+FORMAT_VERSION: Final = 3
 """Bumped when the receipt's schema changes meaning."""
 
 PREPARING: Final = "preparing"
 """The provenance of a receipt pinned before preparation finished."""
 
 # Decode-only modules and diffusion normalization never produce raw latent bytes.
-_DECODE_FIELDS: Final = frozenset({"decoder", "pixel_decoder", "latent_norm"})
+_DECODE_FIELDS: Final = frozenset({"decoder", "latent_norm"})
+
+
+class AutoencoderConfig(Makeable[Autoencoder], Protocol):
+    """What the corpus reads from an autoencoder's config without building it.
+
+    Building one downloads gigabytes, so the geometry and the statistics that
+    belong to the checkpoint are stated on the config, where the dataset, the
+    preparer, and the training loop read them.
+    """
+
+    image_size: int
+    """Side of the square image the checkpoint was trained at."""
+
+    latent_norm: Makeable[LatentNormalizer]
+    """The normalizer published with this checkpoint; the autoencoder never applies it."""
+
+    def latent_shape(self) -> tuple[int, int, int]:
+        """Return ``(channels, height, width)`` of a latent at ``image_size``."""
+        ...
 
 
 class CorpusMismatchError(ValueError):
@@ -147,14 +167,19 @@ def load_stored(path: Path, dtype: torch.dtype) -> Tensor:
     return tensor
 
 
-def autoencoder_identity(config: VisionAutoencoderConfig) -> dict[str, object]:
+def autoencoder_identity(
+    config: AutoencoderConfig,
+    *,
+    sample: bool,
+) -> dict[str, object]:
     """Return what distinguishes one autoencoder's corpus from another's.
 
     Args:
       config: The experiment's autoencoder config.
+      sample: Whether the corpus stores a draw of each latent or its mode.
 
     Returns:
-      identity: Class, latent shape, and the encoding config tree.
+      identity: Class, latent shape, draw-or-mode, and the encoding config tree.
 
     Raises:
       ValueError: An encoding field holds a lambda or a closure, which print
@@ -164,6 +189,7 @@ def autoencoder_identity(config: VisionAutoencoderConfig) -> dict[str, object]:
     return {
         "class": _qualified(config),
         "latent_shape": list(config.latent_shape()),
+        "sample": sample,
         "encoding": _encoding_identity(config),
     }
 
@@ -251,7 +277,8 @@ def load_table(directory: Path, codec: FittedCodec) -> str:
 def write_receipt(
     directory: Path,
     *,
-    autoencoder: VisionAutoencoderConfig,
+    autoencoder: AutoencoderConfig,
+    sample: bool,
     codec_config: Makeable[LatentCodec],
     codec: LatentCodec,
     table_sha256: str | None,
@@ -262,6 +289,7 @@ def write_receipt(
     Args:
       directory: Latent directory.
       autoencoder: The autoencoder config that encoded the corpus.
+      sample: Whether the corpus stores a draw of each latent or its mode.
       codec_config: The codec config that stored it.
       codec: The built (and, if fitted, fitted) codec.
       table_sha256: Digest of the table, for a fitted codec.
@@ -276,7 +304,7 @@ def write_receipt(
     receipt = {
         "format": FORMAT_VERSION,
         "identity": {
-            "autoencoder": autoencoder_identity(autoencoder),
+            "autoencoder": autoencoder_identity(autoencoder, sample=sample),
             "codec": codec_identity(
                 codec_config,
                 codec=codec,
@@ -302,7 +330,8 @@ def write_receipt(
 def verify_receipt(
     directory: Path,
     *,
-    autoencoder: VisionAutoencoderConfig,
+    autoencoder: AutoencoderConfig,
+    sample: bool,
     codec_config: Makeable[LatentCodec],
     codec: LatentCodec,
     table_sha256: str | None,
@@ -312,6 +341,7 @@ def verify_receipt(
     Args:
       directory: Latent directory.
       autoencoder: The autoencoder the experiment declares.
+      sample: Whether the experiment reads a draw of each latent or its mode.
       codec_config: The codec the experiment declares.
       codec: The built codec (table loaded, if fitted).
       table_sha256: Digest of the loaded table, for a fitted codec.
@@ -340,7 +370,7 @@ def verify_receipt(
         )
     expected = _flatten(
         {
-            "autoencoder": autoencoder_identity(autoencoder),
+            "autoencoder": autoencoder_identity(autoencoder, sample=sample),
             "codec": codec_identity(
                 codec_config,
                 codec=codec,
@@ -378,7 +408,8 @@ def mismatches(
         for key in sorted(recorded.keys() | expected.keys())
         if key not in recorded
         or key not in expected
-        or _jsonable(recorded[key]) != _jsonable(expected[key])
+        or cast(object, json.loads(json.dumps(recorded[key], default=str)))
+        != cast(object, json.loads(json.dumps(expected[key], default=str)))
     ]
 
 
@@ -427,11 +458,6 @@ def _flatten(value: object, prefix: str = "") -> dict[str, object]:
     for key, child in cast("dict[str, object]", value).items():
         flat |= _flatten(child, prefix=f"{prefix}.{key}" if prefix else key)
     return flat
-
-
-def _jsonable(value: object) -> object:
-    """Return ``value`` as a JSON round trip would, so tuples compare as lists."""
-    return cast(object, json.loads(json.dumps(value, default=str)))
 
 
 def _sha256(path: Path) -> str:

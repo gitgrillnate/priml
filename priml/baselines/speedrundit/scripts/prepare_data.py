@@ -67,7 +67,7 @@ if TYPE_CHECKING:
 
     from priml.baselines.speedrundit.data import PairedImageLatentDataset
     from priml.baselines.speedrundit.latent_codec import LatentCodec
-    from priml.model.vision_ae.custom_types import Autoencoder
+    from priml.model.ae.custom_types import Encoder
 else:
     from wrapt import lazy_import
 
@@ -280,6 +280,7 @@ def prepare(
             device=device,
             batch_size=batch_size,
             latent_shape=latent_shape,
+            sample=config.sample,
         )
     details = {"preparation": preparation, "fit": fit}
     # The loader refuses a PREPARING corpus, so an interrupted run's latents are
@@ -287,6 +288,7 @@ def prepare(
     _ = write_receipt(
         latent_dir,
         autoencoder=config.autoencoder,
+        sample=config.sample,
         codec_config=config.codec,
         codec=codec,
         table_sha256=table_sha256,
@@ -318,6 +320,7 @@ def prepare(
             images=images,
             device=device,
             latent_shape=latent_shape,
+            sample=config.sample,
         )
         keep = [index for index, r in enumerate(batch) if r.stem in pending]
         stored = codec.encode(latents[keep])
@@ -330,6 +333,7 @@ def prepare(
     _ = write_receipt(
         latent_dir,
         autoencoder=config.autoencoder,
+        sample=config.sample,
         codec_config=config.codec,
         codec=codec,
         table_sha256=table_sha256,
@@ -468,6 +472,7 @@ def record_receipt(
         _ = verify_receipt(
             latent_dir,
             autoencoder=config.autoencoder,
+            sample=config.sample,
             codec_config=config.codec,
             codec=codec,
             table_sha256=table_sha256,
@@ -476,6 +481,7 @@ def record_receipt(
     _ = write_receipt(
         latent_dir,
         autoencoder=config.autoencoder,
+        sample=config.sample,
         codec_config=config.codec,
         codec=codec,
         table_sha256=table_sha256,
@@ -517,7 +523,7 @@ def main() -> int:
 
     """
     parser = argparse.ArgumentParser(
-        description=(__doc__ or "").split("\n", 2)[2],
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_arguments(parser)
@@ -590,11 +596,12 @@ def batches(
 
 
 def encode_latents(
-    autoencoder: Autoencoder,
+    autoencoder: Encoder,
     images: Tensor,
     *,
     device: str,
     latent_shape: tuple[int, int, int],
+    sample: bool,
 ) -> Tensor:
     """Encode a uint8 batch to float32 CPU latents, refusing any a corpus cannot hold.
 
@@ -603,6 +610,8 @@ def encode_latents(
       images: ``[B, 3, H, W]`` uint8.
       device: Device the autoencoder encodes on.
       latent_shape: The ``(C, H, W)`` its config declares.
+      sample: Take a draw of each latent, reading torch's global generator; else
+        the mode.
 
     Returns:
       latents: ``[B, *latent_shape]`` float32 on the CPU.
@@ -612,7 +621,8 @@ def encode_latents(
 
     """
     with torch.inference_mode():
-        latents = autoencoder.encode(images.to(device)).float().cpu()
+        code = autoencoder.encode(images.to(device))
+        latents = (code.sample() if sample else code.mode()).float().cpu()
     if latents.shape != (images.shape[0], *latent_shape):
         raise ValueError(
             f"The autoencoder returned {tuple(latents.shape)} latents for "
@@ -741,6 +751,7 @@ def _resume(
     details = verify_receipt(
         latent_dir,
         autoencoder=config.autoencoder,
+        sample=config.sample,
         codec_config=config.codec,
         codec=codec,
         table_sha256=table_sha256,
@@ -750,7 +761,7 @@ def _resume(
 
 def _fit(
     codec: FittedCodec,
-    autoencoder: Autoencoder,
+    autoencoder: Encoder,
     listed: Sequence[Record],
     *,
     root: Path,
@@ -759,18 +770,20 @@ def _fit(
     device: str,
     batch_size: int,
     latent_shape: tuple[int, int, int],
+    sample: bool,
 ) -> tuple[str, dict[str, object]]:
     """Fit and save the codec's table; return its digest and the fit's record."""
     chosen = fit_sample_indices(len(listed), num_images=codec.num_fit_images)
     subset = [listed[index] for index in chosen]
     logger.info("Fitting the codec on %d images.", len(subset))
-    sample = torch.cat(
+    latents = torch.cat(
         [
             encode_latents(
                 autoencoder,
                 images=images,
                 device=device,
                 latent_shape=latent_shape,
+                sample=sample,
             )
             for _, images in batches(
                 subset,
@@ -780,7 +793,7 @@ def _fit(
             )
         ],
     )
-    codec.fit(sample)
+    codec.fit(latents)
     digest = hashlib.sha256(",".join(map(str, chosen)).encode()).hexdigest()
     return save_table(latent_dir, codec=codec), {
         "num_images": len(chosen),

@@ -121,32 +121,38 @@ SpeedrunTrainLoop(
         │       working_dir=PosixPath('/opt/scratch/datasets/speedrundit'),
         │       latent_subdir='vtp-large',
         │       autoencoder=VTP.Config(
-        │           trunk=DinoVisionTransformerWithBottleneck.Config(
+        │           encoder=Encoder.Config(
         │               patch_size=16,
         │               channels_hidden=1_024,
         │               num_layers=24,
         │               heads=16,
         │               expansion=4.0,
-        │               channels_out=64
+        │               channels_out=64,
+        │               checkpoint=HubFile.Config(
+        │                   repo_id='MiniMaxAI/VTP-Large-f16d64',
+        │                   filename='model.safetensors',
+        │                   revision='d1726ca9abd5ed0b3ad938c508c635d8b1a51a31',
+        │                   sha256='de5df2006083a9536c4d3ea36c6ae2181ec604e06550f1b2d7cece3b16aac32f'
+        │               )
         │           ),
-        │           pixel_decoder=DinoV3PixelDecoder.Config(
+        │           decoder=Decoder.Config(
         │               channels_in=64,
         │               channels_hidden=1_024,
         │               num_layers=24,
         │               heads=16,
         │               expansion=4.0,
-        │               upscale_factor=16
+        │               upscale_factor=16,
+        │               checkpoint=HubFile.Config(
+        │                   repo_id='MiniMaxAI/VTP-Large-f16d64',
+        │                   filename='model.safetensors',
+        │                   revision='d1726ca9abd5ed0b3ad938c508c635d8b1a51a31',
+        │                   sha256='de5df2006083a9536c4d3ea36c6ae2181ec604e06550f1b2d7cece3b16aac32f'
+        │               )
         │           ),
         │           image_size=256,
         │           pixel_mean=(0.485, 0.456, 0.406),
         │           pixel_std=(0.229, 0.224, 0.225),
         │           dtype_autocast=None,
-        │           checkpoint=HubFile.Config(
-        │               repo_id='MiniMaxAI/VTP-Large-f16d64',
-        │               filename='model.safetensors',
-        │               revision='d1726ca9abd5ed0b3ad938c508c635d8b1a51a31',
-        │               sha256='de5df2006083a9536c4d3ea36c6ae2181ec604e06550f1b2d7cece3b16aac32f'
-        │           ),
         │           latent_norm=ChannelLatentStats.Config(
         │               stats=UrlFile.Config(
         │                   url='https://raw.githubusercontent.com/MiniMax-AI/VTP/5ce1eb67010fff3c1eed483352483be6a1838556/generation/latent_stats/vtp_l/latents_stats.pt',
@@ -156,6 +162,7 @@ SpeedrunTrainLoop(
         │           )
         │       ),
         │       codec=FloatCodec.Config(dtype=torch.float32),
+        │       sample=True,
         │       seed=None
         │   ),
         │   batch_size=32,

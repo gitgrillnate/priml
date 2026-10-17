@@ -488,6 +488,24 @@ class _ConstantVelocityModel(nn.Module):
         )
 
 
+@pytest.mark.parametrize(
+    ("path", "match"),
+    [
+        ("x_embedder", "x_embedder must include a bias"),
+        ("blocks.0.adaLN_modulation.1", "adaLN modulation"),
+        ("final_layer.linear", "final projections"),
+    ],
+)
+def test_reset_parameters_refuses_a_projection_without_bias(
+    path: str,
+    match: str,
+) -> None:
+    model = tiny_model()
+    model.get_submodule(path).bias = None
+    with pytest.raises(ValueError, match=match):
+        model.reset_parameters()
+
+
 if __name__ == "__main__":
     from priml.lib.testing.runner import test_main
 

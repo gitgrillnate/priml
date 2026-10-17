@@ -21,7 +21,7 @@ from priml.baselines.speedrundit.model import ModelOutput
 from priml.baselines.speedrundit.model_test import tiny_model
 from priml.baselines.speedrundit.objective import LossTerms
 from priml.baselines.speedrundit.train_step import SpeedrunTrainStep
-from priml.model.vision_ae.latent_norm import ScaleLatents
+from priml.model.ae.latent_norm import ScaleLatents
 from priml.optimizers.newton import Newton
 from priml.testing.bfb import assert_bfb_against_golden
 from priml.train.ema import NoEMA
@@ -322,6 +322,13 @@ def _smoke_input() -> dict[str, Tensor]:
         .div(97),
         "label": torch.tensor([0, 1, 2, 3, 0]),
     }
+
+
+def test_an_unset_latent_norm_is_refused() -> None:
+    config = _small_step_config()
+    config.latent_norm = None
+    with pytest.raises(ValueError, match="latent_norm is unset"):
+        _ = config.make()
 
 
 if __name__ == "__main__":

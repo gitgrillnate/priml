@@ -1,33 +1,128 @@
-"""Weights files named by where they live and what their bytes hash to.
+"""Weights files as configs: a Hub file, a URL, or a local path, each with a digest.
 
-A checkpoint is a node in the config tree, not a path string, so a run's
-weights print, diff, and land in a corpus receipt. Every published default pins
-a revision AND a SHA-256: the revision says which upload, the digest says the
-bytes did not change underneath it. Only ``path()`` resolves -- never
-``finalize`` or ``make()`` -- so building a config never touches the network.
+``path()`` downloads if needed and verifies the digest; nothing else touches the
+network.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 from urllib import parse
 
 import hashlib
 import re
 
-from configgle import Fig
+from configgle import Fig, Makeable
+from treekle import json_loads
 
 from priml.data.ensure import DataSpec, FileSpec, ensure_data, resumable_http_download
 from priml.hub import get_cache_dir
 
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from torch import Tensor
+
     import huggingface_hub
+    import safetensors
+    import torch
 else:
     from wrapt import lazy_import
 
     huggingface_hub = lazy_import("huggingface_hub")
+    safetensors = lazy_import("safetensors")
+    torch = lazy_import("torch")
+
+
+@runtime_checkable
+class CheckpointFile(Protocol):
+    """A weights file that resolves to a local path, downloading if it must."""
+
+    def path(self) -> Path:
+        """Return the local path, verified when a digest is configured.
+
+        Returns:
+          path: Local file.
+
+        Raises:
+          RuntimeError: The bytes do not hash to the configured digest.
+
+        """
+        ...
+
+    def identity(self) -> dict[str, str]:
+        """Return what names this file across machines, for a corpus receipt."""
+        ...
+
+
+def read_state(path: Path, *, prefixes: Sequence[str] = ("",)) -> dict[str, Tensor]:
+    """Read the tensors whose keys start with any of ``prefixes``, on the CPU.
+
+    Unselected tensors are never read from disk.
+
+    Args:
+      path: A ``.safetensors`` file, or a ``torch.save``-d state dict.
+      prefixes: Key prefixes to keep; the default keeps every key.
+
+    Returns:
+      state: Selected tensors by their stored names.
+
+    """
+    keep = tuple(prefixes)
+    if path.suffix == ".safetensors":
+        with safetensors.safe_open(path, framework="pt") as stream:
+            return {
+                name: stream.get_tensor(name)
+                for name in stream.keys()  # noqa: SIM118 -- safe_open is not a Mapping; keys() is its only listing.
+                if name.startswith(keep)
+            }
+    state = cast(
+        "dict[str, Tensor]",
+        torch.load(path, map_location="cpu", weights_only=True, mmap=True),
+    )
+    return {name: tensor for name, tensor in state.items() if name.startswith(keep)}
+
+
+def hub_or_local(
+    path_or_repo: Path | str,
+    filename: str,
+    *,
+    revision: str,
+) -> Makeable[CheckpointFile]:
+    """Name one file of a local directory, or of a Hub repository at ``revision``.
+
+    Args:
+      path_or_repo: An existing local directory, or a Hub ``owner/name``.
+      filename: File within it.
+      revision: Full commit SHA, used for a Hub repository only.
+
+    Returns:
+      source: A :class:`LocalFile` or :class:`HubFile` config.
+
+    """
+    path = Path(path_or_repo)
+    if path.is_dir():
+        return LocalFile.Config(path=path / filename)
+    return HubFile.Config(
+        repo_id=str(path_or_repo),
+        filename=filename,
+        revision=revision,
+    )
+
+
+def read_json(source: Makeable[CheckpointFile]) -> dict[str, object]:
+    """Read a JSON object, e.g. a ``config.json``, from a checkpoint file.
+
+    Args:
+      source: Where the file lives.
+
+    Returns:
+      config: The parsed object.
+
+    """
+    return json_loads(source.make().path().read_text(), dict[str, object])
 
 
 class HubFile:
@@ -224,8 +319,7 @@ def verify_sha256(path: Path, expected: str) -> None:
       expected: Lowercase hex SHA-256, or empty.
 
     Raises:
-      RuntimeError: The digest differs, as ``ensure_data`` raises for a
-        downloaded file.
+      RuntimeError: The digest differs.
 
     """
     if not expected:

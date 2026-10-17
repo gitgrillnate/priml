@@ -14,8 +14,8 @@ from torch.nn import functional
 import pytest
 import torch
 
-from priml.model.vision_ae.scripts import reference_parity
-from priml.model.vision_ae.scripts.reference_parity import (
+from priml.model.ae.scripts import reference_parity
+from priml.model.ae.scripts.reference_parity import (
     Outcome,
     PinnedRandom,
     Reference,
@@ -106,7 +106,7 @@ def test_definitions_reach_into_compound_statements(tmp_path: Path) -> None:
 
 
 def test_inventory_checks_branches_in_paired_math_helpers(tmp_path: Path) -> None:
-    """``rgb2float`` is port code like any ``model/vision_ae`` function."""
+    """``rgb2float`` is port code like any ``model/ae`` function."""
     pixel = _PORT_ROOT / "math" / "pixel.py"
     line = _line_of(pixel, text="if unit_interval:")
     reference = _reference(tmp_path, paired=("math/pixel.py::rgb2float",))
@@ -118,26 +118,37 @@ def test_inventory_checks_branches_in_paired_math_helpers(tmp_path: Path) -> Non
 
 
 def test_an_allowlist_entry_silences_only_its_own_definition(tmp_path: Path) -> None:
-    """``Upsample`` tests ``if self.with_conv:`` twice; allowing one keeps the other."""
-    invae = _PORT_ROOT / "model" / "vision_ae" / "invae.py"
-    built = _line_of(invae, text="if self.with_conv:")
-    run = _line_of(invae, text="if self.with_conv:", after=built + 1)
+    """``INVAE.encode`` and ``INVAE.decode`` share a guard shape; allowing one keeps the other."""
+    invae = _PORT_ROOT / "model" / "ae" / "invae.py"
+    encode = _line_of(
+        invae,
+        text="if self.encoder is None:",
+        after=_line_of(
+            invae,
+            text="def encode(self, x: Tensor, /) -> DiagonalGaussian:",
+        ),
+    )
+    decode = _line_of(
+        invae,
+        text="if self.decoder is None:",
+        after=_line_of(invae, text="def decode(self, z: Tensor, /) -> Tensor:"),
+    )
     reference = _reference(
         tmp_path,
         paired=(
-            "model/vision_ae/invae.py::Upsample.__init__",
-            "model/vision_ae/invae.py::Upsample.forward",
+            "model/ae/invae.py::INVAE.encode",
+            "model/ae/invae.py::INVAE.decode",
         ),
         port_unreached={
-            "model/vision_ae/invae.py::Upsample.__init__::if self.with_conv:": "Why.",
+            "model/ae/invae.py::INVAE.encode::if self.encoder is None:": "Why.",
         },
     )
-    measured = _Measured({str(invae): {built: (2, 1), run: (2, 1)}})
+    measured = _Measured({str(invae): {encode: (2, 1), decode: (2, 1)}})
     problems = inventory_problems(reference, clone=tmp_path, measured=measured)
     assert problems == [
         (
-            f"model/vision_ae/invae.py::Upsample.forward:{run} takes 1 of 2 exits: "
-            "if self.with_conv:"
+            f"model/ae/invae.py::INVAE.decode:{decode} takes 1 of 2 exits: "
+            "if self.decoder is None:"
         ),
     ]
 

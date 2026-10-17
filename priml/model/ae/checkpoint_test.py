@@ -8,10 +8,20 @@ from typing import TYPE_CHECKING, ClassVar, Final
 import hashlib
 import io
 
-import pytest
+from safetensors.torch import save_file
 
-from priml.model.vision_ae.checkpoint import HubFile, LocalFile, UrlFile, sha256_file
-from priml.model.vision_ae.custom_types import CheckpointFile
+import pytest
+import torch
+
+from priml.model.ae.checkpoint import (
+    CheckpointFile,
+    HubFile,
+    LocalFile,
+    UrlFile,
+    hub_or_local,
+    read_state,
+    sha256_file,
+)
 
 
 if TYPE_CHECKING:
@@ -128,7 +138,7 @@ def test_hub_file_downloads_the_pinned_revision_and_verifies_it(
     # The module's lazy proxy is replaced whole: patching the real package would
     # import it, ~100 ms this test does not need.
     monkeypatch.setattr(
-        "priml.model.vision_ae.checkpoint.huggingface_hub",
+        "priml.model.ae.checkpoint.huggingface_hub",
         SimpleNamespace(hf_hub_download=download),
     )
     source = HubFile.Config(
@@ -227,6 +237,45 @@ class _Response(io.BytesIO):
 def test_sha256_file_matches_hashlib(tmp_path: Path) -> None:
     path, digest = _file(tmp_path, payload=b"x" * 100_000)
     assert sha256_file(path) == digest
+
+
+def _state() -> dict[str, torch.Tensor]:
+    generator = torch.Generator().manual_seed(0)
+    return {
+        "encoder.weight": torch.randn(2, 3, generator=generator),
+        "decoder.weight": torch.randn(3, 4, generator=generator),
+        "quant.bias": torch.randn(4, generator=generator),
+    }
+
+
+@pytest.mark.parametrize("suffix", [".safetensors", ".pt"])
+def test_read_state_keeps_only_the_prefixed_tensors(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    state = _state()
+    path = tmp_path / f"weights{suffix}"
+    if suffix == ".safetensors":
+        save_file(state, str(path))
+    else:
+        torch.save(state, path)
+    kept = read_state(path, prefixes=("encoder.", "quant."))
+    assert kept.keys() == {"encoder.weight", "quant.bias"}
+    assert all(torch.equal(kept[name], state[name]) for name in kept)
+    assert read_state(path).keys() == state.keys()
+
+
+def test_hub_or_local_names_a_hub_file_when_no_directory_exists(
+    tmp_path: Path,
+) -> None:
+    local = hub_or_local(tmp_path, "config.json", revision="0" * 40)
+    assert local == LocalFile.Config(path=tmp_path / "config.json")
+    hub = hub_or_local("owner/name", "config.json", revision="0" * 40)
+    assert hub == HubFile.Config(
+        repo_id="owner/name",
+        filename="config.json",
+        revision="0" * 40,
+    )
 
 
 if __name__ == "__main__":

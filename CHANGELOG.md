@@ -7,24 +7,26 @@ All notable priml changes are documented here. This project follows
 
 ### Added
 
-- `priml.model.vision_ae`: pretrained vision autoencoders behind one
-  `Autoencoder` protocol (`encode` uint8 images to raw latents, refusing any
-  other dtype; `decode` back to `[0, 1]` pixels). `VariationalAutoencoder`
-  adds `posterior`; the latent a variational `encode` returns is the config's
-  `latent_fn` (`posterior_sample` or `posterior_mode`). Implementations:
+- `priml.model.ae`: pretrained autoencoders behind one contract
+  (`custom_types.py`): `Encoder.encode(x) -> Distribution`,
+  `Decoder.decode(z) -> Tensor`, `Autoencoder` both, over arbitrary leading
+  dims. A `Distribution` has `sample(*, generator)` and `mode()`; INVAE
+  returns a `DiagonalGaussian`, RAE and VTP a `PointMass`. Implementations:
   `INVAE`, `VTP` (`vtp_small`, `vtp_base`, `vtp_large`), and `RAE`
-  (`rae_dinov2_base`), each config defaulting to its published checkpoint.
-  Checkpoints are config nodes (`HubFile` at a commit revision, `UrlFile`,
-  `LocalFile`), and every published default pins its SHA-256;
-  each config's `latent_norm` holds its published normalizer
-  (`ScaleLatents`, `ElementwiseLatentStats`, `ChannelLatentStats`), which
-  keeps its reference's operation order.
-- `priml/model/vision_ae/scripts/reference_parity.py`: clones each
+  (`rae_dinov2_base`). Each config has `encoder` and `decoder` slots, either
+  `None`; each half carries its own `checkpoint` and reads only its own
+  tensors. `Config.from_hf` parses a published `config.json`, `load()` builds
+  from a Hub repository or local directory, and `remap_*_state_dict` renames
+  published tensors. Checkpoints are config nodes (`HubFile` at a commit
+  revision, `UrlFile`, `LocalFile`), and every published default pins its
+  SHA-256; each config's `latent_norm` holds its published normalizer
+  (`ScaleLatents`, `ElementwiseLatentStats`, `ChannelLatentStats`).
+- `priml/model/ae/scripts/reference_parity.py`: clones each
   autoencoder's reference at its pinned commit and proves the port
-  bit-identical, from seeded initialization through encode and decode, with
-  pinned randomness, per-module bisection, a checked function inventory, and
-  branch coverage over both sides. It mints `testdata/rae_reference.pt` and
-  `testdata/vtp_reference.pt`.
+  bit-identical through encode and decode, with the reference's weights
+  loaded through each port's remap, pinned randomness, per-module bisection,
+  a checked function inventory, and branch coverage over both sides. It mints
+  `testdata/rae_reference.pt` and `testdata/vtp_reference.pt`.
 - `priml.math.scalar_quantization`: exact Lloyd-Max fitting on sorted
   samples, the cube-root high-resolution start, standard-normal levels, and
   batched nearest-level `quantize` / `dequantize`.
@@ -46,11 +48,11 @@ All notable priml changes are documented here. This project follows
 
 ### Changed
 
-- `priml.model.invae` moved to `priml.model.vision_ae.invae`. `AutoencoderKL`,
+- `priml.model.invae` moved to `priml.model.ae.invae`. `AutoencoderKL`,
   `VAE_F16D32`, `VAE_F8D4`, `vae_models`, `encode_image`, `decode_latents`,
   and `load_invae` are removed; build `INVAE.Config().make()` and call
-  `encode` / `decode`. The architecture and the published checkpoint's keys
-  are unchanged.
+  `encode` / `decode`. INVAE now loads the published diffusers file
+  `REPA-E/e2e-invae-hf`, whose tensors equal REG's `e2e-invae-400k.pt`.
 - SpeedrunDiT: `SpeedrunTrainStep.Config.latent_scale` is replaced by the
   `latent_norm` slot, filled at loop finalize from the dataset's autoencoder
   (INVAE's is the same `* 0.3099`). `PairedImageLatentDataset.Config` gains
@@ -58,7 +60,10 @@ All notable priml changes are documented here. This project follows
   `corpus.json` receipt; record one for an existing REG corpus, and bind its
   crops, with `prepare_data.py --receipt-only --source <imagenet>`.
   `prepare_data.py` takes `--experiment` in place of `--output`,
-  `--checkpoint`, and `--resolution`.
+  `--checkpoint`, and `--resolution`. `PairedImageLatentDataset.Config.sample`
+  chooses a posterior draw or its mode, and is part of the receipt's
+  identity; the receipt format is 3, so re-record an existing corpus with
+  `--receipt-only`.
 - SpeedrunDiT: `SpeedrunTrainStep.Config.ema` keeps parameter shadows
   (`shadow_kind="param_dict"`); the module-copy default could not deepcopy the
   composable `replicate` model, so every distributed run failed at its first

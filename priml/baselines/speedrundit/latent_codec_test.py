@@ -289,6 +289,16 @@ def _mse_per_channel(codec: LatentCodec, latent: Tensor) -> Tensor:
     return error.pow(2).mean(dim=(0, 2, 3))
 
 
+def test_scale_groups_need_a_positive_count() -> None:
+    with pytest.raises(ValueError, match="num_groups must be positive"):
+        _ = ScaleGroups.Config(num_groups=0).make()
+
+
+def test_table_codec_needs_a_positive_fit_size() -> None:
+    with pytest.raises(ValueError, match="num_fit_images must be positive"):
+        _ = ScalarTableCodec.Config(num_fit_images=0).make()
+
+
 if __name__ == "__main__":
     from priml.lib.testing.runner import test_main
 

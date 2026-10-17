@@ -28,8 +28,8 @@ from priml.baselines.speedrundit.data import SpeedrunImageNetData
 from priml.baselines.speedrundit.latent_codec import FloatCodec, ScalarTableCodec
 from priml.baselines.speedrundit.optimizers import speedrundit_optimizer
 from priml.baselines.speedrundit.train_step import SpeedrunTrainStep
-from priml.model.vision_ae.rae import rae_dinov2_base
-from priml.model.vision_ae.vtp import vtp_large
+from priml.model.ae.rae import rae_dinov2_base
+from priml.model.ae.vtp import vtp_large
 from priml.runtime import MultiProcess, SingleProcess
 from priml.train.checkpointer import Checkpointer
 from priml.train.parallelism import DataParallel, NoParallel

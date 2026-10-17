@@ -25,8 +25,8 @@ paths on the same inputs. Following ``docs/SKILL.bit-for-bit.md``:
    ``testdata/vtp_reference.pt`` from the reference side. Without it, the
    run re-derives both and requires the checked-in bits.
 
-Initialization is compared too (bit-for-bit checkpoint 1): each side is built
-from the same seed and the state dicts must match in names, order, and bits.
+Weights are compared too: each port half loads the reference's tensors through
+its published-name remap, and every tensor must match in bits.
 
 Exactly these things are supplied or changed on the reference side:
 
@@ -76,6 +76,7 @@ import importlib
 import inspect
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -88,26 +89,27 @@ from treekle import json_loads
 import torch
 
 from priml.hub import get_cache_dir
-from priml.model.vision_ae.checkpoint import (
-    LocalFile,
+from priml.model.ae.checkpoint import LocalFile, read_state
+from priml.model.ae.invae import (
+    INVAE,
+    Decoder as InvaeDecoder,
+    Encoder as InvaeEncoder,
+    remap_hf_state_dict as remap_invae_state_dict,
 )
-from priml.model.vision_ae.custom_types import (
-    posterior_mode,
-)
-from priml.model.vision_ae.invae import INVAE
-from priml.model.vision_ae.latent_norm import (
-    ElementwiseLatentStats,
-)
-from priml.model.vision_ae.rae import (
+from priml.model.ae.latent_norm import ElementwiseLatentStats
+from priml.model.ae.rae import (
     RAE,
-    Dinov2WithRegisters,
-    GeneralDecoder,
+    Decoder as RaeDecoder,
+    Encoder as RaeEncoder,
+    remap_decoder_state_dict,
+    remap_encoder_state_dict,
 )
-from priml.model.vision_ae.vtp import VTP
-from priml.testing.bfb import (
-    host_agnostic_numerics,
-    load_golden,
+from priml.model.ae.vtp import (
+    VTP,
+    Decoder as VtpDecoder,
+    Encoder as VtpEncoder,
 )
+from priml.testing.bfb import host_agnostic_numerics
 from priml.testing.golden import (
     mismatches,
     read_tensors,
@@ -146,7 +148,7 @@ else:
 
 _THIS: Final = Path(__file__).resolve()
 _PRIML: Final = _THIS.parents[3]
-_TESTDATA: Final = _PRIML / "model" / "vision_ae" / "testdata"
+_TESTDATA: Final = _PRIML / "model" / "ae" / "testdata"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -199,49 +201,57 @@ _INVAE: Final = Reference(
     commit="3c51606c801dd9e87ee9ef778782766ab7c379ca",
     files=("models/invae.py",),
     paired={
+        "models/invae.py::nonlinearity": ("model/ae/invae.py::_swish",),
+        "models/invae.py::Normalize": ("model/ae/invae.py::_norm",),
         **{
-            f"models/invae.py::{name}": (f"model/vision_ae/invae.py::{name}",)
-            for name in (
-                "nonlinearity",
-                "Normalize",
-                "Upsample",
-                "Upsample.__init__",
-                "Upsample.forward",
-                "Downsample",
-                "Downsample.__init__",
-                "Downsample.forward",
-                "ResnetBlock",
-                "ResnetBlock.__init__",
-                "ResnetBlock.forward",
-                "AttnBlock",
-                "AttnBlock.__init__",
-                "AttnBlock.forward",
-                "Encoder",
-                "Encoder.__init__",
-                "Encoder.forward",
-                "Decoder",
-                "Decoder.__init__",
-                "Decoder.forward",
-                "DiagonalGaussianDistribution",
-                "DiagonalGaussianDistribution.__init__",
-                "DiagonalGaussianDistribution.sample",
-                "DiagonalGaussianDistribution.mode",
+            f"models/invae.py::{theirs}": (f"model/ae/invae.py::{ours}",)
+            for theirs, ours in (
+                ("Upsample", "_Upsample"),
+                ("Upsample.__init__", "_Upsample.__init__"),
+                ("Upsample.forward", "_Upsample.forward"),
+                ("Downsample", "_Downsample"),
+                ("Downsample.__init__", "_Downsample.__init__"),
+                ("Downsample.forward", "_Downsample.forward"),
+                ("ResnetBlock", "_Resnet"),
+                ("ResnetBlock.__init__", "_Resnet.__init__"),
+                ("ResnetBlock.forward", "_Resnet.forward"),
+                ("AttnBlock", "_Attention"),
+                ("AttnBlock.__init__", "_Attention.__init__"),
+                ("AttnBlock.forward", "_Attention.forward"),
+                ("Encoder", "Encoder"),
+                ("Encoder.__init__", "Encoder.__init__"),
+                ("Encoder.forward", "Encoder.forward"),
+                ("Decoder", "Decoder"),
+                ("Decoder.__init__", "Decoder.__init__"),
+                ("Decoder.forward", "Decoder.forward"),
             )
         },
-        "models/invae.py::AutoencoderKL": ("model/vision_ae/invae.py::INVAE",),
+        "models/invae.py::DiagonalGaussianDistribution": (
+            "model/ae/distribution.py::DiagonalGaussian",
+        ),
+        "models/invae.py::DiagonalGaussianDistribution.__init__": (
+            "model/ae/distribution.py::DiagonalGaussian.__init__",
+        ),
+        "models/invae.py::DiagonalGaussianDistribution.sample": (
+            "model/ae/distribution.py::DiagonalGaussian.sample",
+        ),
+        "models/invae.py::DiagonalGaussianDistribution.mode": (
+            "model/ae/distribution.py::DiagonalGaussian.mode",
+        ),
+        "models/invae.py::AutoencoderKL": ("model/ae/invae.py::INVAE",),
         "models/invae.py::AutoencoderKL.__init__": (
-            "model/vision_ae/invae.py::INVAE.__init__",
+            "model/ae/invae.py::INVAE.__init__",
+            "model/ae/invae.py::_conv",
+            "model/ae/invae.py::_Stage.__init__",
+            "model/ae/invae.py::_Middle.__init__",
         ),
         "models/invae.py::AutoencoderKL.encode": (
-            "model/vision_ae/invae.py::INVAE.posterior",
-            "model/vision_ae/invae.py::INVAE.encode",
-            "model/vision_ae/custom_types.py::posterior_sample",
-            "model/vision_ae/custom_types.py::posterior_mode",
+            "model/ae/invae.py::INVAE.encode",
+            "model/ae/invae.py::_Stage.forward",
+            "model/ae/invae.py::_Middle.forward",
         ),
-        "models/invae.py::AutoencoderKL.decode": (
-            "model/vision_ae/invae.py::INVAE.decode",
-        ),
-        "models/invae.py::VAE_F16D32": ("model/vision_ae/invae.py::INVAE.Config",),
+        "models/invae.py::AutoencoderKL.decode": ("model/ae/invae.py::INVAE.decode",),
+        "models/invae.py::VAE_F16D32": ("model/ae/invae.py::INVAE.Config",),
     },
     not_ported={
         "models/invae.py::DiagonalGaussianDistribution.kl": (
@@ -254,8 +264,8 @@ _INVAE: Final = Reference(
             "The training round trip: encode, sample, decode, each paired above."
         ),
         "models/invae.py::VAE_F8D4": (
-            "The f8d4 geometry is INVAE.Config values (channels_latent=4, "
-            "channel_multipliers=(1, 2, 4, 4)); no checkpoint of it is published."
+            "The f8d4 geometry is Encoder/Decoder.Config values; no checkpoint of "
+            "it is published."
         ),
     },
     reference_unreached={
@@ -272,15 +282,14 @@ _INVAE: Final = Reference(
         "models/invae.py::Decoder.forward::if self.give_pre_end:": "Never set by AutoencoderKL.",
     },
     port_unreached={
-        "model/vision_ae/invae.py::Upsample.__init__::if self.with_conv:": "The port builds every resampler with a convolution.",
-        "model/vision_ae/invae.py::Upsample.forward::if self.with_conv:": "The port builds every resampler with a convolution.",
-        "model/vision_ae/invae.py::Downsample.__init__::if self.with_conv:": "The port builds every resampler with a convolution.",
-        "model/vision_ae/invae.py::Downsample.forward::if self.with_conv:": "The port builds every resampler with a convolution.",
-        "model/vision_ae/invae.py::ResnetBlock.forward::if temb is not None:": "INVAE has no time embedding.",
-        "model/vision_ae/invae.py::ResnetBlock.__init__::if temb_channels > 0:": "INVAE has no time embedding.",
-        "model/vision_ae/invae.py::ResnetBlock.__init__::if self.use_conv_shortcut:": "The encoder and decoder build every ResnetBlock without it.",
-        "model/vision_ae/invae.py::ResnetBlock.forward::if self.use_conv_shortcut:": "The encoder and decoder build every ResnetBlock without it.",
-        "model/vision_ae/invae.py::Decoder.forward::if self.give_pre_end:": "INVAE never sets it.",
+        "model/ae/invae.py::INVAE.encode::if self.encoder is None:": "An error guard; invae_test drives it.",
+        "model/ae/invae.py::INVAE.encode::if x.dtype != torch.uint8:": "An error guard; invae_test drives it.",
+        "model/ae/invae.py::INVAE.decode::if self.decoder is None:": "An error guard; invae_test drives it.",
+        "model/ae/invae.py::INVAE.__init__::if not halves:": "An error guard; invae_test drives it.",
+        "model/ae/invae.py::INVAE.__init__::if config.image_size % downsample:": "An error guard; invae_test drives it.",
+        "model/ae/invae.py::INVAE.__init__::if len({half.channels_latent for half in halves}) != 1:": "An error guard; invae_test drives it.",
+        "model/ae/invae.py::Encoder.__init__::if config.checkpoint is not None:": "The comparison loads both halves through the remap; invae_test loads checkpoints.",
+        "model/ae/invae.py::Decoder.__init__::if config.checkpoint is not None:": "The comparison loads both halves through the remap; invae_test loads checkpoints.",
     },
     extra_outputs={},
 )
@@ -289,6 +298,11 @@ _INVAE: Final = Reference(
 _RAE_DECODER: Final = "src/stage1/decoders/decoder.py"
 _RAE_MAE_ENCODER: Final = (
     "The MAE encoder's; GeneralDecoder builds only the decoder half."
+)
+_GUARD: Final = "An error guard; the model's own test drives it."
+_LOADED: Final = (
+    "The comparison loads every half from a checkpoint; the model's own test "
+    "builds without one."
 )
 
 _RAE: Final = Reference(
@@ -301,69 +315,60 @@ _RAE: Final = Reference(
         "src/stage1/decoders/utils.py",
     ),
     paired={
-        "src/stage1/rae.py::RAE": ("model/vision_ae/rae.py::RAE",),
-        "src/stage1/rae.py::RAE.__init__": ("model/vision_ae/rae.py::RAE.__init__",),
+        "src/stage1/rae.py::RAE": ("model/ae/rae.py::RAE",),
+        "src/stage1/rae.py::RAE.__init__": ("model/ae/rae.py::RAE.__init__",),
         "src/stage1/rae.py::RAE.encode": (
-            "model/vision_ae/rae.py::RAE.encode",
-            "model/vision_ae/latent_norm.py::ElementwiseLatentStats.__init__",
-            "model/vision_ae/latent_norm.py::ElementwiseLatentStats.normalize",
+            "model/ae/rae.py::RAE.encode",
+            "model/ae/latent_norm.py::ElementwiseLatentStats.__init__",
+            "model/ae/latent_norm.py::ElementwiseLatentStats.normalize",
             "math/pixel.py::rgb2float",
         ),
         "src/stage1/rae.py::RAE.decode": (
-            "model/vision_ae/rae.py::RAE.decode",
-            "model/vision_ae/latent_norm.py::ElementwiseLatentStats.denormalize",
+            "model/ae/rae.py::RAE.decode",
+            "model/ae/latent_norm.py::ElementwiseLatentStats.denormalize",
         ),
-        "src/stage1/encoders/dinov2.py::Dinov2withNorm": (
-            "model/vision_ae/rae.py::Dinov2WithRegisters",
-        ),
+        "src/stage1/encoders/dinov2.py::Dinov2withNorm": ("model/ae/rae.py::Encoder",),
         "src/stage1/encoders/dinov2.py::Dinov2withNorm.__init__": (
-            "model/vision_ae/rae.py::Dinov2WithRegisters.__init__",
+            "model/ae/rae.py::Encoder.__init__",
         ),
         "src/stage1/encoders/dinov2.py::Dinov2withNorm.dinov2_forward": (
-            "model/vision_ae/rae.py::Dinov2WithRegisters.forward",
+            "model/ae/rae.py::Encoder.forward",
+            "model/ae/rae.py::Encoder._positions",
         ),
         "src/stage1/encoders/dinov2.py::Dinov2withNorm.forward": (
-            "model/vision_ae/rae.py::Dinov2WithRegisters.forward",
+            "model/ae/rae.py::Encoder.forward",
         ),
         **{
-            f"{_RAE_DECODER}::{name}": (f"model/vision_ae/rae.py::{name}",)
-            for name in (
-                "ViTMAESelfAttention",
-                "ViTMAESelfAttention.__init__",
-                "ViTMAESelfAttention.forward",
-                "ViTMAESelfOutput",
-                "ViTMAESelfOutput.__init__",
-                "ViTMAESelfOutput.forward",
-                "ViTMAEAttention",
-                "ViTMAEAttention.__init__",
-                "ViTMAEAttention.forward",
-                "ViTMAEIntermediate",
-                "ViTMAEIntermediate.__init__",
-                "ViTMAEIntermediate.forward",
-                "ViTMAEOutput",
-                "ViTMAEOutput.__init__",
-                "ViTMAEOutput.forward",
-                "ViTMAELayer",
-                "ViTMAELayer.__init__",
-                "ViTMAELayer.forward",
-                "GeneralDecoder",
-                "GeneralDecoder.__init__",
-                "GeneralDecoder.unpatchify",
-                "GeneralDecoder.forward",
+            f"{_RAE_DECODER}::{theirs}": (f"model/ae/rae.py::{ours}",)
+            for theirs, ours in (
+                ("ViTMAESelfAttention", "_Attention"),
+                ("ViTMAESelfAttention.__init__", "_Attention.__init__"),
+                ("ViTMAESelfAttention.forward", "_Attention.forward"),
+                ("ViTMAESelfAttention.transpose_for_scores", "_Attention._heads"),
+                ("ViTMAESelfOutput", "_Attention"),
+                ("ViTMAESelfOutput.__init__", "_Attention.__init__"),
+                ("ViTMAESelfOutput.forward", "_Attention.forward"),
+                ("ViTMAEAttention", "_Attention"),
+                ("ViTMAEAttention.__init__", "_Attention.__init__"),
+                ("ViTMAEAttention.forward", "_Attention.forward"),
+                ("ViTMAEIntermediate", "_Block"),
+                ("ViTMAEIntermediate.__init__", "_Block.__init__"),
+                ("ViTMAEIntermediate.forward", "_Block.forward"),
+                ("ViTMAEOutput", "_Block"),
+                ("ViTMAEOutput.__init__", "_Block.__init__"),
+                ("ViTMAEOutput.forward", "_Block.forward"),
+                ("ViTMAELayer", "_Block"),
+                ("ViTMAELayer.__init__", "_Block.__init__"),
+                ("ViTMAELayer.forward", "_Block.forward"),
+                ("GeneralDecoder", "Decoder"),
+                ("GeneralDecoder.__init__", "Decoder.__init__"),
+                ("GeneralDecoder.initialize_weights", "Decoder.__init__"),
+                ("GeneralDecoder.set_trainable_cls_token", "Decoder.__init__"),
+                ("GeneralDecoder.interpolate_latent", "Decoder.forward"),
+                ("GeneralDecoder.unpatchify", "Decoder.forward"),
+                ("GeneralDecoder.forward", "Decoder.forward"),
             )
         },
-        f"{_RAE_DECODER}::ViTMAESelfAttention.transpose_for_scores": (
-            "model/vision_ae/rae.py::ViTMAESelfAttention._heads",
-        ),
-        f"{_RAE_DECODER}::GeneralDecoder.initialize_weights": (
-            "model/vision_ae/rae.py::GeneralDecoder.__init__",
-        ),
-        f"{_RAE_DECODER}::GeneralDecoder.set_trainable_cls_token": (
-            "model/vision_ae/rae.py::GeneralDecoder.__init__",
-        ),
-        f"{_RAE_DECODER}::GeneralDecoder.interpolate_latent": (
-            "model/vision_ae/rae.py::GeneralDecoder.forward",
-        ),
         **{
             f"{_RAE_DECODER}::{name}": (
                 "math/position_embedding.py::sincos_position_table",
@@ -375,27 +380,28 @@ _RAE: Final = Reference(
             )
         },
         "src/stage1/decoders/utils.py::ViTMAEConfig": (
-            "model/vision_ae/rae.py::GeneralDecoder.Config",
-        ),
-        "src/stage1/decoders/utils.py::ViTMAEConfig.__init__": (
-            "model/vision_ae/rae.py::GeneralDecoder.Config",
+            "model/ae/rae.py::Decoder.Config",
         ),
     },
     not_ported={
         "src/stage1/rae.py::Stage1Protocal": (
-            "A typing Protocol; rae.py's PatchEncoder states the same contract."
+            "A typing Protocol; model/ae/custom_types.py states the contract."
         ),
         "src/stage1/rae.py::RAE.noising": (
             "A decoder-training augmentation; encode runs it only in training "
             "mode with noise_tau > 0, and the port never trains."
         ),
         "src/stage1/rae.py::RAE.forward": "Encode then decode, both paired.",
+        "src/stage1/decoders/utils.py::ViTMAEConfig.__init__": (
+            "RAE.__init__ reads its decoder config through transformers' "
+            "AutoConfig, which builds HF's own ViTMAEConfig."
+        ),
         f"{_RAE_DECODER}::ViTMAEModelOutput": _RAE_MAE_ENCODER,
         f"{_RAE_DECODER}::ViTMAEForPreTrainingOutput": _RAE_MAE_ENCODER,
         f"{_RAE_DECODER}::ViTMAEEmbeddings": _RAE_MAE_ENCODER,
         f"{_RAE_DECODER}::ViTMAEPatchEmbeddings": _RAE_MAE_ENCODER,
         f"{_RAE_DECODER}::ViTMAEDecoderOutput": (
-            "An output record; the port's GeneralDecoder returns the logits."
+            "An output record; the port's Decoder returns pixels."
         ),
         f"{_RAE_DECODER}::ViTMAESdpaSelfAttention": (
             "Selected by an sdpa attention config; the decoder config the "
@@ -424,31 +430,42 @@ _RAE: Final = Reference(
         "src/stage1/decoders/decoder.py::GeneralDecoder.forward::if output_hidden_states:": "RAE.decode asks for no hidden states.",
         "src/stage1/decoders/decoder.py::GeneralDecoder.forward::if self.gradient_checkpointing and self.training:": "Training-only.",
         "src/stage1/decoders/decoder.py::get_2d_sincos_pos_embed::if add_cls_token:": "initialize_weights always asks for the CLS row.",
-        "src/stage1/decoders/decoder.py::get_2d_sincos_pos_embed_from_grid::if embed_dim % 2 != 0:": "A misconfiguration guard; the port's GeneralDecoder.Config refuses a width the table cannot split.",
-        "src/stage1/decoders/decoder.py::get_1d_sincos_pos_embed_from_grid::if embed_dim % 2 != 0:": "A misconfiguration guard; the port's GeneralDecoder.Config refuses a width the table cannot split.",
+        "src/stage1/decoders/decoder.py::get_2d_sincos_pos_embed_from_grid::if embed_dim % 2 != 0:": "A misconfiguration guard; sincos_position_table refuses a width it cannot split.",
+        "src/stage1/decoders/decoder.py::get_1d_sincos_pos_embed_from_grid::if embed_dim % 2 != 0:": "A misconfiguration guard; sincos_position_table refuses a width it cannot split.",
     },
     port_unreached={
-        "model/vision_ae/latent_norm.py::ElementwiseLatentStats.__init__::if config.stats is None:": "An error guard; latent_norm_test drives it.",
-        "model/vision_ae/latent_norm.py::ElementwiseLatentStats.__init__::if var is None:": "An error guard; latent_norm_test drives it.",
-        "model/vision_ae/rae.py::Dinov2WithRegisters.__init__::if config.checkpoint is not None:": "The comparison loads both checkpoints; rae_test builds without them.",
-        "model/vision_ae/rae.py::GeneralDecoder.forward::if tokens.shape[1] != self.num_patches:": "Raises where the reference resizes; rae_test drives it.",
-        "model/vision_ae/rae.py::RAE.decode::if (channels, height, width) != self.latent_shape:": "Raises where the reference reshapes; rae_test drives it.",
-        "model/vision_ae/rae.py::ViTMAESelfAttention.__init__::if channels % num_heads:": "A misconfiguration guard; rae_test drives it.",
+        "model/ae/latent_norm.py::ElementwiseLatentStats.__init__::if math.isnan(eps) or math.isinf(eps) or eps < 0:": _GUARD,
+        "model/ae/latent_norm.py::ElementwiseLatentStats.__init__::if config.stats is None:": _GUARD,
+        "model/ae/latent_norm.py::ElementwiseLatentStats.__init__::if var is None:": _GUARD,
+        "model/ae/rae.py::RAE.__init__::if config.encoder is None and config.decoder is None:": _GUARD,
+        "model/ae/rae.py::RAE.__init__::if any(math.isnan(v) or math.isinf(v) for v in (*mean, *std)) or 0 in std:": _GUARD,
+        "model/ae/rae.py::RAE.__init__::if config.encoder is not None:": "The comparison builds both halves; rae_test leaves each out.",
+        "model/ae/rae.py::RAE.__init__::if config.encoder_image_size % patch:": _GUARD,
+        "model/ae/rae.py::RAE.__init__::if config.decoder is not None:": "The comparison builds both halves; rae_test leaves each out.",
+        "model/ae/rae.py::RAE.__init__::if (decoder.channels_in, decoder.num_patches) != (channels, grid * grid):": _GUARD,
+        "model/ae/rae.py::RAE.__init__::if decoder.patch_size * grid != config.image_size:": _GUARD,
+        "model/ae/rae.py::RAE.encode::if self.encoder is None:": _GUARD,
+        "model/ae/rae.py::RAE.encode::if x.dtype != torch.uint8:": _GUARD,
+        "model/ae/rae.py::RAE.decode::if self.decoder is None:": _GUARD,
+        "model/ae/rae.py::RAE.decode::if tuple(z.shape[-3:]) != self.latent_shape:": "Raises where the reference reshapes; rae_test drives it.",
+        "model/ae/rae.py::Encoder.__init__::if config.checkpoint is not None:": _LOADED,
+        "model/ae/rae.py::Encoder._positions::if num_patches == num_positions and height == width:": (
+            "The encoder side is fixed and its grid is smaller than the table's, as "
+            "224 is against the published 518; rae_test drives the other way."
+        ),
+        "model/ae/rae.py::Decoder.__init__::if n <= 0 or math.isqrt(n) ** 2 != n:": _GUARD,
+        "model/ae/rae.py::Decoder.__init__::if config.checkpoint is not None:": _LOADED,
+        "model/ae/rae.py::Decoder.forward::if tokens.shape[1] != self.num_patches:": "Raises where the reference resizes; rae_test drives it.",
+        "model/ae/rae.py::_Attention.__init__::if channels % num_heads:": _GUARD,
         "math/pixel.py::rgb2float::if not x_.dtype.is_floating_point:": "An input-type guard; the encoders always pass float_dtype=float32.",
         "math/pixel.py::rgb2float::if inplace and x_.requires_grad and x_.is_leaf:": "The encoders never scale a leaf requiring grad in place.",
         "math/pixel.py::rgb2float::if unit_interval:": "Both encoders normalize from [0, 1], so they always pass unit_interval=True.",
-        "math/position_embedding.py::sincos_position_table::if channels % 4:": "A misconfiguration guard; GeneralDecoder.Config refuses such a width first, and position_embedding_test drives it.",
-        "model/vision_ae/latent_norm.py::ElementwiseLatentStats.__init__::if math.isnan(eps) or math.isinf(eps) or eps < 0:": "An error guard; latent_norm_test drives it.",
-        "model/vision_ae/rae.py::RAE.__init__::if any(math.isnan(v) or math.isinf(v) for v in (*mean, *std)) or 0 in std:": "An error guard; rae_test drives it.",
+        "math/position_embedding.py::sincos_position_table::if channels % 4:": "A misconfiguration guard; position_embedding_test drives it.",
     },
     extra_outputs={
-        "encoder.encoder": (
-            "The reference asks HF for every hidden state (output_hidden_states=True); "
-            "the last one, the latent, is compared."
-        ),
-        "encoder.encoder.encoder": (
-            "The reference asks HF for every hidden state (output_hidden_states=True); "
-            "the last one, the latent, is compared."
+        "encoder.encoder.encoder.layer.0.attention": (
+            "HF's attention also returns its attention weights; the attended "
+            "output, first, is compared."
         ),
     },
 )
@@ -457,6 +474,56 @@ _RAE: Final = Reference(
 _VTP_LAYERS: Final = "vtp/models/layers"
 _VTP_TEXT: Final = "The CLIP text and alignment side; reconstruction never reads it."
 _VTP_TRAINING: Final = "Training-only; the evaluation forward never runs it."
+_VTP_TRUNK: Final = "vtp/models/encoders"
+
+_VTP_REFERENCE_UNREACHED: Final = {
+    "vtp/models/vtp_hf/modeling_vtp.py::VTPPreTrainedModel._init_weights::elif isinstance(module, nn.Embedding):": "VTP's reconstruction modules hold no embedding tables.",
+    "vtp/models/vtp_hf/modeling_vtp.py::VTPModel._patch_tokens_to_4d::if N != feat_h * feat_w:": "A shape guard the trunk's own tokens always satisfy.",
+    "vtp/models/vtp_hf/modeling_vtp.py::VTPModel.__init__::if config.train_clip:": "Reconstruction builds VTPModel without the CLIP side.",
+    "vtp/models/vtp_hf/modeling_vtp.py::VTPModel._init_vision_components::if config.train_clip:": "Reconstruction builds VTPModel without the CLIP side.",
+    "vtp/models/vtp_hf/modeling_vtp.py::VTPModel._init_vision_components::if config.train_reconstruction:": "Reconstruction always builds the pixel decoder.",
+    "vtp/models/vtp_hf/modeling_vtp.py::VTPModel.get_latents_decoded_images::if self.pixel_decoder is None:": "Reconstruction always builds the pixel decoder.",
+    "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.__init__::if vit_feature_bottleneck is None:": "Every published trunk has a bottleneck.",
+    "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.__init__::if self.vit_feature_bottleneck != self.original_embed_dim:": "Every published bottleneck narrows; the port refuses an equal width.",
+    "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck._apply_feature_bottleneck::if self.feature_bottleneck is not None:": "Every published trunk has a bottleneck.",
+    "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.forward_features::if self.feature_bottleneck is None or not use_bottleneck:": "get_reconstruction_latents always asks for the bottleneck.",
+    "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.forward_features::if isinstance(output, list):": "Reconstruction encodes one tensor, not a crop list.",
+    "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.forward_features::for item in output:": "Reconstruction encodes one tensor, not a crop list.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.__init__::if len(ignored_kwargs) > 0:": "A warning for unknown constructor keywords; none are passed.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.__init__::if self.n_storage_tokens > 0:": "VTP's trunk has no register tokens.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.init_weights::if self.n_storage_tokens > 0:": "VTP's trunk has no register tokens.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.prepare_tokens_with_masks::if self.n_storage_tokens > 0:": "VTP's trunk has no register tokens.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.__init__::if untie_cls_and_patch_norms:": "VTP ties the CLS and patch norms.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.__init__::if untie_global_and_local_cls_norm:": "VTP ties the global and local CLS norms.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features_list::if self.untie_cls_and_patch_norms or self.untie_global_and_local_cls_norm:": "VTP ties both norm pairs.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features_list::if self.untie_global_and_local_cls_norm and self.training and idx == 1:": "VTP ties both norm pairs, so this branch is never reached.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features_list::elif self.untie_cls_and_patch_norms:": "VTP ties both norm pairs, so this branch is never reached.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.prepare_tokens_with_masks::if masks is not None:": "Masked-token pretraining; reconstruction masks nothing.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features_list::if self.rope_embed is not None:": "VTP always uses rotary positions.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features::if isinstance(x, torch.Tensor):": "Reconstruction encodes one tensor, not a crop list.",
+    "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward::if is_training:": "get_reconstruction_latents always asks for the token dict.",
+    "vtp/models/encoders/vision_transformer.py::init_weights_vit::if isinstance(module, LayerScale):": "LayerScale is identity at VTP's layerscale_init=None.",
+    "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder.__init__::if len(ignored_kwargs) > 0:": "A warning for unknown constructor keywords; none are passed.",
+    "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder.init_weights::if isinstance(m, nn.Conv2d):": "Its only modules are the two convolutions.",
+    "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder.init_weights::if m.bias is not None:": "Both convolutions are biased.",
+    "vtp/models/layers/attention.py::SelfAttention.compute_attention::if rope is not None:": "VTP always uses rotary positions.",
+    "vtp/models/layers/block.py::SelfAttentionBlock.forward::elif isinstance(x_or_x_list, list):": "The trunk and decoder pass one tensor.",
+    "vtp/models/layers/block.py::SelfAttentionBlock.forward::if rope_or_rope_list is None:": "The trunk and decoder pass one tensor.",
+    "vtp/models/layers/block.py::SelfAttentionBlock._forward_list::if rope_list is not None:": "Reached only for a list input; the blocks get one tensor.",
+    "vtp/models/layers/block.py::SelfAttentionBlock._forward_list::if self.training and effective_drop_ratio > 0.0:": "Training-only stochastic depth.",
+    "vtp/models/layers/embeddings.py::make_2tuple::if isinstance(x, tuple):": "Every published patch size is an int.",
+    "vtp/models/layers/embeddings.py::PatchEmbed.forward::if not self.flatten_embedding:": "VTP flattens its patch embedding.",
+    "vtp/models/layers/embeddings.py::PatchEmbed.reset_parameters::if self.proj.bias is not None:": "The patch projection is biased.",
+    "vtp/models/layers/embeddings.py::RopePositionEmbedding.__init__::if (base is None and not both_periods) or (base is not None and both_periods):": "A misconfiguration guard; VTP configures a base.",
+    "vtp/models/layers/embeddings.py::RopePositionEmbedding._init_weights::if self.base is not None:": "VTP configures a base, not explicit periods.",
+    'vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::if self.normalize_coords == "max":': "VTP normalizes each side separately, the one mode the port implements.",
+    'vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::elif self.normalize_coords == "min":': "VTP normalizes each side separately, the one mode the port implements.",
+    'vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::elif self.normalize_coords == "separate":': "VTP normalizes each side separately, the one mode the port implements.",
+    "vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::if self.training and self.shift_coords is not None:": "Training-only coordinate augmentation.",
+    "vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::if self.training and self.jitter_coords is not None:": "Training-only coordinate augmentation.",
+    "vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::if self.training and self.rescale_coords is not None:": "Training-only coordinate augmentation.",
+}
+
 
 _VTP: Final = Reference(
     url="https://github.com/MiniMax-AI/VTP.git",
@@ -464,8 +531,8 @@ _VTP: Final = Reference(
     files=(
         "vtp/models/vtp_hf/modeling_vtp.py",
         "vtp/models/vtp_hf/configuration_vtp.py",
-        "vtp/models/encoders/vision_transformer_bottleneck.py",
-        "vtp/models/encoders/vision_transformer.py",
+        f"{_VTP_TRUNK}/vision_transformer_bottleneck.py",
+        f"{_VTP_TRUNK}/vision_transformer.py",
         "vtp/models/decoders/pixel_decoder.py",
         f"{_VTP_LAYERS}/attention.py",
         f"{_VTP_LAYERS}/block.py",
@@ -476,185 +543,110 @@ _VTP: Final = Reference(
         f"{_VTP_LAYERS}/activation.py",
     ),
     paired={
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPPreTrainedModel": (
-            "model/vision_ae/vtp.py::VTP",
-        ),
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPPreTrainedModel._init_weights": (
-            "model/vision_ae/vtp.py::init_weights_post",
-        ),
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel": ("model/vision_ae/vtp.py::VTP",),
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel.__init__": (
-            "model/vision_ae/vtp.py::VTP.__init__",
-        ),
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel._init_vision_components": (
-            "model/vision_ae/vtp.py::VTP.__init__",
-        ),
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel.get_reconstruction_latents": (
-            "model/vision_ae/vtp.py::VTP.encode",
-            "math/pixel.py::rgb2float",
-        ),
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel.get_latents_decoded_images": (
-            "model/vision_ae/vtp.py::VTP.decode",
-        ),
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel._patch_tokens_to_4d": (
-            "model/vision_ae/vtp.py::DinoVisionTransformerWithBottleneck.forward",
-        ),
-        "vtp/models/vtp_hf/configuration_vtp.py::VTPConfig": (
-            "model/vision_ae/vtp.py::VTP.Config",
-        ),
-        "vtp/models/vtp_hf/configuration_vtp.py::VTPConfig.__init__": (
-            "model/vision_ae/vtp.py::VTP.Config",
-        ),
         **{
-            f"vtp/models/encoders/{file}::{name}": (
-                f"model/vision_ae/vtp.py::DinoVisionTransformerWithBottleneck{method}",
-            )
-            for file, name, method in (
-                (
-                    "vision_transformer_bottleneck.py",
-                    "DinoVisionTransformerWithBottleneck",
-                    "",
-                ),
-                (
-                    "vision_transformer_bottleneck.py",
-                    "DinoVisionTransformerWithBottleneck.__init__",
-                    ".__init__",
-                ),
-                (
-                    "vision_transformer_bottleneck.py",
-                    "DinoVisionTransformerWithBottleneck.init_weights",
-                    ".__init__",
-                ),
-                (
-                    "vision_transformer_bottleneck.py",
-                    "DinoVisionTransformerWithBottleneck._apply_feature_bottleneck",
-                    ".forward",
-                ),
-                (
-                    "vision_transformer_bottleneck.py",
-                    "DinoVisionTransformerWithBottleneck.forward_features",
-                    ".forward",
-                ),
-                (
-                    "vision_transformer_bottleneck.py",
-                    "DinoVisionTransformerWithBottleneck._process_output_dict",
-                    ".forward",
-                ),
-                ("vision_transformer.py", "DinoVisionTransformer", ""),
-                (
-                    "vision_transformer.py",
-                    "DinoVisionTransformer.__init__",
-                    ".__init__",
-                ),
-                (
-                    "vision_transformer.py",
-                    "DinoVisionTransformer.init_weights",
-                    ".__init__",
-                ),
-                (
-                    "vision_transformer.py",
-                    "DinoVisionTransformer.prepare_tokens_with_masks",
-                    ".forward",
-                ),
-                (
-                    "vision_transformer.py",
-                    "DinoVisionTransformer.forward_features_list",
-                    ".forward",
-                ),
-                (
-                    "vision_transformer.py",
-                    "DinoVisionTransformer.forward_features",
-                    ".forward",
-                ),
-                ("vision_transformer.py", "DinoVisionTransformer.forward", ".forward"),
+            f"vtp/models/vtp_hf/{theirs}": (f"model/ae/vtp.py::{ours}",)
+            for theirs, ours in (
+                ("modeling_vtp.py::VTPPreTrainedModel", "VTP"),
+                ("modeling_vtp.py::VTPPreTrainedModel._init_weights", "VTP.__init__"),
+                ("modeling_vtp.py::VTPModel", "VTP"),
+                ("modeling_vtp.py::VTPModel.__init__", "VTP.__init__"),
+                ("modeling_vtp.py::VTPModel._init_vision_components", "VTP.__init__"),
+                ("modeling_vtp.py::VTPModel.get_latents_decoded_images", "VTP.decode"),
+                ("modeling_vtp.py::VTPModel._patch_tokens_to_4d", "Encoder.forward"),
+                ("configuration_vtp.py::VTPConfig", "VTP.Config"),
+                ("configuration_vtp.py::VTPConfig.__init__", "VTP.Config"),
             )
         },
-        "vtp/models/encoders/vision_transformer.py::init_weights_vit": (
-            "model/vision_ae/vtp.py::init_weights_vit",
-        ),
-        "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder": (
-            "model/vision_ae/vtp.py::DinoV3PixelDecoder",
-        ),
-        "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder.__init__": (
-            "model/vision_ae/vtp.py::DinoV3PixelDecoder.__init__",
-        ),
-        "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder.init_weights": (
-            "model/vision_ae/vtp.py::DinoV3PixelDecoder.__init__",
-        ),
-        "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder.forward": (
-            "model/vision_ae/vtp.py::DinoV3PixelDecoder.forward",
+        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel.get_reconstruction_latents": (
+            "model/ae/vtp.py::VTP.encode",
+            "math/pixel.py::rgb2float",
         ),
         **{
-            f"{_VTP_LAYERS}/{file}::{name}": (f"model/vision_ae/vtp.py::{port}",)
-            for file, name, port in (
-                ("attention.py", "rope_rotate_half", "rope_rotate_half"),
-                ("attention.py", "rope_apply", "rope_apply"),
-                ("attention.py", "SelfAttention", "SelfAttention"),
-                ("attention.py", "SelfAttention.__init__", "SelfAttention.__init__"),
+            f"{_VTP_TRUNK}/{theirs}": (f"model/ae/vtp.py::{ours}",)
+            for theirs, ours in (
                 (
-                    "attention.py",
-                    "SelfAttention.apply_rope",
-                    "SelfAttention.apply_rope",
+                    "vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck",
+                    "Encoder",
                 ),
-                ("attention.py", "SelfAttention.forward", "SelfAttention.forward"),
+                *(
+                    (
+                        (
+                            "vision_transformer_bottleneck.py::"
+                            f"DinoVisionTransformerWithBottleneck.{method}"
+                        ),
+                        f"Encoder.{ours}",
+                    )
+                    for method, ours in (
+                        ("__init__", "__init__"),
+                        ("init_weights", "__init__"),
+                        ("_apply_feature_bottleneck", "forward"),
+                        ("forward_features", "forward"),
+                        ("_process_output_dict", "forward"),
+                    )
+                ),
+                ("vision_transformer.py::DinoVisionTransformer", "Encoder"),
+                *(
+                    (
+                        f"vision_transformer.py::DinoVisionTransformer.{method}",
+                        f"Encoder.{ours}",
+                    )
+                    for method, ours in (
+                        ("__init__", "__init__"),
+                        ("init_weights", "__init__"),
+                        ("prepare_tokens_with_masks", "forward"),
+                        ("forward_features_list", "forward"),
+                        ("forward_features", "forward"),
+                        ("forward", "forward"),
+                    )
+                ),
+                ("vision_transformer.py::init_weights_vit", "Encoder.__init__"),
+            )
+        },
+        **{
+            f"vtp/models/decoders/pixel_decoder.py::{theirs}": (
+                f"model/ae/vtp.py::{ours}",
+            )
+            for theirs, ours in (
+                ("DinoV3PixelDecoder", "Decoder"),
+                ("DinoV3PixelDecoder.__init__", "Decoder.__init__"),
+                ("DinoV3PixelDecoder.init_weights", "Decoder.__init__"),
+                ("DinoV3PixelDecoder.forward", "Decoder.forward"),
+            )
+        },
+        **{
+            f"{_VTP_LAYERS}/{theirs}": (f"model/ae/vtp.py::{ours}",)
+            for theirs, ours in (
+                ("attention.py::rope_rotate_half", "_rotate_after_prefix"),
+                ("attention.py::rope_apply", "_rotate_after_prefix"),
+                ("attention.py::SelfAttention", "_Attention"),
+                ("attention.py::SelfAttention.__init__", "_Attention.__init__"),
+                ("attention.py::SelfAttention.apply_rope", "_rotate_after_prefix"),
+                ("attention.py::SelfAttention.forward", "_Attention.forward"),
+                ("attention.py::SelfAttention.compute_attention", "_Attention.forward"),
+                ("block.py::SelfAttentionBlock", "_Block"),
+                ("block.py::SelfAttentionBlock.__init__", "_Block.__init__"),
+                ("block.py::SelfAttentionBlock._forward_list", "_Block.forward"),
+                ("block.py::SelfAttentionBlock.forward", "_Block.forward"),
+                ("embeddings.py::make_2tuple", "Encoder.__init__"),
+                ("embeddings.py::PatchEmbed", "Encoder"),
+                ("embeddings.py::PatchEmbed.__init__", "Encoder.__init__"),
+                ("embeddings.py::PatchEmbed.forward", "Encoder.forward"),
+                ("embeddings.py::PatchEmbed.reset_parameters", "Encoder.__init__"),
+                ("embeddings.py::RopePositionEmbedding", "_Rotary"),
+                ("embeddings.py::RopePositionEmbedding.__init__", "_Rotary.__init__"),
+                ("embeddings.py::RopePositionEmbedding.forward", "_Rotary.forward"),
                 (
-                    "attention.py",
-                    "SelfAttention.compute_attention",
-                    "SelfAttention.forward",
+                    "embeddings.py::RopePositionEmbedding._init_weights",
+                    "_Rotary.__init__",
                 ),
-                ("block.py", "SelfAttentionBlock", "SelfAttentionBlock"),
-                (
-                    "block.py",
-                    "SelfAttentionBlock.__init__",
-                    "SelfAttentionBlock.__init__",
-                ),
-                (
-                    "block.py",
-                    "SelfAttentionBlock._forward_list",
-                    "SelfAttentionBlock.forward",
-                ),
-                (
-                    "block.py",
-                    "SelfAttentionBlock.forward",
-                    "SelfAttentionBlock.forward",
-                ),
-                ("embeddings.py", "make_2tuple", "PatchEmbed.__init__"),
-                ("embeddings.py", "PatchEmbed", "PatchEmbed"),
-                ("embeddings.py", "PatchEmbed.__init__", "PatchEmbed.__init__"),
-                ("embeddings.py", "PatchEmbed.forward", "PatchEmbed.forward"),
-                (
-                    "embeddings.py",
-                    "PatchEmbed.reset_parameters",
-                    "PatchEmbed.reset_parameters",
-                ),
-                ("embeddings.py", "RopePositionEmbedding", "RopePositionEmbedding"),
-                (
-                    "embeddings.py",
-                    "RopePositionEmbedding.__init__",
-                    "RopePositionEmbedding.__init__",
-                ),
-                (
-                    "embeddings.py",
-                    "RopePositionEmbedding.forward",
-                    "RopePositionEmbedding.forward",
-                ),
-                (
-                    "embeddings.py",
-                    "RopePositionEmbedding._init_weights",
-                    "RopePositionEmbedding.reset_parameters",
-                ),
-                ("ffn.py", "SwiGLUFFN", "SwiGLUFFN"),
-                ("ffn.py", "SwiGLUFFN.__init__", "SwiGLUFFN.__init__"),
-                ("ffn.py", "SwiGLUFFN.forward", "SwiGLUFFN.forward"),
-                ("normalization.py", "RMSNorm", "RMSNorm"),
-                ("normalization.py", "RMSNorm.__init__", "RMSNorm.__init__"),
-                (
-                    "normalization.py",
-                    "RMSNorm.reset_parameters",
-                    "RMSNorm.reset_parameters",
-                ),
-                ("normalization.py", "RMSNorm._norm", "RMSNorm.forward"),
-                ("normalization.py", "RMSNorm.forward", "RMSNorm.forward"),
+                ("ffn.py::SwiGLUFFN", "_Block"),
+                ("ffn.py::SwiGLUFFN.__init__", "_Block.__init__"),
+                ("ffn.py::SwiGLUFFN.forward", "_Block.forward"),
+                ("normalization.py::RMSNorm", "Encoder"),
+                ("normalization.py::RMSNorm.__init__", "Encoder.__init__"),
+                ("normalization.py::RMSNorm.reset_parameters", "Encoder.__init__"),
+                ("normalization.py::RMSNorm._norm", "Encoder.forward"),
+                ("normalization.py::RMSNorm.forward", "Encoder.forward"),
             )
         },
     },
@@ -686,24 +678,23 @@ _VTP: Final = Reference(
             "The training forward; reconstruction's two calls are paired."
         ),
         "vtp/models/vtp_hf/configuration_vtp.py::VTPConfig.from_vtp_yaml": (
-            "Reads a training YAML; vtp_small, vtp_base, and vtp_large state "
-            "the published configurations."
+            "Reads a training YAML; VTP.Config.from_hf reads the published config.json."
         ),
-        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.get_intermediate_layers": (
+        f"{_VTP_TRUNK}/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.get_intermediate_layers": (
             "A representation probe, not the autoencoder."
         ),
-        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.encode": (
+        f"{_VTP_TRUNK}/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.encode": (
             "An entry point hardcoding a 16-pixel patch; reconstruction goes "
             "through get_reconstruction_latents."
         ),
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer._get_intermediate_layers_not_chunked": (
+        f"{_VTP_TRUNK}/vision_transformer.py::DinoVisionTransformer._get_intermediate_layers_not_chunked": (
             "A representation probe, not the autoencoder."
         ),
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.get_intermediate_layers": (
+        f"{_VTP_TRUNK}/vision_transformer.py::DinoVisionTransformer.get_intermediate_layers": (
             "A representation probe, not the autoencoder."
         ),
         **{
-            f"vtp/models/encoders/vision_transformer.py::{name}": (
+            f"{_VTP_TRUNK}/vision_transformer.py::{name}": (
                 "A backbone preset; VTPModel builds its trunk directly, and "
                 "vtp_small, vtp_base, and vtp_large state the published sizes."
             )
@@ -750,7 +741,7 @@ _VTP: Final = Reference(
         f"{_VTP_LAYERS}/block.py::ResidualAttentionBlock": _VTP_TEXT,
         f"{_VTP_LAYERS}/block.py::CustomResidualAttentionBlock": _VTP_TEXT,
         f"{_VTP_LAYERS}/embeddings.py::PatchEmbed.flops": (
-            "A FLOP estimate; the port's cost() prices the patch convolution."
+            "A FLOP estimate; Encoder.Config.cost prices the patch convolution."
         ),
         **{
             f"{_VTP_LAYERS}/embeddings.py::{name}": (
@@ -775,63 +766,24 @@ _VTP: Final = Reference(
         f"{_VTP_LAYERS}/misc.py::PatchDropout": _VTP_TRAINING,
         f"{_VTP_LAYERS}/activation.py::QuickGELU": _VTP_TEXT,
     },
-    reference_unreached={
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPPreTrainedModel._init_weights::elif isinstance(module, nn.Embedding):": "VTP's reconstruction modules hold no embedding tables.",
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel._patch_tokens_to_4d::if N != feat_h * feat_w:": "A shape guard the trunk's own tokens always satisfy.",
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel.__init__::if config.train_clip:": "Reconstruction builds VTPModel without the CLIP side.",
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel._init_vision_components::if config.train_clip:": "Reconstruction builds VTPModel without the CLIP side.",
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel._init_vision_components::if config.train_reconstruction:": "Reconstruction always builds the pixel decoder.",
-        "vtp/models/vtp_hf/modeling_vtp.py::VTPModel.get_latents_decoded_images::if self.pixel_decoder is None:": "Reconstruction always builds the pixel decoder.",
-        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.__init__::if vit_feature_bottleneck is None:": "Every published trunk has a bottleneck.",
-        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.__init__::if self.vit_feature_bottleneck != self.original_embed_dim:": "Every published bottleneck narrows; the port refuses an equal width.",
-        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck._apply_feature_bottleneck::if self.feature_bottleneck is not None:": "Every published trunk has a bottleneck.",
-        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.forward_features::if self.feature_bottleneck is None or not use_bottleneck:": "get_reconstruction_latents always asks for the bottleneck.",
-        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.forward_features::if isinstance(output, list):": "Reconstruction encodes one tensor, not a crop list.",
-        "vtp/models/encoders/vision_transformer_bottleneck.py::DinoVisionTransformerWithBottleneck.forward_features::for item in output:": "Reconstruction encodes one tensor, not a crop list.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.__init__::if len(ignored_kwargs) > 0:": "A warning for unknown constructor keywords; none are passed.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.__init__::if self.n_storage_tokens > 0:": "VTP's trunk has no register tokens.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.init_weights::if self.n_storage_tokens > 0:": "VTP's trunk has no register tokens.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.prepare_tokens_with_masks::if self.n_storage_tokens > 0:": "VTP's trunk has no register tokens.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.__init__::if untie_cls_and_patch_norms:": "VTP ties the CLS and patch norms.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.__init__::if untie_global_and_local_cls_norm:": "VTP ties the global and local CLS norms.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features_list::if self.untie_cls_and_patch_norms or self.untie_global_and_local_cls_norm:": "VTP ties both norm pairs.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features_list::if self.untie_global_and_local_cls_norm and self.training and idx == 1:": "VTP ties both norm pairs, so this branch is never reached.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features_list::elif self.untie_cls_and_patch_norms:": "VTP ties both norm pairs, so this branch is never reached.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.prepare_tokens_with_masks::if masks is not None:": "Masked-token pretraining; reconstruction masks nothing.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features_list::if self.rope_embed is not None:": "VTP always uses rotary positions.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward_features::if isinstance(x, torch.Tensor):": "Reconstruction encodes one tensor, not a crop list.",
-        "vtp/models/encoders/vision_transformer.py::DinoVisionTransformer.forward::if is_training:": "get_reconstruction_latents always asks for the token dict.",
-        "vtp/models/encoders/vision_transformer.py::init_weights_vit::if isinstance(module, LayerScale):": "LayerScale is identity at VTP's layerscale_init=None.",
-        "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder.__init__::if len(ignored_kwargs) > 0:": "A warning for unknown constructor keywords; none are passed.",
-        "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder.init_weights::if isinstance(m, nn.Conv2d):": "Its only modules are the two convolutions.",
-        "vtp/models/decoders/pixel_decoder.py::DinoV3PixelDecoder.init_weights::if m.bias is not None:": "Both convolutions are biased.",
-        "vtp/models/layers/attention.py::SelfAttention.compute_attention::if rope is not None:": "VTP always uses rotary positions.",
-        "vtp/models/layers/block.py::SelfAttentionBlock.forward::elif isinstance(x_or_x_list, list):": "The trunk and decoder pass one tensor.",
-        "vtp/models/layers/block.py::SelfAttentionBlock.forward::if rope_or_rope_list is None:": "The trunk and decoder pass one tensor.",
-        "vtp/models/layers/block.py::SelfAttentionBlock._forward_list::if rope_list is not None:": "Reached only for a list input; the blocks get one tensor.",
-        "vtp/models/layers/block.py::SelfAttentionBlock._forward_list::if self.training and effective_drop_ratio > 0.0:": "Training-only stochastic depth.",
-        "vtp/models/layers/embeddings.py::make_2tuple::if isinstance(x, tuple):": "Every published patch size is an int.",
-        "vtp/models/layers/embeddings.py::PatchEmbed.forward::if not self.flatten_embedding:": "VTP flattens its patch embedding.",
-        "vtp/models/layers/embeddings.py::PatchEmbed.reset_parameters::if self.proj.bias is not None:": "The patch projection is biased.",
-        "vtp/models/layers/embeddings.py::RopePositionEmbedding.__init__::if (base is None and not both_periods) or (base is not None and both_periods):": "A misconfiguration guard; VTP configures a base.",
-        "vtp/models/layers/embeddings.py::RopePositionEmbedding._init_weights::if self.base is not None:": "VTP configures a base, not explicit periods.",
-        'vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::if self.normalize_coords == "max":': "VTP normalizes each side separately, the one mode the port implements.",
-        'vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::elif self.normalize_coords == "min":': "VTP normalizes each side separately, the one mode the port implements.",
-        'vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::elif self.normalize_coords == "separate":': "VTP normalizes each side separately, the one mode the port implements.",
-        "vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::if self.training and self.shift_coords is not None:": "Training-only coordinate augmentation.",
-        "vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::if self.training and self.jitter_coords is not None:": "Training-only coordinate augmentation.",
-        "vtp/models/layers/embeddings.py::RopePositionEmbedding.forward::if self.training and self.rescale_coords is not None:": "Training-only coordinate augmentation.",
-    },
+    reference_unreached=_VTP_REFERENCE_UNREACHED,
     port_unreached={
-        "model/vision_ae/vtp.py::init_weights_post::elif isinstance(module, nn.Embedding):": "Mirrors the reference's branch; VTP holds no embedding tables.",
-        "model/vision_ae/vtp.py::DinoV3PixelDecoder.__init__::if conv.bias is not None:": "Mirrors the reference's guard; both convolutions are biased.",
-        "model/vision_ae/vtp.py::PatchEmbed.reset_parameters::if self.proj.bias is not None:": "Mirrors the reference's guard; the patch projection is biased.",
-        "model/vision_ae/vtp.py::RopePositionEmbedding.__init__::if embed_dim % (4 * num_heads):": "A misconfiguration guard; vtp_test drives it.",
-        "model/vision_ae/vtp.py::VTP.encode::if height % self.patch_size or width % self.patch_size:": "Raises on a side off the patch grid; vtp_test drives it.",
+        "model/ae/vtp.py::VTP.__init__::if config.encoder is None and config.decoder is None:": _GUARD,
+        "model/ae/vtp.py::VTP.__init__::if any(math.isnan(v) or math.isinf(v) for v in stats) or 0 in config.pixel_std:": _GUARD,
+        "model/ae/vtp.py::VTP.__init__::if config.image_size % patch:": _GUARD,
+        "model/ae/vtp.py::VTP.__init__::if config.encoder is not None and config.decoder is not None:": "The comparison builds both halves; vtp_test leaves each out.",
+        "model/ae/vtp.py::VTP.__init__::if (decoder.channels_in, decoder.upscale_factor) != (": _GUARD,
+        "model/ae/vtp.py::VTP.encode::if self.encoder is None:": _GUARD,
+        "model/ae/vtp.py::VTP.encode::if x.dtype != torch.uint8:": _GUARD,
+        "model/ae/vtp.py::VTP.encode::if height % self.patch_size or width % self.patch_size:": _GUARD,
+        "model/ae/vtp.py::VTP.decode::if self.decoder is None:": _GUARD,
+        "model/ae/vtp.py::Encoder.__init__::if config.channels_out == config.channels_hidden:": _GUARD,
+        "model/ae/vtp.py::Encoder.__init__::if config.checkpoint is not None:": _LOADED,
+        "model/ae/vtp.py::Decoder.__init__::if config.checkpoint is not None:": _LOADED,
+        "model/ae/vtp.py::_Rotary.__init__::if width % (4 * num_heads):": _GUARD,
         "math/pixel.py::rgb2float::if not x_.dtype.is_floating_point:": "An input-type guard; the encoders always pass float_dtype=float32.",
         "math/pixel.py::rgb2float::if inplace and x_.requires_grad and x_.is_leaf:": "The encoders never scale a leaf requiring grad in place.",
         "math/pixel.py::rgb2float::if unit_interval:": "Both encoders normalize from [0, 1], so they always pass unit_interval=True.",
-        "model/vision_ae/vtp.py::VTP.__init__::if any(math.isnan(v) or math.isinf(v) for v in stats) or 0 in config.pixel_std:": "An error guard; vtp_test drives it.",
     },
     extra_outputs={},
     uncompared={
@@ -1124,28 +1076,36 @@ def compare(
     return problems, len(shared)
 
 
-def state_problems(label: str, theirs: nn.Module, ours: nn.Module) -> list[str]:
-    """Report where two state dicts differ in names, order, dtype, or bits.
+def state_problems(
+    label: str,
+    *,
+    expected: Mapping[str, Tensor],
+    ours: nn.Module,
+) -> list[str]:
+    """Report where the port's state differs from the reference's, renamed.
 
     Args:
       label: Prefix for each reported line.
-      theirs: The reference module.
+      expected: The reference state, under the port's names.
       ours: The port module.
 
     Returns:
-      problems: One line if the names or their order differ, else one per
-        differing tensor.
+      problems: One line if the names differ, else one per differing tensor.
 
     """
-    want, got = theirs.state_dict(), ours.state_dict()
-    if list(want) != list(got):
+    got = ours.state_dict()
+    if expected.keys() != got.keys():
         return [
-            f"{label}: state keys differ: {list(got)[:4]}... vs {list(want)[:4]}...",
+            (
+                f"{label}: state keys differ: "
+                f"{sorted(got.keys() - expected.keys())[:4]} vs "
+                f"{sorted(expected.keys() - got.keys())[:4]}"
+            ),
         ]
     return [
         f"{label}: {key} differs"
-        for key in want
-        if want[key].dtype != got[key].dtype or not torch.equal(want[key], got[key])
+        for key, want in expected.items()
+        if want.dtype != got[key].dtype or not torch.equal(want, got[key])
     ]
 
 
@@ -1202,14 +1162,19 @@ class Outcome:
 def run_invae(clone: Path, work: Path) -> Outcome:
     """Compare INVAE with REG's ``AutoencoderKL`` at the published f16d32 architecture.
 
+    Both sides hold one set of weights: REG's, renamed to the published
+    diffusers names the port loads. Module outputs are compared under REG's
+    module names, the port's renamed to them.
+
     Args:
       clone: REG's clone.
-      work: Scratch directory for the shared checkpoint.
+      work: Scratch directory, unused.
 
     Returns:
       outcome: Mismatches, the modules compared, and the randn call sites.
 
     """
+    del work
     _ = sys.modules.setdefault("dictdot", _dictdot_stub())
     sys.path.insert(0, str(clone))
     upstream = cast("_InvaeModule", importlib.import_module("models.invae"))
@@ -1218,13 +1183,25 @@ def run_invae(clone: Path, work: Path) -> Outcome:
     torch.manual_seed(0)
     theirs = upstream.VAE_F16D32()
     their_invae = cast("_TheirInvae", theirs)
-    torch.manual_seed(0)
-    unloaded = INVAE.Config(checkpoint=None).make()
-    outcome.problems += state_problems("invae init", theirs=theirs, ours=unloaded)
-
-    checkpoint = work / "invae.pt"
-    torch.save(theirs.state_dict(), checkpoint)
-    ours = INVAE.Config(checkpoint=LocalFile.Config(path=checkpoint)).make()
+    _randomize(theirs, seed=1)
+    ours = INVAE.Config(
+        encoder=InvaeEncoder.Config(checkpoint=None),
+        decoder=InvaeDecoder.Config(checkpoint=None),
+    ).make()
+    if ours.encoder is None:
+        raise ValueError("Expected ours.encoder is not None.")
+    if ours.decoder is None:
+        raise ValueError("Expected ours.decoder is not None.")
+    published = _ldm_to_diffusers(theirs.state_dict())
+    for half, module in (("encoder", ours.encoder), ("decoder", ours.decoder)):
+        module.load_state_dict(remap_invae_state_dict(published, half=half))
+    # The port's ``encoder`` ends in ``quant_conv``, REG's before it; the port's
+    # output is compared as ``quant_conv``.
+    reference_names = {
+        _invae_module_name(name): name
+        for name, _ in theirs.named_modules()
+        if name and name != "encoder"
+    }
     theirs.eval()
     generator = torch.Generator().manual_seed(0)
     for index in range(2):
@@ -1252,24 +1229,25 @@ def run_invae(clone: Path, work: Path) -> Outcome:
                     ).clamp(0, 1)
                 outcome.sites.update(pinned.sites)
                 with PinnedRandom([noise]) as pinned, recorded(ours) as our_modules:
-                    our_sample = ours.encode(image)
+                    our_posterior = ours.encode(image)
+                    our_sample = our_posterior.sample()
                     our_decoded = ours.decode(our_sample)
                 outcome.sites.update(pinned.sites)
-                our_posterior = ours.posterior(image)
-            fields = ("mean", "logvar", "std", "var")
             problems, compared = compare(
                 label,
                 theirs={
                     **their_modules,
-                    **{f: [[getattr(upstream_posterior, f)]] for f in fields},
+                    "mean": [[upstream_posterior.mean]],
+                    "std": [[upstream_posterior.std]],
                     "mode": [[upstream_posterior.mode()]],
                     "sample": [[their_sample]],
                     "decoded": [[their_decoded]],
                 },
                 ours={
-                    **our_modules,
-                    **{f: [[getattr(our_posterior, f)]] for f in fields},
-                    "mode": [[posterior_mode(our_posterior)]],
+                    **_renamed(our_modules, rename=reference_names.get),
+                    "mean": [[our_posterior.mean]],
+                    "std": [[our_posterior.std]],
+                    "mode": [[our_posterior.mode()]],
                     "sample": [[our_sample]],
                     "decoded": [[our_decoded]],
                 },
@@ -1280,12 +1258,86 @@ def run_invae(clone: Path, work: Path) -> Outcome:
     return outcome
 
 
-def run_rae(clone: Path, work: Path) -> Outcome:
-    """Compare RAE with the reference ``stage1.RAE`` on its tiny parity fixture.
+def _ldm_to_diffusers(state: Mapping[str, Tensor]) -> dict[str, Tensor]:
+    """Rename REG's LDM ``AutoencoderKL`` state to the published diffusers names."""
+    return {
+        _invae_published_name(key): tensor.reshape(_diffusers_shape(key, tensor))
+        for key, tensor in state.items()
+    }
 
-    The fixture is ``rae_test.tiny``'s geometry: width 8, a 2x2 latent grid,
-    8px out, with a 16px input that drives the bicubic resize and an 8px one
-    that skips it. Latent normalization is compared with and without a mean.
+
+def _diffusers_shape(key: str, tensor: Tensor) -> tuple[int, ...]:
+    """Return a tensor's diffusers shape: attention projections are ``Linear``."""
+    if re.search(r"\.(attn_1|attn\.\d+)\.(q|k|v|proj_out)\.weight$", key):
+        return tuple(tensor.shape[:2])
+    return tuple(tensor.shape)
+
+
+def _invae_published_name(key: str) -> str:
+    """Map one REG ``AutoencoderKL`` key to its diffusers name."""
+    name = _invae_module_name(key.rsplit(".", 1)[0]) + "." + key.rsplit(".", 1)[1]
+    half = name.split(".", 1)[0]
+    if half in {"quant_conv", "post_quant_conv"}:
+        return key
+    rest = name.split(".", 1)[1]
+    if rest.startswith(("quant_conv.", "post_quant_conv.")):
+        return rest
+    return name.replace(".to_out.", ".to_out.0.")
+
+
+def _invae_module_name(name: str) -> str:
+    """Map a REG ``AutoencoderKL`` module name to the port's, both halves prefixed."""
+    if name in {"quant_conv", "post_quant_conv"}:
+        return {
+            "quant_conv": "encoder.quant_conv",
+            "post_quant_conv": "decoder.post_quant_conv",
+        }[name]
+    name = re.sub(
+        r"\.mid\.block_(\d)",
+        lambda m: f".mid_block.resnets.{int(m[1]) - 1}",
+        name,
+    )
+    name = name.replace(".mid.attn_1", ".mid_block.attentions.0")
+    name = name.replace(".nin_shortcut", ".conv_shortcut").replace(
+        ".norm_out",
+        ".conv_norm_out",
+    )
+    name = re.sub(r"\.down\.(\d+)\.block", r".down_blocks.\1.resnets", name)
+    name = re.sub(r"\.down\.(\d+)\.attn", r".down_blocks.\1.attentions", name)
+    name = re.sub(r"\.down\.(\d+)\.downsample", r".down_blocks.\1.downsamplers.0", name)
+    match = re.match(r"decoder\.up\.(\d+)\.(block|attn|upsample)(.*)", name)
+    if match:
+        # REG stores ``up`` finest first; the port, as diffusers, coarsest first.
+        level = (
+            len(InvaeDecoder.Config(checkpoint=None).channels_hidden)
+            - 1
+            - int(match[1])
+        )
+        kind = {"block": "resnets", "attn": "attentions", "upsample": "upsamplers.0"}[
+            match[2]
+        ]
+        name = f"decoder.up_blocks.{level}.{kind}{match[3]}"
+    name = re.sub(r"(attentions\.\d+)\.norm$", r"\1.group_norm", name)
+    name = re.sub(r"(attentions\.\d+)\.(q|k|v)$", r"\1.to_\2", name)
+    return re.sub(r"(attentions\.\d+)\.proj_out$", r"\1.to_out", name)
+
+
+def _renamed(record: Record, rename: Callable[[str], str | None]) -> Record:
+    """Key a record by reference module names, dropping port-only modules."""
+    return {
+        theirs: calls
+        for ours, calls in record.items()
+        if (theirs := rename(ours)) is not None
+    }
+
+
+def run_rae(clone: Path, work: Path) -> Outcome:
+    """Compare RAE with the reference ``stage1.RAE`` on ``rae_test.tiny``'s geometry.
+
+    Width 8, a 2x2 latent grid, 8px out, with a 16px input that drives the
+    bicubic resize and an 8px one that skips it. Latent normalization is
+    compared with and without a mean. Each half loads the reference's own
+    checkpoint files through its published-name remap.
 
     Args:
       clone: The RAE clone.
@@ -1297,14 +1349,6 @@ def run_rae(clone: Path, work: Path) -> Outcome:
     """
     sys.path.insert(0, str(clone / "src"))
     stage1 = cast("_Stage1Module", importlib.import_module("stage1"))
-    upstream_decoder = cast(
-        "_DecoderModule",
-        importlib.import_module("stage1.decoders.decoder"),
-    )
-    utils = cast(
-        "_DecoderUtilsModule",
-        importlib.import_module("stage1.decoders.utils"),
-    )
     outcome = Outcome(problems=[])
     encoder_dir, decoder_dir = work / "enc", work / "dec"
     encoder_dir.mkdir(parents=True, exist_ok=True)
@@ -1363,11 +1407,43 @@ def run_rae(clone: Path, work: Path) -> Outcome:
     _randomize(bootstrap.decoder, seed=2)
     torch.save(bootstrap.decoder.state_dict(), work / "decoder.pt")
 
-    config = _rae_tiny()
-    assert isinstance(config.encoder, Dinov2WithRegisters.Config)
+    config = RAE.Config(
+        encoder=RaeEncoder.Config(
+            channels_hidden=8,
+            num_layers=1,
+            heads=2,
+            patch_size=4,
+            image_size=12,
+            checkpoint=None,
+        ),
+        decoder=RaeDecoder.Config(
+            channels_in=8,
+            num_patches=4,
+            channels_hidden=8,
+            channels_hidden_mlp=16,
+            num_layers=1,
+            heads=2,
+            patch_size=4,
+            checkpoint=None,
+        ),
+        image_size=8,
+        encoder_image_size=8,
+    )
+    if config.encoder is None:
+        raise ValueError("Expected config.encoder is not None.")
+    if config.decoder is None:
+        raise ValueError("Expected config.decoder is not None.")
     config.encoder.checkpoint = LocalFile.Config(path=encoder_dir / "model.safetensors")
     config.decoder.checkpoint = LocalFile.Config(path=work / "decoder.pt")
     ours = config.make()
+    published = {
+        **{
+            f"state.encoder.encoder.{k}": v
+            for k, v in read_state(encoder_dir / "model.safetensors").items()
+            if not k.startswith("layernorm.")
+        },
+        **{f"state.decoder.{k}": v for k, v in read_state(work / "decoder.pt").items()},
+    }
 
     mean = torch.randn(8, 2, 2, generator=torch.Generator().manual_seed(3))
     var = torch.rand(8, 2, 2, generator=torch.Generator().manual_seed(4)) + 0.5
@@ -1394,7 +1470,11 @@ def run_rae(clone: Path, work: Path) -> Outcome:
         # The one reference-side change: the kernel the port fixes, through HF's setter.
         their_rae = cast("_TheirRae", theirs)
         their_rae.encoder.encoder.set_attn_implementation("eager")
-        outcome.problems += state_problems("rae weights", theirs=theirs, ours=ours)
+        outcome.problems += state_problems(
+            "rae weights",
+            expected=_rae_port_state(theirs.state_dict()),
+            ours=ours,
+        )
         norm = None
         if stats is not None:
             norm = ElementwiseLatentStats.Config(
@@ -1407,7 +1487,7 @@ def run_rae(clone: Path, work: Path) -> Outcome:
                     their_latent = their_rae.encode(image.float() / 255)
                     their_decoded = their_rae.decode(their_latent)
                 with recorded(ours) as our_modules:
-                    raw = ours.encode(image)
+                    raw = ours.encode(image).mode()
                     our_latent = raw if norm is None else norm.normalize(raw)
                     our_decoded = ours.decode(
                         our_latent if norm is None else norm.denormalize(our_latent),
@@ -1420,7 +1500,7 @@ def run_rae(clone: Path, work: Path) -> Outcome:
                     "decoded": [[their_decoded.clamp(0, 1)]],
                 },
                 ours={
-                    **our_modules,
+                    **_renamed(our_modules, rename=_rae_module_name),
                     "latent": [[our_latent]],
                     "decoded": [[our_decoded]],
                 },
@@ -1431,50 +1511,75 @@ def run_rae(clone: Path, work: Path) -> Outcome:
             if stats is None and name == "16px":
                 outcome.golden = {
                     "source_commit": _commit_tensor(_RAE),
-                    **{f"state.{k}": v for k, v in ours.state_dict().items()},
+                    **published,
                     "image": image,
                     "latent": their_latent.float(),
                     "decoded": their_decoded.float(),
                 }
 
-    upstream_config = utils.ViTMAEConfig(
-        **{
-            k: v
-            for k, v in decoder_json.items()
-            if not k.startswith("_")
-            and k
-            not in {
-                "architectures",
-                "model_type",
-                "torch_dtype",
-                "transformers_version",
-            }
-        },
-    )
-    upstream_config.hidden_size = 8
-    upstream_config.image_size = 8
-    torch.manual_seed(7)
-    their_decoder = upstream_decoder.GeneralDecoder(upstream_config, num_patches=4)
-    torch.manual_seed(7)
-    our_decoder = GeneralDecoder.Config(
-        channels_in=8,
-        num_patches=4,
-        channels_hidden=8,
-        channels_hidden_mlp=16,
-        num_layers=1,
-        heads=2,
-        patch_size=4,
-    ).make()
-    outcome.problems += state_problems(
-        "rae decoder init",
-        theirs=their_decoder,
-        ours=our_decoder,
-    )
     return outcome
+
+
+def _rae_port_state(state: Mapping[str, Tensor]) -> dict[str, Tensor]:
+    """Rename the reference RAE's state to the port's, through the port's remaps."""
+    encoder = {
+        k.removeprefix("encoder.encoder."): v
+        for k, v in state.items()
+        if k.startswith("encoder.encoder.")
+    }
+    decoder = {
+        k.removeprefix("decoder."): v
+        for k, v in state.items()
+        if k.startswith("decoder.")
+    }
+    return {
+        **{f"encoder.{k}": v for k, v in remap_encoder_state_dict(encoder).items()},
+        **{f"decoder.{k}": v for k, v in remap_decoder_state_dict(decoder).items()},
+    }
+
+
+_RAE_ENCODER_MODULES: Final = (
+    (
+        r"^encoder\.patch_embed$",
+        "encoder.encoder.embeddings.patch_embeddings.projection",
+    ),
+    (r"^encoder\.layers\.", "encoder.encoder.encoder.layer."),
+    (r"^encoder\.norm$", "encoder.encoder.layernorm"),
+    (r"\.attention\.query$", ".attention.q_proj"),
+    (r"\.attention\.key$", ".attention.k_proj"),
+    (r"\.attention\.value$", ".attention.v_proj"),
+    (r"\.attention\.out$", ".attention.o_proj"),
+    (r"\.mlp_in$", ".mlp.fc1"),
+    (r"\.mlp_out$", ".mlp.fc2"),
+)
+
+_RAE_DECODER_MODULES: Final = (
+    (r"\.attention\.(query|key|value)$", r".attention.attention.\1"),
+    (r"\.attention\.out$", ".attention.output.dense"),
+    (r"\.norm1$", ".layernorm_before"),
+    (r"\.norm2$", ".layernorm_after"),
+    (r"\.mlp_in$", ".intermediate.dense"),
+    (r"\.mlp_out$", ".output.dense"),
+)
+
+
+def _rae_module_name(name: str) -> str | None:
+    """Map an RAE port module name to the reference's; ``None`` for port-only ones."""
+    # The port's decoder returns pixels; the reference's, patch logits. Both
+    # are compared: as ``decoder.decoder_pred`` and as the decoded image.
+    if name == "decoder":
+        return None
+    rules = _RAE_ENCODER_MODULES if name.startswith("encoder") else _RAE_DECODER_MODULES
+    for pattern, replacement in rules:
+        name = re.sub(pattern, replacement, name)
+    return name
 
 
 def run_vtp(clone: Path, work: Path) -> Outcome:
     """Compare VTP with ``VTPModel``'s reconstruction on ``vtp_test.tiny``'s geometry.
+
+    Both sides load the published-layout state stored in the reference golden;
+    the port's halves read it through their own checkpoint path.
 
     Args:
       clone: The VTP clone.
@@ -1497,43 +1602,10 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
     hf = cast("_VtpHfModule", importlib.import_module("vtp.models.vtp_hf"))
     outcome = Outcome(problems=[])
 
-    # Initialization, at a geometry VTPModel builds natively: its decoder's
-    # ffn ratio is 4 and its upscale the patch, 16.
-    torch.manual_seed(0)
-    their_init = hf.VTPModel(
-        hf.VTPConfig(
-            train_clip=False,
-            image_size=32,
-            vision_patch_size=16,
-            vision_embed_dim=16,
-            vision_depth=1,
-            vision_num_heads=2,
-            vision_mlp_ratio=4.0,
-            vision_feature_bottleneck=4,
-            decoder_embed_dim=16,
-            decoder_depth=1,
-            decoder_num_heads=2,
-        ),
-    )
-    native = VTP.Config()
-    native.trunk.channels_hidden = 16
-    native.trunk.num_layers = 1
-    native.trunk.heads = 2
-    native.trunk.channels_out = 4
-    native.pixel_decoder.channels_hidden = 16
-    native.pixel_decoder.num_layers = 1
-    native.pixel_decoder.heads = 2
-    native.image_size = 32
-    native.checkpoint = None
-    torch.manual_seed(0)
-    outcome.problems += state_problems(
-        "vtp init",
-        theirs=their_init,
-        ours=native.make(),
-    )
-
-    golden = load_golden(_TESTDATA / "vtp.pt")
-    state = golden["state_dict"]
+    golden = read_tensors(_TESTDATA / "vtp_reference.pt")
+    state = {
+        k.removeprefix("state."): v for k, v in golden.items() if k.startswith("state.")
+    }
     save_file(
         {k: v.contiguous() for k, v in state.items()},
         str(work / "vtp.safetensors"),
@@ -1568,13 +1640,38 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
     _ = theirs.load_state_dict(state, strict=True)
     theirs.eval()
     their_vtp = cast("_TheirVtp", theirs)
-    config = _vtp_tiny()
-    config.checkpoint = LocalFile.Config(path=work / "vtp.safetensors")
+    config = VTP.Config(
+        encoder=VtpEncoder.Config(
+            patch_size=4,
+            channels_hidden=16,
+            num_layers=1,
+            heads=2,
+            expansion=1.0,
+            channels_out=4,
+            checkpoint=None,
+        ),
+        decoder=VtpDecoder.Config(
+            channels_in=4,
+            channels_hidden=16,
+            num_layers=1,
+            heads=2,
+            expansion=1.0,
+            upscale_factor=4,
+            checkpoint=None,
+        ),
+        image_size=8,
+    )
+    if config.encoder is None:
+        raise ValueError("Expected config.encoder is not None.")
+    if config.decoder is None:
+        raise ValueError("Expected config.decoder is not None.")
+    config.encoder.checkpoint = LocalFile.Config(path=work / "vtp.safetensors")
+    config.decoder.checkpoint = LocalFile.Config(path=work / "vtp.safetensors")
     ours = config.make()
     config.dtype_autocast = torch.bfloat16
     ours_bf16 = config.make()
 
-    golden_input = cast("Tensor", golden["input"])
+    golden_input = golden["input"]
     square = torch.randint(
         0,
         256,
@@ -1592,7 +1689,7 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
             with recorded(theirs) as their_modules:
                 expected = _their_round_trip(their_vtp, image=image, autocast=autocast)
             with recorded(model) as our_modules:
-                latent = model.encode(image)
+                latent = model.encode(image).mode()
                 got = {"latent": latent, "image": model.decode(latent)}
         # The raw pixels are the recorded ``pixel_decoder`` output on both sides.
         problems, compared = compare(
@@ -1602,7 +1699,10 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
                 "latent": [[expected["latent"]]],
                 "image": [[expected["image"]]],
             },
-            ours={**our_modules, **{k: [[v]] for k, v in got.items()}},
+            ours={
+                **_renamed(our_modules, rename=_vtp_module_name),
+                **{k: [[v]] for k, v in got.items()},
+            },
             allowances=_VTP,
         )
         outcome.problems += problems
@@ -1611,8 +1711,30 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
             outcome.golden = {
                 "source_commit": _commit_tensor(_VTP),
                 **{k: v.float() for k, v in expected.items()},
+                **{f"state.{k}": v for k, v in state.items()},
+                "input": golden_input,
             }
     return outcome
+
+
+_VTP_MODULES: Final = (
+    (r"^encoder", "trunk"),
+    (r"^decoder", "pixel_decoder"),
+    (r"\.rope$", ".rope_embed"),
+    (r"^trunk\.patch_embed$", "trunk.patch_embed.proj"),
+    (r"^trunk\.bottleneck$", "trunk.feature_bottleneck"),
+    (r"\.mlp\.down_proj$", ".mlp.w3"),
+)
+
+
+def _vtp_module_name(name: str) -> str | None:
+    """Map a VTP port module name to the reference's; ``None`` for port-only ones."""
+    # The reference projects gate and value separately; the port fuses them.
+    if name.endswith(".mlp.up_proj"):
+        return None
+    for pattern, replacement in _VTP_MODULES:
+        name = re.sub(pattern, replacement, name)
+    return name
 
 
 def measure(
@@ -1641,7 +1763,8 @@ def measure(
         data_file=None,
         include=[
             *(str(clone / f) for f in reference.files),
-            str(_PRIML / "model" / "vision_ae" / "*.py"),
+            str(_PRIML / "model" / "ae" / "*.py"),
+            str(_PRIML / "model" / "*.py"),
             str(_PRIML / "math" / "*.py"),
         ],
         config_file=False,
@@ -1662,7 +1785,7 @@ def main() -> int:
 
     """
     parser = argparse.ArgumentParser(
-        description=(__doc__ or "").split("\n", 2)[2],
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_arguments(parser)
@@ -1884,8 +2007,9 @@ class _Decoded(Protocol):
 def _randomize(module: nn.Module, *, seed: int) -> None:
     """Draw every parameter from ``N(0, 0.3 ** 2)``: weights far from any init."""
     generator = torch.Generator().manual_seed(seed)
+    # By name: registration order moves between transformers releases.
     with torch.no_grad():
-        for parameter in module.parameters():
+        for _, parameter in sorted(module.named_parameters()):
             parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.3)
 
 
@@ -1911,26 +2035,6 @@ def _their_rae(
     )
 
 
-def _rae_tiny() -> RAE.Config:
-    """Return ``rae_test.tiny``'s geometry, which the checked-in golden is minted at."""
-    config = RAE.Config()
-    encoder = config.encoder
-    assert isinstance(encoder, Dinov2WithRegisters.Config)
-    encoder.channels_hidden = 8
-    encoder.num_layers = 1
-    encoder.heads = 2
-    encoder.patch_size = 4
-    encoder.image_size = 12
-    config.encoder_image_size = 8
-    config.decoder.channels_hidden = 8
-    config.decoder.channels_hidden_mlp = 16
-    config.decoder.num_layers = 1
-    config.decoder.heads = 2
-    config.decoder.patch_size = 4
-    config.image_size = 8
-    return config
-
-
 def _commit_tensor(reference: Reference) -> Tensor:
     """Return the reference's pinned commit as bytes, the golden's provenance."""
     return torch.frombuffer(bytearray(reference.commit.encode()), dtype=torch.uint8)
@@ -1943,15 +2047,6 @@ class _Stage1Module(Protocol):
 class _DecoderModule(Protocol):
     GeneralDecoder: Callable[..., nn.Module]
     DinoV3PixelDecoder: Callable[..., nn.Module]
-
-
-class _DecoderUtilsModule(Protocol):
-    ViTMAEConfig: Callable[..., _ViTMAEConfig]
-
-
-class _ViTMAEConfig(Protocol):
-    hidden_size: int
-    image_size: int
 
 
 class _TheirRae(Protocol):
@@ -1969,24 +2064,6 @@ class _TheirDinov2(Protocol):
 
 class _HfEncoder(Protocol):
     def set_attn_implementation(self, name: str, /) -> None: ...
-
-
-def _vtp_tiny() -> VTP.Config:
-    """Return ``vtp_test.tiny``'s geometry, which the checked-in golden is minted at."""
-    config = VTP.Config()
-    config.trunk.patch_size = 4
-    config.trunk.channels_hidden = 16
-    config.trunk.num_layers = 1
-    config.trunk.heads = 2
-    config.trunk.expansion = 1.0
-    config.trunk.channels_out = 4
-    config.pixel_decoder.channels_hidden = 16
-    config.pixel_decoder.num_layers = 1
-    config.pixel_decoder.heads = 2
-    config.pixel_decoder.expansion = 1.0
-    config.image_size = 8
-    config.checkpoint = None
-    return config
 
 
 def _their_round_trip(
