@@ -11,7 +11,7 @@ from __future__ import annotations
 from copy import deepcopy
 from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 from typing import TYPE_CHECKING, Final, cast
 
 from torch import Tensor
@@ -634,6 +634,7 @@ def test_the_kernel_table_binds_an_injected_reciprocal(
     built: list[tuple[str, tuple[str, ...]]] = []
 
     def record(kernel: Callable[..., object], **helpers: object) -> str:
+        assert isinstance(kernel, FunctionType)
         name = kernel.__name__
         built.append((name, tuple(sorted(helpers))))
         return name

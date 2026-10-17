@@ -315,9 +315,9 @@ def test_a_kernel_writes_nested_fields_at_their_c_offsets() -> None:
 
 def test_layout_helpers_refuse_an_unstructured_dtype() -> None:
     with pytest.raises(ValueError, match="a structured dtype is required"):
-        _ = byte_offset("x", np.dtype(np.float32))
+        _ = byte_offset("x", np.dtype(np.void))
     with pytest.raises(ValueError, match="a structured dtype is required"):
-        _ = semantic_bytes(np.dtype(np.float32))
+        _ = semantic_bytes(np.dtype(np.void))
 
 
 @pytest.mark.parametrize(

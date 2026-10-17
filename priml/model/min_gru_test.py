@@ -9,7 +9,7 @@ torch reference at torch's bf16 tolerance.
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 from typing import TYPE_CHECKING, ClassVar, Final, cast, override
 from unittest.mock import Mock, call
 
@@ -1438,6 +1438,7 @@ def test_the_kernel_table_binds_each_helper_into_its_callers(
     built: list[tuple[str, tuple[str, ...]]] = []
 
     def record(kernel: Callable[..., object], **helpers: object) -> str:
+        assert isinstance(kernel, FunctionType)
         name = kernel.__name__
         built.append((name, tuple(sorted(helpers))))
         return name
