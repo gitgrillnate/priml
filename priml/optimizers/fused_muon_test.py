@@ -628,6 +628,76 @@ def _portable_uniform(
     return (torch.rand(*shape, generator=generator) * 2 - 1) * bound
 
 
+def test_the_kernel_table_binds_an_injected_reciprocal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[tuple[str, tuple[str, ...]]] = []
+
+    def record(kernel: Callable[..., object], **helpers: object) -> str:
+        name = kernel.__name__
+        built.append((name, tuple(sorted(helpers))))
+        return name
+
+    def reciprocal_stub() -> None:
+        """Stand in for the default reciprocal helper."""
+
+    monkeypatch.setattr(fused_muon, "jit_kernel", record)
+    fused_muon._kernels.cache_clear()
+    try:
+        kernels = fused_muon._kernels(_reciprocal_triton=reciprocal_stub)
+    finally:
+        fused_muon._kernels.cache_clear()
+    assert ("reciprocal_stub", ()) in built
+    assert ("_normalize_triton", ("_reciprocal_triton",)) in built
+    assert (kernels.nesterov, kernels.apply) == ("_nesterov_triton", "_apply_triton")
+
+
+def test_the_fused_path_turns_a_float_rate_into_a_device_tensor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kernels read the rate from memory, so a Python float becomes a tensor."""
+    rates: list[object] = []
+    parameter = _parameter(2, 3)
+    optimizer = FusedMuon.Config().make()([parameter])
+    parameter.grad = torch.ones_like(parameter)
+
+    def nesterov_cuda(gradient: Tensor, buffer: Tensor, **kwargs: object) -> Tensor:
+        del kwargs
+        return gradient.float() + 0 * buffer
+
+    def normalize_cuda(update: Tensor, **kwargs: object) -> Tensor:
+        del kwargs
+        return update
+
+    def apply_cuda(
+        parameter: Tensor,
+        master: Tensor,
+        update: Tensor,
+        *,
+        lr: object,
+        scale: float,
+    ) -> None:
+        del parameter, master, update, scale
+        rates.append(lr)
+
+    monkeypatch.setattr(Tensor, "is_cuda", property(_on_cuda))
+    monkeypatch.setattr(optimizer, "_nesterov_cuda", nesterov_cuda)
+    monkeypatch.setattr(optimizer, "_normalize_cuda", normalize_cuda)
+    monkeypatch.setattr(optimizer, "_apply_cuda", apply_cuda)
+    optimizer.param_groups[0]["lr"] = 0.25
+    optimizer.step()
+    assert len(rates) == 1
+    assert isinstance(rates[0], Tensor)
+    assert rates[0].dtype == torch.float32
+    assert float(rates[0]) == 0.25
+
+
+def _on_cuda(tensor: Tensor) -> bool:
+    """Stand in for ``Tensor.is_cuda``: every tensor reports a CUDA device."""
+    del tensor
+    return True
+
+
 if __name__ == "__main__":
     from priml.lib.testing.runner import test_main
 

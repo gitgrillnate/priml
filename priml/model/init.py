@@ -152,6 +152,7 @@ def truncated_normal(
     References:
       https://github.com/jax-ml/jax/blob/main/jax/_src/nn/initializers.py
         ``jax.nn.initializers.variance_scaling`` (truncated distribution).
+        License: ``LICENSES/JAX``.
 
     """
     if variance_correction:

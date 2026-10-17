@@ -14,7 +14,7 @@ so a pairwise sum of the same logs lands on different bits.
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``src/pufferl.cu``, pin ``6ffa5b10``.
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``src/pufferl.cu``, pin ``6ffa5b10``.
 
 """
 

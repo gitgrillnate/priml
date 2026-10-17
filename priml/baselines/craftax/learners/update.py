@@ -22,7 +22,7 @@ References:
     https://arxiv.org/abs/1707.06347
         Schulman et al. 2017. Proximal policy optimization algorithms.
     https://github.com/MichaelTMatthews/Craftax_Baselines
-        Matthews et al. Craftax_Baselines (MIT license), ``ppo.py``, commit
+        Matthews et al. Craftax_Baselines (MIT, ``LICENSES/Craftax_Baselines``), ``ppo.py``, commit
         ``7ce36fa``.
 
 """

@@ -417,6 +417,43 @@ def test_scaled_linear_traffic_counts_scale_input_and_output() -> None:
     assert costed["bytes", "adjoint", "elementwise"].sum() == 3 * 2 * (4 + 4)
 
 
+def test_a_block_costed_alone_needs_a_square_grid() -> None:
+    block = ResidualBlock.Config(channels_in=4, channels_out=4)
+    with pytest.raises(ValueError, match="needs a square image; seq_len=12"):
+        _ = block.cost(seq_len=12, batch_size=1, dtype=None)
+
+
+def test_scaled_linear_fills_an_unset_width_from_the_other() -> None:
+    out_only = ScaledLinear.Config(channels_out=5).finalize()
+    in_only = ScaledLinear.Config(channels_in=7).finalize()
+    assert (out_only.channels_in, out_only.channels_out) == (5, 5)
+    assert (in_only.channels_in, in_only.channels_out) == (7, 7)
+
+
+def test_resnet_wires_an_explicit_output_projection() -> None:
+    config = tiny_resnet()
+    config.proj_out = ScaledLinear.Config()
+    finalized = config.finalize()
+    assert isinstance(finalized.proj_out, ScaledLinear.Config)
+    assert finalized.proj_out.channels_in == config.channels_hidden[-1]
+    assert finalized.proj_out.channels_out == config.channels_out
+
+
+def test_speednet_rejects_empty_channels_hidden() -> None:
+    config = tiny_speednet()
+    config.channels_hidden = ()
+    with pytest.raises(ValueError, match="at least one block"):
+        _ = config.make()
+
+
+def test_resnet_takes_one_config_per_block_from_a_list() -> None:
+    config = tiny_resnet()
+    stages, per_stage = len(config.channels_hidden), config.blocks_per_stage
+    config.block = [ResidualBlock.Config() for _ in range(stages * per_stage)]
+    model = config.make()
+    assert model(torch.randn(2, 3, 8, 8)).shape == (2, 2)
+
+
 if __name__ == "__main__":
     from priml.lib.testing.runner import test_main
 

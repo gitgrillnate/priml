@@ -39,12 +39,15 @@ from priml.baselines.craftax.game.state import (
     BlockType,
     EnvState,
     ItemType,
+    byte_offset,
+    env_log,
     env_state,
     env_stats,
     new_logs,
     new_states,
     new_stats,
     semantic_bytes,
+    training_stats,
 )
 
 
@@ -308,6 +311,29 @@ def test_a_kernel_writes_nested_fields_at_their_c_offsets() -> None:
     assert int.from_bytes(raw[76_328 + 68 + 20 : 76_328 + 68 + 24], "little") == 7
     assert raw[4 * 2304 + 48 + 2] == BlockType.STONE
     assert states[0:1].tobytes() == bytes(80_248)
+
+
+def test_layout_helpers_refuse_an_unstructured_dtype() -> None:
+    with pytest.raises(ValueError, match="a structured dtype is required"):
+        _ = byte_offset("x", np.dtype(np.float32))
+    with pytest.raises(ValueError, match="a structured dtype is required"):
+        _ = semantic_bytes(np.dtype(np.float32))
+
+
+@pytest.mark.parametrize(
+    ("read", "match"),
+    [
+        (env_log, "LOG_DTYPE"),
+        (training_stats, "TRAINING_STATS_DTYPE"),
+        (env_state, "STATE_DTYPE"),
+    ],
+)
+def test_record_readers_refuse_another_dtype(
+    read: Callable[[np.ndarray, int], object],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _ = read(np.zeros(1, dtype=STATS_DTYPE), 0)
 
 
 if __name__ == "__main__":

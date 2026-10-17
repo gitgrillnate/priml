@@ -109,7 +109,7 @@ def observation_aligned_advantage(
         Schulman et al. 2015. High-dimensional continuous control using
         generalized advantage estimation.
       https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``puff_advantage`` in
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``puff_advantage`` in
         ``src/algo.cu``, pin ``6ffa5b10``.
 
     """

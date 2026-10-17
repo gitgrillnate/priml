@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import ClassVar, Final, cast, override
+from typing import TYPE_CHECKING, ClassVar, Final, cast, override
 from unittest.mock import Mock, call
 
 from torch import Tensor
@@ -33,6 +33,10 @@ from priml.model.min_gru import (
 )
 from priml.testing.bfb import assert_bfb_against_golden
 from priml.testing.golden import assert_pprint_golden
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -1425,6 +1429,33 @@ def test_triton_scan_constructor_installs_torch_reference() -> None:
     assert result.final.dtype == torch.float64
     assert result.states.shape == inputs.shape
     assert result.states.dtype == torch.float64
+
+
+def test_the_kernel_table_binds_each_helper_into_its_callers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Built once per helper set; an injected helper replaces the default."""
+    built: list[tuple[str, tuple[str, ...]]] = []
+
+    def record(kernel: Callable[..., object], **helpers: object) -> str:
+        name = kernel.__name__
+        built.append((name, tuple(sorted(helpers))))
+        return name
+
+    def sigmoid_stub() -> None:
+        """Stand in for the default sigmoid helper."""
+
+    monkeypatch.setattr(min_gru, "jit_kernel", record)
+    min_gru._kernels.cache_clear()
+    try:
+        kernels = min_gru._kernels(_sigmoid_triton=sigmoid_stub)
+    finally:
+        min_gru._kernels.cache_clear()
+    assert built[0] == ("sigmoid_stub", ())
+    assert kernels.forward == "_scan_forward_triton"
+    assert kernels.backward == "_scan_backward_triton"
+    names = {name for name, _ in built}
+    assert {"_forward_update_triton", "_backward_update_triton"} <= names
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ def dct1d(x: Tensorable, *, normalize: bool = False) -> Tensor:
     References:
       https://github.com/zh217/torch-dct/blob/master/torch_dct/_dct.py
         via https://github.com/AaltoML/generative-inverse-heat-dissipation/blob/main/model_code/torch_dct.py
+        License: ``LICENSES/torch-dct``, ``LICENSES/generative-inverse-heat-dissipation``.
 
     """
     x = convert_to_tensor(x)
@@ -75,6 +76,7 @@ def idct1d(x: Tensorable, *, normalize: bool = False) -> Tensor:
     References:
       https://github.com/zh217/torch-dct/blob/master/torch_dct/_dct.py
         via https://github.com/AaltoML/generative-inverse-heat-dissipation/blob/main/model_code/torch_dct.py
+        License: ``LICENSES/torch-dct``, ``LICENSES/generative-inverse-heat-dissipation``.
 
     """
     x = convert_to_tensor(x)

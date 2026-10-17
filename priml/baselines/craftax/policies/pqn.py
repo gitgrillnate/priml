@@ -39,6 +39,7 @@ References:
         Gallici et al. 2024. Simplifying deep temporal difference learning.
     https://github.com/mttga/purejaxql
         The reference implementation, ``pqn_rnn_craftax.py``.
+        License: ``LICENSES/purejaxql``.
 
 """
 

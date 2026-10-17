@@ -8,6 +8,7 @@ in the same slot.
 
 References:
   https://github.com/libffcv/ffcv-imagenet/blob/main/train_imagenet.py
+    License: ``LICENSES/ffcv-imagenet``.
   https://arxiv.org/abs/1904.11486
     Zhang 2019. Making convolutional networks shift-invariant again.
 

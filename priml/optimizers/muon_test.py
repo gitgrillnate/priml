@@ -596,6 +596,22 @@ def test_muon_sharded_matches_replicated_multirank(
     assert results == {"rank_0": "ok", "rank_1": "ok"}, results
 
 
+def test_step_runs_the_closure_with_gradients_and_returns_its_loss() -> None:
+    parameter = nn.Parameter(torch.ones(2, 3))
+    optimizer = Muon([parameter], lr=0.0, weight_decay=0.0)
+
+    def closure() -> Tensor:
+        optimizer.zero_grad()
+        loss = parameter.square().sum()
+        loss.backward()
+        return loss
+
+    loss = optimizer.step(closure)
+    assert isinstance(loss, Tensor)
+    assert float(loss.detach()) == 6.0
+    assert parameter.grad is not None
+
+
 if __name__ == "__main__":
     from priml.lib.testing.runner import test_main
 

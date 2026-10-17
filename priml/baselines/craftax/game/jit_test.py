@@ -493,6 +493,29 @@ def _imported_names(tree: ast.Module) -> dict[str, str]:
     }
 
 
+def test_a_kernel_in_a_writable_tree_caches_beside_its_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``NUMBA_CACHE_DIR`` unset, Numba caches in the tree's ``__pycache__``."""
+    monkeypatch.setattr(config, "CACHE_DIR", "")
+    module = tmp_path / "writable.py"
+    module.write_text(
+        "from priml.baselines.craftax.game.jit import jit\n\n\n"
+        "@jit\ndef add_one(x: int) -> int:\n    return x + 1\n",
+    )
+    spec = util.spec_from_file_location("writable", module)
+    assert spec is not None
+    assert spec.loader is not None
+    loaded = util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    add_one = cast("_AddOne", loaded).add_one
+    assert isinstance(add_one, _Caching)
+    locator = add_one._cache._impl.locator
+    assert Path(locator.get_cache_path()) == tmp_path / "__pycache__"
+    assert locator.get_source_stamp() == source_stamp(module)
+
+
 if __name__ == "__main__":
     from priml.lib.testing.runner import test_main
 

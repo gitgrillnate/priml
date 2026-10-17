@@ -26,7 +26,7 @@ exponential needs no replacement.
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``src/algo.cu`` and ``src/pufferl.cu``,
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``src/algo.cu`` and ``src/pufferl.cu``,
         pin ``6ffa5b10``.
 
 """

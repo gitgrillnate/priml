@@ -32,6 +32,7 @@ References:
         fixed-length context.
     https://github.com/Reytuag/transformerXL_PPO_JAX
         The Craftax scoreboard implementation this ports.
+        License: ``LICENSES/transformerXL_PPO_JAX``.
 
 """
 

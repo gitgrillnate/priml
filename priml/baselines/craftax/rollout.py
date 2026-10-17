@@ -95,7 +95,7 @@ are numpy scalars.
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), the rollout and ``sample_logits`` in
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), the rollout and ``sample_logits`` in
         ``src/pufferl.cu``, pin ``6ffa5b10``.
 
 """

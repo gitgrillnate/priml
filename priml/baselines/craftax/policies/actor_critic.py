@@ -15,7 +15,7 @@ sampler and the learning rules read it.
 
 References:
     https://github.com/MichaelTMatthews/Craftax_Baselines
-        Matthews et al. Craftax_Baselines (MIT license), ``ActorCritic`` in
+        Matthews et al. Craftax_Baselines (MIT, ``LICENSES/Craftax_Baselines``), ``ActorCritic`` in
         ``models/actor_critic.py``, commit ``7ce36fa``.
 
 """

@@ -109,6 +109,7 @@ class Muon(Optimizer):
       Bernstein & Wan 2024, "Old Optimizer, New Norm."
       https://kellerjordan.github.io/posts/muon/
       https://github.com/KellerJordan/Muon
+        License: ``LICENSES/Muon``.
 
     """
 

@@ -48,7 +48,7 @@ Control row ``r`` (``ROW`` words, its own 128-byte block): ``TICKET``,
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``src/pufferl.cu`` and
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``src/pufferl.cu`` and
         ``ocean/craftax/craftax.h``, pin ``6ffa5b10``.
 
 """

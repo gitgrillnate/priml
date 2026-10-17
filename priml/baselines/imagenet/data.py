@@ -9,6 +9,7 @@ pipelines a fork injects instead -- ``exp000`` carries none of it.
 
 References:
   https://github.com/libffcv/ffcv-imagenet/blob/main/train_imagenet.py
+    License: ``LICENSES/ffcv-imagenet``.
   https://arxiv.org/abs/2012.12877
     Touvron et al. 2021. Training data-efficient image transformers.
 

@@ -21,7 +21,7 @@ recurrence has no parallel form, so a shorter window would save nothing.
 
 References:
     https://github.com/MichaelTMatthews/Craftax_Baselines
-        Matthews et al. Craftax_Baselines (MIT license), ``ppo_rnn.py``.
+        Matthews et al. Craftax_Baselines (MIT, ``LICENSES/Craftax_Baselines``), ``ppo_rnn.py``.
     https://arxiv.org/abs/1707.06347
         Schulman et al. 2017. Proximal policy optimization algorithms.
 

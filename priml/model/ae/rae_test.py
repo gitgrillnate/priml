@@ -1,7 +1,6 @@
 """RAE: the published architectures, their checkpoint names, and the reference's bits.
 
-``testdata/rae_reference.pt`` was minted by ``scripts/reference_parity.py`` from
-the reference clone at ``a4d18c4``: a tiny DINOv2-with-registers and decoder,
+``testdata/rae_reference.pt`` holds the reference at ``a4d18c4``: a tiny DINOv2-with-registers and decoder,
 their weights, an input, and the reference's latent and unclamped pixels, the
 reference's encoder pinned to HF's eager attention. Replaying it here proves
 the port against the reference itself. ``testdata/rae.pt`` freezes the port's

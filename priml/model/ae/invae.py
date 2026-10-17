@@ -3,7 +3,7 @@
 Build the published model with ``INVAE.load()``, or parse a diffusers
 ``config.json`` with :meth:`INVAE.Config.from_hf`.
 
-MIT license and attribution: ``priml/model/ae/IN-VAE-LICENSE``.
+MIT license and attribution: ``LICENSES/REG``.
 
 References:
   https://github.com/SwayStar123/REG/blob/3c51606c801dd9e87ee9ef778782766ab7c379ca/models/invae.py

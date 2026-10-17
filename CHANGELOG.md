@@ -21,12 +21,9 @@ All notable priml changes are documented here. This project follows
   revision, `UrlFile`, `LocalFile`), and every published default pins its
   SHA-256; each config's `latent_norm` holds its published normalizer
   (`ScaleLatents`, `ElementwiseLatentStats`, `ChannelLatentStats`).
-- `priml/model/ae/scripts/reference_parity.py`: clones each
-  autoencoder's reference at its pinned commit and proves the port
-  bit-identical through encode and decode, with the reference's weights
-  loaded through each port's remap, pinned randomness, per-module bisection,
-  a checked function inventory, and branch coverage over both sides. It mints
-  `testdata/rae_reference.pt` and `testdata/vtp_reference.pt`.
+- `priml/model/ae/testdata/rae_reference.pt` and `vtp_reference.pt`: each
+  reference's own outputs at its pinned commit, replayed bit for bit by
+  `rae_test` and `vtp_test`.
 - `priml.math.scalar_quantization`: exact Lloyd-Max fitting on sorted
   samples, the cube-root high-resolution start, standard-normal levels, and
   batched nearest-level `quantize` / `dequantize`.

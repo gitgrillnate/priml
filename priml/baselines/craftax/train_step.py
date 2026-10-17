@@ -25,7 +25,7 @@ under it.
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``src/pufferl.cu``, pin ``6ffa5b10``.
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``src/pufferl.cu``, pin ``6ffa5b10``.
 
 """
 
@@ -782,7 +782,7 @@ def cosine_annealing_fp32(
 
     References:
       https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``cosine_annealing`` in
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``cosine_annealing`` in
         ``src/pufferl.cu``, pin ``6ffa5b10``.
 
     """

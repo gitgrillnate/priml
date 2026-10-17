@@ -200,6 +200,8 @@ def exp000() -> Arc1TrainLoop:
       https://arxiv.org/abs/2510.04871
         Jolicoeur-Martineau. Less is More: Recursive Reasoning with Tiny
         Networks. Published at 44.6%.
+      https://github.com/SamsungSAILMontreal/TinyRecursiveModels
+        License: ``LICENSES/TinyRecursiveModels``.
 
     Results:
       8xH100: 46.0% pass@2 at step 370,000; the run finished.

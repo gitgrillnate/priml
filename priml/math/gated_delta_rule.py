@@ -1,7 +1,7 @@
 """Gated delta-rule attention with explicit recurrent state.
 
 The operation order follows the Transformers 5.17.0 PyTorch reference
-(Apache-2.0). In particular, normalization and accumulation use float32.
+(Apache-2.0, ``LICENSES/transformers``). In particular, normalization and accumulation use float32.
 """
 
 from torch import Tensor

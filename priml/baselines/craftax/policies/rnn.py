@@ -20,7 +20,7 @@ parallel form.
 
 References:
     https://github.com/MichaelTMatthews/Craftax_Baselines
-        Matthews et al. Craftax_Baselines (MIT license), ``ActorCriticRNN`` and
+        Matthews et al. Craftax_Baselines (MIT, ``LICENSES/Craftax_Baselines``), ``ActorCriticRNN`` and
         ``ScannedRNN`` in ``ppo_rnn.py``.
     https://arxiv.org/abs/1406.1078
         Cho et al. 2014. Learning phrase representations using RNN

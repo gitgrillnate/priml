@@ -20,6 +20,7 @@ overhead comes straight out of the step count, so a fused step buys score.
 References:
   https://github.com/karpathy/autoresearch
     Karpathy. autoresearch, ``adamw_step_fused`` in train.py.
+    License: MIT, stated in its README; ``LICENSES/README.md``.
 
 """
 

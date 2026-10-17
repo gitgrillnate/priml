@@ -61,6 +61,7 @@ def exp000() -> ImageNetTrainLoop:
 
     References:
       https://github.com/libffcv/ffcv-imagenet
+        License: ``LICENSES/ffcv-imagenet``.
       Leclerc et al. 2022. FFCV: Accelerating training by removing data
       bottlenecks.
 

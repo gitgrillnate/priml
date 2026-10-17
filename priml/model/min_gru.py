@@ -41,7 +41,7 @@ CPU run selects :class:`TorchScan`.
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``src/algo.cu``, pin ``6ffa5b10``.
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``src/algo.cu``, pin ``6ffa5b10``.
 
 """
 

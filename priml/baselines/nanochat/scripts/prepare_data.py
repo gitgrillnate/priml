@@ -68,6 +68,7 @@ References:
     https://github.com/karpathy/autoresearch
         Karpathy. prepare.py, commit
         b11d6f283f866eb7e10fb776a4b8553fef873fd5.
+        License: MIT, stated in its README; ``LICENSES/README.md``.
 
 '''
 # fmt: on

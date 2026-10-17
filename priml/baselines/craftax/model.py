@@ -45,7 +45,7 @@ once to a ``state_dict``.
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``src/algo.cu`` and
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``src/algo.cu`` and
         ``ocean/craftax/craftax.cu``, pin ``6ffa5b10``.
 
 """

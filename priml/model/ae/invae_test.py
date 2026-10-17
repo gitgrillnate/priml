@@ -1,7 +1,6 @@
 """INVAE: the published architecture, its checkpoint names, and its arithmetic.
 
-``testdata/invae.pt`` freezes the round trip at golden size. Parity with the
-REG reference is ``scripts/reference_parity.py``'s.
+``testdata/invae.pt`` freezes the round trip at golden size.
 """
 
 from __future__ import annotations

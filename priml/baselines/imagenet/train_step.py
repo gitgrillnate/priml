@@ -12,6 +12,7 @@ their defaults, so a fork swaps either without touching this file.
 
 References:
   https://github.com/libffcv/ffcv-imagenet/blob/main/train_imagenet.py
+    License: ``LICENSES/ffcv-imagenet``.
 
 """
 

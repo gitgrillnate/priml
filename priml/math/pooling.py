@@ -75,7 +75,7 @@ def adaptive_avg_pool3d(
 # The index-gather algorithm below is an N-dimensional generalization of
 # PyTorch's reference decomposition for adaptive average pooling:
 #   https://github.com/pytorch/pytorch/blob/main/torch/_decomp/decompositions.py
-# (PyTorch, BSD-3-Clause). Unlike that reference, which hard-codes separate
+# (PyTorch, BSD-3-Clause, LICENSES/PyTorch). Unlike that reference, which hard-codes separate
 # 2D/3D paths, this collapses to a single rank-agnostic implementation and
 # adds the `variance_preserving` scaling option.
 

@@ -58,7 +58,7 @@ each on the Xeon, which Numba exposes no spelling for. ``prefetch`` is
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``ocean/craftax/craftax.h``, pin
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``ocean/craftax/craftax.h``, pin
         ``6ffa5b10``.
 
 """

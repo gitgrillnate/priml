@@ -158,6 +158,7 @@ class ChannelLatentStats:
 
     References:
       https://github.com/JingfengYao/LightningDiT/blob/986098540d7d902cfee84e5344804de0eeeb2aaa/datasets/img_latent_dataset.py
+        License: ``LICENSES/LightningDiT``.
 
     """
 

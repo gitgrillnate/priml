@@ -1,9 +1,8 @@
 """VTP: the published architectures, their checkpoint names, and the reference's bits.
 
 ``testdata/vtp_reference.pt`` holds MiniMax-AI/VTP's own outputs at commit
-``5ce1eb6`` for the weights and input it stores, minted by
-``scripts/reference_parity.py`` under ``host_agnostic_numerics``. Replaying it
-here proves the port against the reference. ``testdata/vtp.pt`` freezes the
+``5ce1eb6`` for the weights and input it stores, under
+``host_agnostic_numerics``. Replaying it here proves the port against the reference. ``testdata/vtp.pt`` freezes the
 port's own round trip.
 """
 

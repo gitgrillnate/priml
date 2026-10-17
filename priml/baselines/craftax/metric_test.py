@@ -166,6 +166,15 @@ def test_the_score_requires_a_played_evaluation() -> None:
         CraftaxScore.Config().make().update(played=object())
 
 
+def test_reset_forgets_the_last_evaluation() -> None:
+    score = CraftaxScore.Config().make()
+    played = Played(logs=_logs([_with_n(1.0, 1.0)]), rollouts=1, gameplay_seconds=0.5)
+    score.update(played=played)
+    assert score.compute()
+    score.reset()
+    assert score.compute() == {}
+
+
 if __name__ == "__main__":
     from priml.lib.testing.runner import test_main
 

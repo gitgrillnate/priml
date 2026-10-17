@@ -4,7 +4,7 @@ The latent is the encoder's patch-token grid. Build the published model with
 ``RAE.load()``, or parse the two ``config.json`` files with
 :meth:`RAE.Config.from_hf`.
 
-MIT license and attribution: ``priml/model/ae/RAE-LICENSE``.
+MIT license and attribution: ``LICENSES/RAE``.
 
 References:
   https://github.com/bytetriper/RAE/blob/a4d18c4db766419cbe7cb8c02cd9f7ceb0ec9041/src/stage1/rae.py

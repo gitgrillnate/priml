@@ -4,7 +4,7 @@ A DINOv3-style ViT encoder with a linear bottleneck, and a ViT pixel decoder.
 Build a published model with ``VTP.load()``, or parse its ``config.json`` with
 :meth:`VTP.Config.from_hf`.
 
-MIT license with an attribution clause: ``priml/model/ae/VTP-LICENSE``.
+MIT license with an attribution clause: ``LICENSES/VTP``.
 
 References:
   https://github.com/MiniMax-AI/VTP/tree/5ce1eb67010fff3c1eed483352483be6a1838556/vtp/models

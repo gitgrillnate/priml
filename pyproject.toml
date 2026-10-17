@@ -8,6 +8,7 @@ description = "Malleable ML building blocks for training experiments."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
+license-files = ["LICENSE", "LICENSES/*"]
 authors = [{name = "rekursiv.ai", email = "hello@rekursiv.ai"}]
 keywords = ["ml", "pytorch", "training", "experiments"]
 classifiers = [
@@ -300,6 +301,8 @@ exclude_lines = [
     "if __name__ == .__main__.:",
     "raise NotImplementedError",
     "^\\s*\\.\\.\\.$",
+    # Typing-only bodies: an ``@overload`` stub never runs.
+    "@overload",
     # Convention: a ``_triton``-suffixed def is a body ``triton.jit`` compiles
     # from its source text to PTX. The Python bytecode never runs, so the
     # tracer cannot see lines a GPU test executed; the kernel is tested by

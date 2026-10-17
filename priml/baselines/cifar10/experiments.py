@@ -149,6 +149,7 @@ def exp001() -> Cifar10TrainLoop:
 
     References:
       https://github.com/KellerJordan/cifar10-airbench
+        License: ``LICENSES/cifar10-airbench``.
       Jordan 2024. 94% on CIFAR-10 in 3.29 seconds on a single A100.
 
     Results:

@@ -216,6 +216,7 @@ def exp000() -> NanoChatLoop.Config:
       https://github.com/karpathy/autoresearch
         Karpathy. autoresearch, commit
         b11d6f283f866eb7e10fb776a4b8553fef873fd5.
+        License: MIT, stated in its README; ``LICENSES/README.md``.
       https://arxiv.org/abs/2109.08668
         So et al. Primer: Searching for Efficient Transformer for Language
         Modeling.

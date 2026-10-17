@@ -47,7 +47,7 @@ is the one place a raw record is given that type.
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``ocean/craftax/craftax.h`` and
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``ocean/craftax/craftax.h`` and
         ``ocean/craftax/constants.h``, pin ``6ffa5b10``.
 
 """

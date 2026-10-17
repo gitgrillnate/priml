@@ -25,7 +25,7 @@ config different bits on different hosts. A CPU run selects ``TorchPPO``.
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``cache_imp_and_v``,
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``cache_imp_and_v``,
         ``puff_advantage``, ``ppo_loss_compute`` and ``ppo_loss_reduce`` in
         ``src/algo.cu``, pin ``6ffa5b10``.
 

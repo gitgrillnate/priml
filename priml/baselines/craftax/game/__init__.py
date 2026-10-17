@@ -42,7 +42,7 @@ the tests of ``jit``'s rules.
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``ocean/craftax/craftax.h``.
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``ocean/craftax/craftax.h``.
     https://arxiv.org/abs/2402.16801
         Matthews et al. 2024. Craftax: a lightning-fast benchmark for
         open-ended reinforcement learning.

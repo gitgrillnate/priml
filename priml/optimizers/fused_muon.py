@@ -32,7 +32,7 @@ The step is then ``master -= lr * update`` in fp32, with the product rounded.
 
 References:
   https://github.com/PufferAI/PufferLib
-    Suarez. PufferLib (MIT license), ``muon_step`` in ``src/algo.cu``, pin
+    Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``muon_step`` in ``src/algo.cu``, pin
     ``6ffa5b10``.
   https://kellerjordan.github.io/posts/muon/
     Jordan et al. Muon: An optimizer for hidden layers in neural networks.

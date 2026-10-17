@@ -41,7 +41,7 @@ Launch::
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``config/craftax.ini``, pin ``6ffa5b10``.
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``config/craftax.ini``, pin ``6ffa5b10``.
 
 """
 
@@ -801,6 +801,7 @@ def exp009() -> CraftaxTrainLoop:
 
     References:
       https://github.com/MichaelTMatthews/Craftax (Craftax-Symbolic-v1)
+        License: ``LICENSES/Craftax``.
 
     Results:
       H200 + 16 CPUs, 3.49B transitions: 12.48% perf (seed 73).
@@ -1167,6 +1168,7 @@ def exp013() -> CraftaxPQNTrainLoop:
         Gallici et al. 2024. Simplifying deep temporal difference learning.
       https://github.com/mttga/purejaxql
         The reference, ``pqn_rnn_craftax.py`` and its Craftax config.
+        License: ``LICENSES/purejaxql``.
 
     Results:
       H200 + 16 CPUs, 1B transitions: 16.32% perf (seed 42).
@@ -1301,6 +1303,7 @@ def exp015() -> CraftaxTrainLoop:
 
     References:
       https://github.com/Reytuag/transformerXL_PPO_JAX
+        License: ``LICENSES/transformerXL_PPO_JAX``.
       https://arxiv.org/abs/1910.06764
         Parisotto et al. 2020. Stabilizing transformers for reinforcement
         learning.

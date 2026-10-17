@@ -17,7 +17,7 @@ wastes a step on a recipe the player cannot afford.
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``ocean/craftax/craftax.h``, pin
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``ocean/craftax/craftax.h``, pin
         ``6ffa5b10``.
 
 """

@@ -36,6 +36,7 @@ size; a cheaper replay is a speed follow-up, not a change of what is learned.
 References:
     https://github.com/Reytuag/transformerXL_PPO_JAX
         The Craftax scoreboard implementation whose learner this ports.
+        License: ``LICENSES/transformerXL_PPO_JAX``.
     https://arxiv.org/abs/1707.06347
         Schulman et al. 2017. Proximal policy optimization algorithms.
 

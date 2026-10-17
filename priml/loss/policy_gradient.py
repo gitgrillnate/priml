@@ -27,7 +27,7 @@ References:
     https://arxiv.org/abs/1707.06347
         Schulman et al. 2017. Proximal policy optimization algorithms.
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``src/algo.cu``, pin ``6ffa5b10``.
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``src/algo.cu``, pin ``6ffa5b10``.
 
 """
 

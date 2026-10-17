@@ -14,7 +14,7 @@ docstring says why the game is numpy).
 
 References:
     https://github.com/PufferAI/PufferLib
-        Suarez. PufferLib (MIT license), ``src/pufferl.cu``, pin ``6ffa5b10``.
+        Suarez. PufferLib (MIT, ``LICENSES/PufferLib``), ``src/pufferl.cu``, pin ``6ffa5b10``.
 
 """
 
