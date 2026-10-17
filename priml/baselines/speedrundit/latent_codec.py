@@ -36,14 +36,17 @@ from torch import Tensor
 
 import torch
 
-from priml.math.scalar_quantization import (
-    dequantize,
+from priml.math.quantization.fits import (
+    moment_matched_levels,
+    quantile_levels,
+    uniform_levels,
+)
+from priml.math.quantization.lloyd_max import (
     gaussian_levels,
     high_resolution_levels,
     lloyd_max,
-    midpoints,
-    quantize,
 )
+from priml.math.quantization.nearest import dequantize, midpoints, quantize
 
 
 if TYPE_CHECKING:
@@ -200,8 +203,7 @@ class GaussianFit:
           levels: ``[NUM_LEVELS]`` float64.
 
         """
-        x = values.to(torch.float64)
-        return x.mean() + x.std() * self.unit.to(x.device)
+        return moment_matched_levels(values, unit=self.unit)
 
 
 class QuantileFit:
@@ -227,12 +229,7 @@ class QuantileFit:
           levels: ``[NUM_LEVELS]`` float64.
 
         """
-        x = values.to(torch.float64).sort().values
-        position = (
-            torch.arange(NUM_LEVELS, dtype=torch.float64, device=x.device) + 0.5
-        ) / NUM_LEVELS
-        index = (position * x.numel()).long().clamp(max=x.numel() - 1)
-        return x[index]
+        return quantile_levels(values, num_levels=NUM_LEVELS)
 
 
 class LinearFit:
@@ -248,7 +245,7 @@ class LinearFit:
         clip = config.clip_sigmas
         if clip is not None and (math.isnan(clip) or math.isinf(clip) or clip <= 0):
             raise ValueError(f"clip_sigmas must be positive and finite; got {clip}.")
-        self.clip_sigmas = config.clip_sigmas
+        self.clip_sigmas = clip
 
     def __call__(self, values: Tensor, /) -> Tensor:
         """Return cell centres of a uniform partition of the range.
@@ -260,17 +257,10 @@ class LinearFit:
           levels: ``[NUM_LEVELS]`` float64.
 
         """
-        x = values.to(torch.float64)
-        if self.clip_sigmas is None:
-            low, high = x.min(), x.max()
-        else:
-            spread = self.clip_sigmas * x.std()
-            low, high = x.mean() - spread, x.mean() + spread
-        step = (high - low) / NUM_LEVELS
-        return (
-            low
-            + (torch.arange(NUM_LEVELS, dtype=torch.float64, device=x.device) + 0.5)
-            * step
+        return uniform_levels(
+            values,
+            num_levels=NUM_LEVELS,
+            clip_sigmas=self.clip_sigmas,
         )
 
 

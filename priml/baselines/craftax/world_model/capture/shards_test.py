@@ -289,6 +289,25 @@ def test_an_episode_whose_floors_replay_does_not_give_fails_its_shard(
     assert not read_manifest(tmp_path)
 
 
+def test_a_shard_queued_behind_a_failed_one_is_not_written(
+    tmp_path: Path,
+    writer: ShardWriter,
+    gate: dict[int, threading.Event],
+) -> None:
+    gate[0] = threading.Event()
+    first = _episode(0)
+    hashes = first.hashes.clone()
+    hashes[-1] ^= 1
+    stream = writer.stream(tmp_path, index=0, threshold=1)
+    stream.add(dataclasses.replace(first, hashes=hashes))
+    stream.add(_episode(1))
+    gate[0].set()
+    with pytest.raises(ValueError, match="hash"):
+        writer.finish()
+    assert not read_manifest(tmp_path)
+    assert not writer.published
+
+
 def _noting_wait(
     wait_for: Callable[[Callable[[], bool], float | None], bool],
     waited: threading.Event,

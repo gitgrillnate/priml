@@ -365,6 +365,13 @@ def test_update_uses_last_axis_for_rank_three_tokens() -> None:
     assert seen == [(4, 6)]
 
 
+def test_state_round_trips_as_nothing() -> None:
+    meter = Utilization(Utilization.Config())
+    assert meter.state_dict() == {}
+    meter.load_state_dict({"anything": 1})
+    assert meter.state_dict() == {}
+
+
 if __name__ == "__main__":
     from priml.lib.testing.runner import test_main
 

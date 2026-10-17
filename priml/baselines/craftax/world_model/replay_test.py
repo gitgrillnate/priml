@@ -482,6 +482,22 @@ def _signed(value: int) -> int:
     return value - (1 << 64) if value >= 1 << 63 else value
 
 
+def test_a_snapshot_of_another_length_is_refused() -> None:
+    with pytest.raises(ValueError, match="bytes, not 3"):
+        _ = replay.load(b"abc")
+
+
+def test_only_equal_lengths_xor() -> None:
+    with pytest.raises(ValueError, match="equal lengths"):
+        _ = replay.xor_bytes(b"ab", right=b"abc")
+
+
+def test_an_episode_without_decisions_is_refused(episode: Episode) -> None:
+    empty = dataclasses.replace(episode, actions=episode.actions[:0])
+    with pytest.raises(ValueError, match="Invalid replay arguments"):
+        _ = replay.verify(empty)
+
+
 if __name__ == "__main__":
     from priml.lib.testing.runner import test_main
 

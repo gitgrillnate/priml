@@ -210,6 +210,13 @@ def test_delta_rejects_non_tensor_attention_mask(attention_mask: object) -> None
         native(torch.randn(2, 3, 8), attention_mask=attention_mask)
 
 
+def test_delta_layer_with_no_cached_state_runs_uncached() -> None:
+    native = _native()
+    x = torch.randn(2, 3, 8, generator=torch.Generator().manual_seed(0))
+    cache: dict[tuple[tuple[int, int], ...], object] = {native.depth_index: None}
+    assert torch.equal(native(x, cache=cache), native(x))
+
+
 @pytest.mark.parametrize("state_name", ["conv_state", "recurrent_state"])
 def test_delta_rejects_partial_cache_without_mutation(state_name: str) -> None:
     native = _native()

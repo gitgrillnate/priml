@@ -173,9 +173,15 @@ def test_from_hf_parses_each_published_architecture_into_its_factory(
     assert default.encoder is not None
     assert default.decoder is not None
     default.encoder.checkpoint = default.decoder.checkpoint = None
-    parsed.latent_norm = default.latent_norm
     assert parsed == default
     assert parsed.latent_shape() == (64, 16, 16)
+
+
+def test_from_hf_of_an_unpublished_architecture_keeps_the_default_statistics() -> None:
+    hf = _json("vtp_small_config.json")
+    hf["vision_depth"] = 3
+    parsed = VTP.Config.from_hf(hf)
+    assert parsed.latent_norm == VTP.Config().latent_norm
 
 
 def test_published_halves_load_exactly_the_published_tensors() -> None:

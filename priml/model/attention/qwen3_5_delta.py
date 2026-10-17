@@ -224,7 +224,7 @@ class Qwen35GatedDeltaNet(GatedDeltaNet):
         )
         if cache is not None:
             if state is None:
-                raise ValueError("Expected state is not None.")
+                raise ValueError("output_final_state=True returns the state.")
             cache["recurrent_state"] = state
         output = output.reshape(-1, self.channels_v_head)
         if z is None:

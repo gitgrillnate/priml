@@ -530,6 +530,7 @@ class _Recorder:
     def __init__(self, config: Config) -> None:
         del config
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.events: list[tuple[object, ...]] = []
 
     def log_metrics(
         self,
@@ -542,13 +543,15 @@ class _Recorder:
         self.calls.append((prefix, dict(metrics)))
 
     def log_images(self, key: str, images: list[object], step: int) -> None:
-        del key, images, step
+        del images
+        self.events.append(("images", key, step))
 
     def log_notes(self, notes: str) -> None:
-        del notes
+        self.events.append(("notes", notes))
 
     def close(self) -> None:
-        """Do nothing."""
+        """Note the close."""
+        self.events.append(("close",))
 
 
 def test_series_use_nanochat_names() -> None:
@@ -657,6 +660,27 @@ def _zstd_bpb(*micro_batches: bytes) -> float:
         len(zstd_compat.compress(data, level=ZSTD_LEVEL)) for data in micro_batches
     )
     return 8 * compressed / sum(len(data) for data in micro_batches)
+
+
+def test_series_need_a_tracker() -> None:
+    with pytest.raises(ValueError, match="child tracker"):
+        _ = NanochatSeries.Config().make()
+
+
+def test_series_forward_images_notes_and_close() -> None:
+    config = NanochatSeries.Config()
+    config.tracker = _Recorder.Config()
+    series = config.make()
+    recorder = series.tracker
+    assert isinstance(recorder, _Recorder)
+    series.log_images("samples", ["image"], 3)
+    series.log_notes("note")
+    series.close()
+    assert recorder.events == [
+        ("images", "samples", 3),
+        ("notes", "note"),
+        ("close",),
+    ]
 
 
 if __name__ == "__main__":

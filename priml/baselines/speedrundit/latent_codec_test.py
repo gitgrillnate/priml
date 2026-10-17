@@ -25,7 +25,7 @@ from priml.baselines.speedrundit.latent_codec import (
     bits_per_scalar,
     entropy_bits,
 )
-from priml.math.scalar_quantization import midpoints
+from priml.math.quantization.nearest import midpoints
 
 
 if TYPE_CHECKING:

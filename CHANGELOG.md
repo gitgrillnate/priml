@@ -24,9 +24,10 @@ All notable priml changes are documented here. This project follows
 - `priml/model/ae/testdata/rae_reference.pt` and `vtp_reference.pt`: each
   reference's own outputs at its pinned commit, replayed bit for bit by
   `rae_test` and `vtp_test`.
-- `priml.math.scalar_quantization`: exact Lloyd-Max fitting on sorted
-  samples, the cube-root high-resolution start, standard-normal levels, and
-  batched nearest-level `quantize` / `dequantize`.
+- `priml.math.quantization`: `lloyd_max` (exact Lloyd-Max fitting on sorted
+  samples, the cube-root high-resolution start, standard-normal levels),
+  `fits` (uniform, quantile, and moment-matched levels), and `nearest`
+  (batched nearest-level `quantize` / `dequantize`).
 - SpeedrunDiT: storage codecs (`FloatCodec`, `ScalarTableCodec` with injected
   table fits and channel grouping), a corpus receipt checked at load time,
   `prepare_data.py --experiment`, `benchmark_codec.py`, and experiments

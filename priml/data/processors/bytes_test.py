@@ -2381,6 +2381,57 @@ def test_video_decoder_invokes_ffmpeg_with_the_output_contract() -> None:
     }
 
 
+def test_video_decoder_routes_an_unclaimed_format_on_untouched() -> None:
+    processor = DecodeVideo(DecodeVideo.Config(ffmpeg_exe="unused-ffmpeg"))
+    sample = cast(
+        DecodeVideo.Input,
+        {"media": b"clip", "format": "webm", "frames": 8, "height": 2, "width": 2},
+    )
+    (out,) = processor(_as_stream([sample]))
+    assert "media_tensor" not in out
+    assert "filter_reasons" not in out
+
+
+def test_video_decoder_drops_a_failed_read_and_kills_a_hung_ffmpeg() -> None:
+    events: list[str] = []
+
+    class Stdout:
+        def read(self, size: int) -> bytes:
+            del size
+            raise OSError("broken pipe")
+
+        def close(self) -> None:
+            events.append("close")
+
+    class Process:
+        stdout = Stdout()
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            events.append("terminate")
+
+        def wait(self, timeout: int | None = None) -> None:
+            events.append(f"wait {timeout}")
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("ffmpeg", timeout)
+
+        def kill(self) -> None:
+            events.append("kill")
+
+    processor = DecodeVideo(DecodeVideo.Config(ffmpeg_exe="hung-ffmpeg"))
+    with patch(
+        "priml.data.processors.bytes.subprocess.Popen",
+        return_value=Process(),
+    ):
+        result = processor._decode(b"video", height=2, width=2, keep_frames=1)
+
+    assert result is None
+    assert events == ["close", "terminate", "wait 5", "kill", "wait None"]
+
+
 if __name__ == "__main__":
     from priml.lib.testing.runner import test_main
 

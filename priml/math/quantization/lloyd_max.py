@@ -1,7 +1,5 @@
-"""Fixed-rate scalar quantization: Lloyd-Max levels and nearest-level coding.
+"""Lloyd-Max: minimum-squared-error reconstruction levels for a sample.
 
-A quantizer is a sorted vector of reconstruction LEVELS; a value is coded as the
-index of its nearest level, found against the midpoints between neighbours.
 :func:`lloyd_max` fits levels that minimize mean squared error over a sample by
 alternating the two Lloyd-Max conditions -- each boundary is the midpoint of
 its neighbouring levels, each level is the mean of its cell -- until the
@@ -16,7 +14,8 @@ Derivation:
   ``[a, b)`` has mean ``(S[b] - S[a]) / (b - a)`` and squared error
   ``(Q[b] - Q[a]) - (S[b] - S[a])**2 / (b - a)``. Each iteration is then one
   ``searchsorted`` of the boundaries into ``x`` -- exact Lloyd on the sample,
-  with no histogram, at ``O(levels * log n)`` per iteration.
+  with no histogram, at ``O(levels * log n)`` per iteration, plus one more
+  pass per empty cell re-seated.
 
 References:
   W. R. Bennett. Spectra of quantized signals. Bell Syst. Tech. J.
@@ -41,6 +40,8 @@ import math
 from torch import Tensor
 
 import torch
+
+from priml.math.quantization.nearest import midpoints
 
 
 def lloyd_max(
@@ -86,10 +87,15 @@ def lloyd_max(
     if distinct.numel() <= num_levels:
         pad = distinct[-1].expand(num_levels - distinct.numel())
         return torch.cat([distinct, pad])
+    # Fit about the sample's middle: prefix sums of a sample far from zero cancel
+    # in float64, so cell means and errors go wrong and cells empty spuriously.
+    centre = x[x.numel() // 2]
+    x = x - centre
     zero = x.new_zeros(1)
     total = torch.cat([zero, x.cumsum(0)])
     total_sq = torch.cat([zero, (x * x).cumsum(0)])
     levels = init.detach().to(device=x.device, dtype=torch.float64).sort().values
+    levels = levels - centre
     # The INITIAL distortion, not infinity: ``inf - d <= tol * inf`` holds, which
     # stopped the loop after one step.
     previous = _distortion(x, levels=levels, total=total, total_sq=total_sq)
@@ -103,7 +109,7 @@ def lloyd_max(
         if distortion == 0 or previous - distortion <= tolerance * previous:
             break
         previous = distortion
-    return levels
+    return levels + centre
 
 
 def high_resolution_levels(
@@ -204,61 +210,11 @@ def gaussian_levels(num_levels: int, *, num_points: int = 1 << 20) -> Tensor:
     return lloyd_max(points, init=start, max_iterations=2_000, tolerance=1e-12)
 
 
-def midpoints(levels: Tensor) -> Tensor:
-    """Return the nearest-level decision boundaries between sorted levels.
-
-    Args:
-      levels: ``[..., L]`` sorted levels.
-
-    Returns:
-      thresholds: ``[..., L - 1]`` midpoints, in ``levels``' dtype.
-
-    """
-    # Halving is exact, so this rounds once like ``(a + b) / 2``, without overflowing
-    # when the sum of two finite levels would.
-    return levels[..., 1:] / 2 + levels[..., :-1] / 2
-
-
-def quantize(values: Tensor, thresholds: Tensor) -> Tensor:
-    """Return each value's nearest-level index, one threshold row per row.
-
-    A value equal to a threshold takes the lower cell, the convention
-    :func:`lloyd_max` fits with. Values past the outer thresholds saturate to
-    the first or last level.
-
-    Args:
-      values: ``[R, M]`` finite values; a NaN codes as the last index, since
-        checking values here would synchronize the device on every call.
-      thresholds: ``[R, L - 1]`` sorted boundaries, one row per row of values.
-
-    Returns:
-      indices: ``[R, M]`` int64 in ``[0, L - 1]``.
-
-    """
-    return torch.searchsorted(
-        thresholds.to(values.device).contiguous(),
-        values.contiguous(),
-    )
-
-
-def dequantize(indices: Tensor, levels: Tensor) -> Tensor:
-    """Return the level each index names, one level row per row.
-
-    Args:
-      indices: ``[R, M]`` integer indices.
-      levels: ``[R, L]`` levels.
-
-    Returns:
-      values: ``[R, M]`` in ``levels``' dtype.
-
-    """
-    return torch.gather(levels.to(indices.device), dim=-1, index=indices.long())
-
-
 def _cell_bounds(x: Tensor, levels: Tensor) -> Tensor:
     """Return the sample index each cell starts at, plus the end."""
     # Cell k holds the samples at or below boundary k and above boundary k-1;
-    # ``right=True`` counts ties into the lower cell, matching :func:`quantize`.
+    # ``right=True`` counts ties into the lower cell, matching
+    # :func:`~priml.math.quantization.nearest.quantize`.
     cut = torch.searchsorted(x, midpoints(levels), right=True)
     ends = x.new_tensor([x.numel()], dtype=torch.int64)
     return torch.cat([cut.new_zeros(1), cut, ends])
@@ -280,16 +236,16 @@ def _split_empty_cells(
 ) -> Tensor:
     """Re-seat every empty cell's level inside the worst cell, then re-sort."""
     levels = levels.clone()
-    for _ in range(levels.numel()):
+    # Each pass fills one empty cell and empties none, so it ends with every cell
+    # filled, or when no cell holds two values to split.
+    while True:
         bounds = _cell_bounds(x, levels=levels)
         counts = bounds[1:] - bounds[:-1]
         empty = (counts == 0).nonzero()
-        if empty.numel() == 0:
-            return levels
         error = _cell_errors(bounds, total=total, total_sq=total_sq)
         error = torch.where(counts > 1, error, error.new_tensor(-1.0))
         worst = int(error.argmax())
-        if error[worst] <= 0:
+        if empty.numel() == 0 or error[worst] <= 0:
             return levels
         start, end = int(bounds[worst]), int(bounds[worst + 1])
         middle = (start + end) // 2
@@ -300,7 +256,6 @@ def _split_empty_cells(
         levels[worst] = lower
         levels[int(empty[0])] = upper
         levels = levels.sort().values
-    return levels
 
 
 def _cell_errors(bounds: Tensor, total: Tensor, total_sq: Tensor) -> Tensor:

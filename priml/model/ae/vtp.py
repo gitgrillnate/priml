@@ -541,11 +541,17 @@ class VTP(nn.Module):
                 upscale_factor=encoder.patch_size,
                 checkpoint=checkpoint,
             )
-            return cls(
+            parsed = cls(
                 encoder=encoder,
                 decoder=decoder,
                 image_size=from_plain(config["image_size"], int),
             )
+            # Each published size has its own statistics; match by architecture.
+            for size in PUBLISHED:
+                published = _published(size)
+                if _architecture(published) == _architecture(parsed):
+                    parsed.latent_norm = published.latent_norm
+            return parsed
 
         def latent_shape(self) -> tuple[int, int, int]:
             """Return the latent's shape at ``image_size``.
@@ -719,25 +725,14 @@ class VTP(nn.Module):
           model: Frozen VTP.
 
         """
-        config = cls.Config.from_hf(
+        return cls.Config.from_hf(
             read_json(hub_or_local(path_or_repo, "config.json", revision=revision)),
             checkpoint=hub_or_local(
                 path_or_repo,
                 "model.safetensors",
                 revision=revision,
             ),
-        )
-        size = next(
-            (
-                name
-                for name, (repo, *_) in PUBLISHED.items()
-                if repo == str(path_or_repo)
-            ),
-            None,
-        )
-        if size is not None:
-            config.latent_norm = published_latent_norm(size)
-        return config.make()
+        ).make()
 
     @override
     def train(self, mode: bool = True) -> Self:
@@ -810,17 +805,17 @@ class VTP(nn.Module):
 
 def vtp_small() -> VTP.Config:
     """Return VTP-Small-f16d64: 384 wide, 12 blocks, 6 heads in each half."""
-    return _published("small", width=384, depth=12, heads=6)
+    return _published("small")
 
 
 def vtp_base() -> VTP.Config:
     """Return VTP-Base-f16d64: 768 wide, 12 blocks, 12 heads in each half."""
-    return _published("base", width=768, depth=12, heads=12)
+    return _published("base")
 
 
 def vtp_large() -> VTP.Config:
     """Return VTP-Large-f16d64, the :class:`VTP.Config` defaults: 1024 wide, 24 blocks."""
-    return VTP.Config()
+    return _published("large")
 
 
 def remap_hf_state_dict(state: Mapping[str, Tensor], *, half: str) -> dict[str, Tensor]:
@@ -894,8 +889,13 @@ _KNOWN: Final = (
 )
 
 
-def _published(size: str, *, width: int, depth: int, heads: int) -> VTP.Config:
+def _published(size: str) -> VTP.Config:
     """Return a published size's architecture, weights, and statistics."""
+    width, depth, heads = {
+        "small": (384, 12, 6),
+        "base": (768, 12, 12),
+        "large": (1024, 24, 16),
+    }[size]
     return VTP.Config(
         encoder=Encoder.Config(
             channels_hidden=width,
@@ -910,6 +910,18 @@ def _published(size: str, *, width: int, depth: int, heads: int) -> VTP.Config:
             checkpoint=published_weights(size),
         ),
         latent_norm=published_latent_norm(size),
+    )
+
+
+def _architecture(config: VTP.Config) -> tuple[object, ...]:
+    """Return what distinguishes one published size from another, weights aside."""
+    return (
+        *(
+            (half.channels_hidden, half.num_layers, half.heads, half.expansion)
+            for half in (config.encoder, config.decoder)
+            if half is not None
+        ),
+        config.image_size,
     )
 
 

@@ -956,9 +956,9 @@ class DecodeVideo:
                 )
             except OSError:
                 return None
-            if process.stdout is None:  # Popen(stdout=PIPE) always sets it.
-                raise ValueError("Expected process.stdout is not None.")
             stdout = process.stdout
+            if stdout is None:
+                raise ValueError("Popen(stdout=PIPE) always sets it.")
             frame_bytes = height * width * 3
             chunks: list[bytes] = []
             try:
@@ -993,15 +993,6 @@ class DecodeVideo:
         # never had.
         chunks.extend([chunks[-1]] * (keep_frames - len(chunks)))
         raw = bytearray(b"".join(chunks))
-        # Checked rather than left to ``view``: this function promises
-        # ``Tensor | None`` and its ``try`` above exists to make an unreadable
-        # clip a None, but the reshape sits OUTSIDE it -- so a stream whose
-        # bytes are not a whole number of frames raised ``RuntimeError`` from a
-        # function documented not to, killing the run instead of dropping one
-        # sample. ffmpeg is told the frame size, so a mismatch means a
-        # truncated read rather than a caller error.
-        if len(raw) != len(chunks) * height * width * 3:
-            return None
         stacked = torch.frombuffer(raw, dtype=torch.uint8).view(
             len(chunks),
             height,

@@ -22,6 +22,7 @@ from priml.baselines.nanochat.attention import (
     _qk_reference,
     fused_qk_norm_rope,
 )
+from priml.baselines.nanochat.ngram import HashedNgramTables, NgramSource
 from priml.cost import Cost, cost
 from priml.model.attention.kernel import SdpaNaive
 from priml.model.linear import Linear
@@ -518,6 +519,56 @@ def test_causal_attention_rejects_non_tensor_memories_and_supports_fused_rope(
             cos_sin=cos_sin,
             bigram_value=torch.randn(2, 3, 16),
         )
+
+
+def test_a_fused_source_without_its_gate_is_refused() -> None:
+    config = CausalAttention.Config()
+    config.channels_in = 16
+    config.channels_head = 4
+    config.num_heads = 4
+    config.gate_channels = 8
+    config.bigram = True
+    config.kernel = SdpaNaive.Config()
+    causal = config.make()
+    assert causal.trigram_gate is None
+    source = NgramSource(2, cast(HashedNgramTables, object()), [])
+    cos_sin = (torch.ones(3, 1, 2), torch.zeros(3, 1, 2))
+    with pytest.raises(ValueError, match="fused source 2 has no gate"):
+        causal(torch.randn(2, 3, 16), cos_sin=cos_sin, fused_tables=[source])
+
+
+def _unjitted(function: Callable[..., object]) -> Callable[..., object]:
+    return function
+
+
+def test_the_qk_kernels_autotune_over_every_block_and_warp_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tuned: list[tuple[int, list[str]]] = []
+
+    def autotune(
+        *,
+        configs: list[object],
+        key: list[str],
+    ) -> Callable[[object], object]:
+        tuned.append((len(configs), key))
+        return lambda kernel: kernel
+
+    def config(meta: dict[str, int], **options: int) -> object:
+        return (meta, options)
+
+    triton = SimpleNamespace(autotune=autotune, Config=config)
+    monkeypatch.setattr(attention, "triton", triton)
+    monkeypatch.setattr(attention, "jit_kernel", _unjitted)
+    attention._compiled_qk_forward.cache_clear()
+    attention._compiled_qk_backward.cache_clear()
+    try:
+        _ = attention._compiled_qk_forward()
+        _ = attention._compiled_qk_backward()
+    finally:
+        attention._compiled_qk_forward.cache_clear()
+        attention._compiled_qk_backward.cache_clear()
+    assert tuned == [(12, ["n_rows"]), (12, ["n_rows"])]
 
 
 def test_qk_validation_rejects_bad_shapes_and_widths() -> None:

@@ -17,6 +17,7 @@ from priml.baselines.etth1.testing import (
     tiny_batches,
     tiny_config,
     training_record,
+    update_record,
 )
 from priml.baselines.etth1.train_step import Etth1TrainLoop
 from priml.testing.bfb import host_agnostic_numerics
@@ -191,6 +192,16 @@ def test_legacy_checkpoint_without_resume_state_is_rejected(tmp_path: Path) -> N
             loop.load_state_dict(state)
     finally:
         loop.close()
+
+
+def test_update_record_refuses_optimizer_state_it_cannot_flatten() -> None:
+    class Optimizer:
+        def state_dict(self) -> dict[str, object]:
+            return {"state": {"note": "text"}}
+
+    model = torch.nn.Linear(1, 1)
+    with pytest.raises(TypeError, match="Unsupported optimizer state: str"):
+        _ = update_record(model, Optimizer(), torch.zeros(1), torch.zeros(()))
 
 
 if __name__ == "__main__":

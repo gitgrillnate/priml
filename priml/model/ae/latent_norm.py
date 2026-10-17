@@ -113,7 +113,7 @@ class ElementwiseLatentStats:
         """Return ``(latent - mean) / sqrt(var + eps)``.
 
         Args:
-          latent: ``[B, C, H, W]`` raw latent.
+          latent: ``[..., C, H, W]`` raw latent.
 
         Returns:
           normalized: Standardized latent.
@@ -128,7 +128,7 @@ class ElementwiseLatentStats:
         """Return ``latent * sqrt(var + eps) + mean``.
 
         Args:
-          latent: ``[B, C, H, W]`` standardized latent.
+          latent: ``[..., C, H, W]`` standardized latent.
 
         Returns:
           raw: Raw latent.
@@ -201,7 +201,7 @@ class ChannelLatentStats:
         """Return ``(latent - mean) / std * multiplier``.
 
         Args:
-          latent: ``[B, C, H, W]`` raw latent.
+          latent: ``[..., C, H, W]`` raw latent.
 
         Returns:
           normalized: Standardized, scaled latent.
@@ -214,7 +214,7 @@ class ChannelLatentStats:
         """Return ``latent * std / multiplier + mean``.
 
         Args:
-          latent: ``[B, C, H, W]`` diffusion-space latent.
+          latent: ``[..., C, H, W]`` diffusion-space latent.
 
         Returns:
           raw: Raw latent.

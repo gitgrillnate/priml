@@ -6,6 +6,7 @@ from unittest.mock import patch
 import re
 
 from torch import Tensor
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 import numpy as np
 import pytest
@@ -671,6 +672,12 @@ def test_shares_storage_raises_on_two_interleaved_strided_views() -> None:
     # Equal first bytes settle it whatever the strides, so an identical pair
     # must not raise.
     assert shares_storage(parent[::2], parent[::2])
+
+
+def test_shares_storage_for_compile_traces_to_a_boolean_scalar() -> None:
+    with FakeTensorMode():
+        traced = shares_storage_for_compile(torch.empty(4), torch.empty(4))
+    assert (traced.shape, traced.dtype) == ((), torch.bool)
 
 
 def test_is_dense_treats_bufferless_values_as_dense() -> None:

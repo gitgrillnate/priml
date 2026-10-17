@@ -151,8 +151,6 @@ class ShardWriter:
         for shard in self.shards:
             if (error := shard.exception()) is not None:
                 raise error
-        if self.failure is not None:
-            raise self.failure
         return self.published
 
     def shutdown(self) -> None:

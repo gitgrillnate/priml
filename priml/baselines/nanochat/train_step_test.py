@@ -1077,6 +1077,7 @@ def test_ngram_train_step_runs_one_cpu_update() -> None:
     assert isinstance(step, train_step.NgramTrainStep)
     result = step.train_step(**_batch())
     assert result["loss"].shape == (1,)
+    assert step.completed_updates == 1
 
 
 def test_a_two_pass_update_charges_the_budget_and_guards_the_worst_pass() -> None:
@@ -1166,6 +1167,21 @@ def test_a_scaled_member_without_a_numeric_rate_is_refused() -> None:
     config.optimizer = CompositeOptimizer.Config(optimizers=[member])
     with pytest.raises(TypeError, match="numeric lr"):
         config.finalize()
+
+
+def test_train_loss_scores_without_updating() -> None:
+    step = _smoke_step()
+    before = [parameter.detach().clone() for parameter in step.model.parameters()]
+    result = step.train_loss(**_smoke_batch(step))
+    assert result["loss"].shape == (1,)
+    after = list(step.model.parameters())
+    assert all(torch.equal(a, b) for a, b in zip(before, after, strict=True))
+
+
+def test_bounded_cross_entropy_refuses_an_unsupported_dtype() -> None:
+    config = train_step.BoundedTokenCrossEntropy.Config(dtype=torch.float64)
+    with pytest.raises(ValueError, match="bfloat16, float16, or float32"):
+        config.make()
 
 
 def test_learning_rates_reports_a_plain_optimizer() -> None:

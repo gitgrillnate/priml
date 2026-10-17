@@ -14,12 +14,16 @@ from __future__ import annotations
 
 from dataclasses import field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final, cast
 
+import dataclasses
+import functools
 import io
 import logging
 import multiprocessing
 import os
+import pickle
 import subprocess
 import time
 
@@ -45,15 +49,18 @@ from priml.math.seed import set_seed_local
 from priml.testing.golden import assert_tensor_golden, read_tensors
 
 
+_CWD: Final = Path(__file__).resolve().parent
+
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
+    from multiprocessing.connection import Connection
     from multiprocessing.queues import Queue
     from multiprocessing.synchronize import Event as EventType
 
     from torch import Tensor
 
 
-GOLDEN: Final = Path(__file__).parent.resolve() / "testdata" / "throughput.pt"
+GOLDEN: Final = _CWD.resolve() / "testdata" / "throughput.pt"
 SYNSETS: Final = ("n01440764", "n01443537")
 NUM_IMAGES: Final = 5
 """Two batches of two, and a remainder the batcher drops."""
@@ -222,6 +229,292 @@ def test_rejects_a_nonsensical_count() -> None:
 
     with pytest.raises(ValueError, match="num_repeats"):
         _ = LoaderThroughput(cfg)
+
+
+def _ignore(*args: object) -> None:
+    del args
+
+
+def _returning(value: object, *args: object, **kwargs: object) -> object:
+    del args, kwargs
+    return value
+
+
+def _noting_group(groups: list[int], group: int, grace_sec: float) -> None:
+    del grace_sec
+    groups.append(group)
+
+
+def test_a_pass_saves_then_compares_its_batches(
+    staged: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # In this process, so the tracer sees the body a spawned pass runs; the
+    # process group stays the test runner's.
+    monkeypatch.setattr(os, "setpgid", _ignore)
+    cfg = _tiny(staged)
+    payload = pickle.dumps(cfg.reference)
+
+    def run(**directories: str | None) -> object:
+        receiver, sender = multiprocessing.Pipe(duplex=False)
+        throughput._pass(
+            payload,
+            seed=cfg.seed,
+            fields=cfg.fields,
+            connection=sender,
+            **directories,
+        )
+        return cast("object", receiver.recv())
+
+    saved = run(save_dir=str(tmp_path), compare_dir=None)
+    compared = run(save_dir=None, compare_dir=str(tmp_path))
+
+    assert isinstance(saved, throughput._Pass)
+    assert isinstance(compared, throughput._Pass)
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["0.pt", "1.pt"]
+    assert (saved.num_batches, saved.num_reference_batches) == (2, 0)
+    assert (compared.num_reference_batches, compared.diffs) == (2, {})
+    assert compared.num_images == 4
+
+
+def test_a_pass_that_raises_sends_its_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "setpgid", _ignore)
+    receiver, sender = multiprocessing.Pipe(duplex=False)
+    with pytest.raises(pickle.UnpicklingError):
+        throughput._pass(
+            b"not a pickle",
+            seed=0,
+            fields=["image"],
+            save_dir=None,
+            compare_dir=None,
+            connection=sender,
+        )
+    message = cast("object", receiver.recv())
+    assert isinstance(message, str)
+    assert "UnpicklingError" in message
+
+
+def test_a_pass_with_fewer_reference_batches_compares_what_both_have(
+    staged: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "setpgid", _ignore)
+    cfg = _tiny(staged)
+    moved = {"image": IMAGE, "label": LABEL}
+    torch.save(moved, tmp_path / "0.pt")
+    receiver, sender = multiprocessing.Pipe(duplex=False)
+    throughput._pass(
+        pickle.dumps(cfg.reference),
+        seed=cfg.seed,
+        fields=cfg.fields,
+        save_dir=None,
+        compare_dir=str(tmp_path),
+        connection=sender,
+    )
+    result = cast("object", receiver.recv())
+    assert isinstance(result, throughput._Pass)
+    assert result.num_reference_batches == 1
+    assert sorted(result.diffs) == [(0, "image"), (0, "label")]
+
+
+def test_finalize_roots_both_pipelines_under_the_job(tmp_path: Path) -> None:
+    cfg = _tiny(tmp_path)
+    cfg.base_dir = tmp_path
+    final = cfg.finalize()
+    for pipeline in (final.pipeline, final.reference):
+        assert isinstance(pipeline, DataPipeline.Config)
+        assert pipeline.base_dir == final.working_dir
+
+
+def test_run_reports_the_rates_of_stubbed_passes(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls: list[str | None] = []
+
+    def run_pass(
+        pipeline: object,
+        cfg: object,
+        *,
+        save_dir: str | None = None,
+        compare_dir: str | None = None,
+    ) -> tuple[throughput._Pass, float]:
+        del pipeline, cfg, save_dir
+        calls.append(compare_dir)
+        return _result({}), 0.5
+
+    monkeypatch.setattr(throughput, "_run_pass", run_pass)
+    cfg = LoaderThroughput.Config()
+    cfg.num_repeats = 2
+    with caplog.at_level(
+        logging.INFO,
+        logger="priml.baselines.imagenet.throughput.throughput",
+    ):
+        cfg.make().run("--ignored")
+    assert calls[0] is None
+    assert len(calls) == 3
+    assert "Ignoring launcher passthrough args" in caplog.text
+    assert "images/cpu-sec (scored) over 2 passes of 2 images: median 4.0" in (
+        caplog.text
+    )
+
+
+def test_run_fails_on_mismatches_and_names_a_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    drift = throughput._Diff(
+        num_differing=1,
+        numel=24,
+        max_abs_diff=1.0,
+        first_index=(0, 0, 0),
+    )
+    monkeypatch.setattr(
+        throughput,
+        "_run_pass",
+        functools.partial(_returning, (_result({(0, "image"): drift}), 0.5)),
+    )
+    with pytest.raises(AssertionError, match="1 batch mismatches"):
+        LoaderThroughput.Config(num_repeats=1).make().run()
+
+    cfg = LoaderThroughput.Config(num_repeats=1)
+    cfg.tolerance = PixelTolerance.Config(max_abs_diff=1, max_fraction_differing=1)
+    with caplog.at_level(
+        logging.INFO,
+        logger="priml.baselines.imagenet.throughput.throughput",
+    ):
+        cfg.make().run()
+    assert "UNDER TOLERANCE max_abs_diff=1" in caplog.text
+
+
+def test_measure_refuses_a_pass_without_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    empty = dataclasses.replace(_result({}), num_images=0)
+    monkeypatch.setattr(
+        throughput,
+        "_run_pass",
+        functools.partial(_returning, (empty, 1.0)),
+    )
+    with pytest.raises(ValueError, match="Pass 0 yielded no batch"):
+        _ = LoaderThroughput.Config(num_repeats=1).make().measure()
+
+
+class _InlineProcess:
+    """A ``spawn`` process stand-in that runs ``stand_in`` on ``start``."""
+
+    pid = 123
+    exitcode = 0
+
+    def __init__(
+        self,
+        stand_in: Callable[..., None],
+        *,
+        target: object,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> None:
+        del target
+        self.run = functools.partial(stand_in, *args, **kwargs)
+
+    def start(self) -> None:
+        self.run()
+
+    def join(self) -> None:
+        """Nothing to wait for."""
+
+
+def _inline(
+    monkeypatch: pytest.MonkeyPatch,
+    stand_in: Callable[..., None],
+) -> list[int]:
+    """Run every pass inline through ``stand_in``; return the groups checked."""
+    groups: list[int] = []
+    context = SimpleNamespace(
+        Pipe=multiprocessing.Pipe,
+        Process=functools.partial(_InlineProcess, stand_in),
+    )
+    monkeypatch.setattr(
+        multiprocessing,
+        "get_context",
+        functools.partial(_returning, context),
+    )
+    monkeypatch.setattr(
+        throughput,
+        "_require_empty_group",
+        functools.partial(_noting_group, groups),
+    )
+    return groups
+
+
+def test_run_pass_returns_the_pass_and_its_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def stand_in(pipeline: bytes, *, connection: Connection, **kwargs: object) -> None:
+        del pipeline, kwargs
+        connection.send(_result({}))
+
+    groups = _inline(monkeypatch, stand_in)
+    result, cpu = throughput._run_pass(DataPipeline.Config(), LoaderThroughput.Config())
+    assert result == _result({})
+    assert cpu == pytest.approx(0.0, abs=1.0)
+    assert groups == [123]
+
+
+@pytest.mark.parametrize(
+    ("sends", "message"),
+    [
+        (["Traceback: boom"], "Traceback: boom"),
+        ([], "exited without a result"),
+    ],
+)
+def test_run_pass_raises_what_a_failed_pass_left(
+    monkeypatch: pytest.MonkeyPatch,
+    sends: list[str],
+    message: str,
+) -> None:
+    def stand_in(pipeline: bytes, *, connection: Connection, **kwargs: object) -> None:
+        del pipeline, kwargs
+        for sent in sends:
+            connection.send(sent)
+        connection.close()
+
+    _ = _inline(monkeypatch, stand_in)
+    with pytest.raises(RuntimeError, match=message):
+        _ = throughput._run_pass(DataPipeline.Config(), LoaderThroughput.Config())
+
+
+def test_a_survivor_that_exits_in_time_is_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probes: list[int] = []
+
+    def killpg(group: int, signal: int) -> None:
+        del signal
+        probes.append(group)
+        if len(probes) > 1:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    throughput._require_empty_group(123, grace_sec=5.0)
+    assert probes == [123, 123]
+
+
+def test_a_survivor_past_its_grace_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "killpg", _ignore)
+    with pytest.raises(RuntimeError, match="outlived its pass"):
+        throughput._require_empty_group(123, grace_sec=0.0)
+
+
+def test_only_tensor_fields_are_compared() -> None:
+    with pytest.raises(TypeError, match="'label' is list, not a Tensor"):
+        _ = throughput._kept({"image": IMAGE, "label": [3]}, ["image", "label"])
 
 
 def test_exp000_batches_match_the_golden(tmp_path: Path) -> None:
@@ -497,6 +790,6 @@ def test_a_process_left_running_refuses_the_run(staged: Path) -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

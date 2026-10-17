@@ -230,6 +230,16 @@ def test_rejects_halves_that_disagree_on_the_latent() -> None:
         _ = config.make()
 
 
+def test_rejects_halves_that_disagree_on_the_grid() -> None:
+    """A decoder with another stage count would return another image size."""
+    config = tiny()
+    assert config.decoder is not None
+    config.decoder.channels_hidden = (2, 4, 4)
+    config.decoder.attention = (False, True, True)
+    with pytest.raises(ValueError, match="stages"):
+        _ = config.make()
+
+
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     [

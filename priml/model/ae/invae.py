@@ -484,6 +484,11 @@ class INVAE(nn.Module):
             )
         if len({half.channels_latent for half in halves}) != 1:
             raise ValueError("The encoder and decoder disagree on channels_latent.")
+        if len({len(half.channels_hidden) for half in halves}) != 1:
+            raise ValueError(
+                "The encoder and decoder disagree on their number of stages, so the "
+                "decoder would not return image_size.",
+            )
         self.encoder = None if config.encoder is None else config.encoder.make()
         self.decoder = None if config.decoder is None else config.decoder.make()
         self.eval()

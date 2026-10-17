@@ -1,4 +1,4 @@
-"""Tests for Lloyd-Max fitting and nearest-level coding."""
+"""Tests for Lloyd-Max fitting and its starting levels."""
 
 from __future__ import annotations
 
@@ -9,14 +9,12 @@ from torch import Tensor
 import pytest
 import torch
 
-from priml.math.scalar_quantization import (
-    dequantize,
+from priml.math.quantization.lloyd_max import (
     gaussian_levels,
     high_resolution_levels,
     lloyd_max,
-    midpoints,
-    quantize,
 )
+from priml.math.quantization.nearest import dequantize, midpoints, quantize
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
@@ -112,6 +110,23 @@ def test_empty_cells_are_moved_into_the_data() -> None:
     assert bool((levels[1:] >= levels[:-1]).all())
 
 
+def test_a_sample_far_from_zero_fits_as_its_shift_does() -> None:
+    """Prefix sums of raw values cancel in float64 far from zero.
+
+    Integers on both sides of the shift, so values and starting levels are exact
+    at ``2**40``; only the fit's own arithmetic can differ.
+    """
+    generator = torch.Generator().manual_seed(3)
+    near = torch.randint(-2_000, 2_000, (4_096,), generator=generator).double()
+    init = torch.linspace(-1_920, 1_920, 16, dtype=torch.float64).round()
+    offset = 2.0**40
+    far = lloyd_max(near + offset, init=init + offset)
+    assert (far - offset).tolist() == pytest.approx(
+        lloyd_max(near, init=init).tolist(),
+        abs=1e-3,
+    )
+
+
 def test_fewer_distinct_values_than_levels_returns_the_values() -> None:
     values = torch.tensor([3.0, 1.0, 2.0, 1.0, 3.0])
     assert lloyd_max(values, init=torch.zeros(4)).tolist() == [1.0, 2.0, 3.0, 3.0]
@@ -127,18 +142,43 @@ def test_non_finite_samples_are_refused(bad: float) -> None:
         _ = high_resolution_levels(values, num_levels=4)
 
 
+def test_samples_and_levels_must_be_nonempty_and_one_dimensional() -> None:
+    with pytest.raises(ValueError, match="1-D"):
+        _ = lloyd_max(torch.zeros(2, 2), init=torch.zeros(2))
+    with pytest.raises(ValueError, match="nonempty"):
+        _ = lloyd_max(torch.zeros(0), init=torch.zeros(2))
+    with pytest.raises(ValueError, match="nonempty 1-D"):
+        _ = high_resolution_levels(torch.zeros(0), num_levels=2)
+
+
+def test_an_empty_cell_stays_put_when_no_cell_holds_two_values() -> None:
+    """Each of five levels already holds one distinct value; the sixth cannot split."""
+    values = torch.arange(5, dtype=torch.float64).repeat_interleave(2)
+    init = torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0, 50.0], dtype=torch.float64)
+    values = torch.cat([values, torch.tensor([4.0, 4.5])])
+    levels = lloyd_max(values, init=init, max_iterations=1)
+    assert levels[:4].tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert levels[-1] < 50
+
+
+def test_no_iterations_returns_the_sorted_start() -> None:
+    values = torch.arange(10, dtype=torch.float64)
+    init = torch.tensor([7.0, 1.0, 4.0], dtype=torch.float64)
+    assert lloyd_max(values, init=init, max_iterations=0).tolist() == [1.0, 4.0, 7.0]
+
+
+def test_a_budget_too_small_to_converge_stops_after_its_iterations() -> None:
+    values = torch.randn(4096, generator=torch.Generator().manual_seed(4))
+    init = torch.linspace(-3, 3, 32)
+    one = lloyd_max(values, init=init, max_iterations=1, tolerance=0.0)
+    two = lloyd_max(values, init=init, max_iterations=2, tolerance=0.0)
+    assert one.tolist() != two.tolist()
+
+
 def test_non_finite_initial_levels_are_refused() -> None:
     values = torch.arange(100, dtype=torch.float64)
     with pytest.raises(ValueError, match="finite initial"):
         _ = lloyd_max(values, init=torch.tensor([0.0, math.nan, 50.0, 99.0]))
-
-
-def test_midpoints_of_finite_levels_never_overflow() -> None:
-    levels = torch.tensor([[40_000.0, 50_000.0]], dtype=torch.float16)
-    thresholds = midpoints(levels)
-    assert bool(thresholds.isfinite().all())
-    values = torch.tensor([[41_000.0, 49_000.0]], dtype=torch.float16)
-    assert quantize(values, thresholds=thresholds).tolist() == [[0, 1]]
 
 
 def test_high_resolution_start_puts_levels_inside_the_sample() -> None:
@@ -168,33 +208,6 @@ def test_constant_sample_places_every_level_on_the_constant() -> None:
         2.5,
         2.5,
         2.5,
-    ]
-
-
-def test_ties_take_the_lower_cell_and_outliers_saturate() -> None:
-    thresholds = torch.tensor([[0.0, 1.0]])
-    values = torch.tensor([[-5.0, 0.0, 0.5, 1.0, 1.5, 9.0]])
-    assert quantize(values, thresholds=thresholds).tolist() == [[0, 0, 1, 1, 2, 2]]
-
-
-def test_quantize_compiles_without_reading_a_python_scalar() -> None:
-    values = torch.tensor([[-1.0, 0.0, 1.0]])
-    thresholds = torch.tensor([[0.0]])
-    compiled = torch.compile(quantize, backend="eager", fullgraph=True)
-    assert torch.equal(
-        compiled(values, thresholds),
-        quantize(values, thresholds=thresholds),
-    )
-
-
-def test_quantize_and_dequantize_apply_one_table_per_row() -> None:
-    levels = torch.tensor([[0.0, 1.0, 2.0], [10.0, 20.0, 30.0]])
-    values = torch.tensor([[0.2, 1.9, 1.4], [11.0, 26.0, 99.0]])
-    indices = quantize(values, thresholds=midpoints(levels))
-    assert indices.tolist() == [[0, 2, 1], [0, 2, 2]]
-    assert dequantize(indices, levels=levels).tolist() == [
-        [0.0, 2.0, 1.0],
-        [10.0, 30.0, 30.0],
     ]
 
 

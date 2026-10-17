@@ -775,6 +775,39 @@ def test_cuda_device_identity_falls_back_to_name_when_attributes_absent(
     get_properties.assert_called_once_with(1)
 
 
+def test_cuda_device_identity_falls_back_to_the_index_when_unnamed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        MagicMock(return_value=SimpleNamespace(name="")),
+    )
+    assert seed._cuda_device_identity(3) == "cuda:3"
+
+
+def test_enable_determinism_turns_off_the_nondeterministic_sdpa_kernels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash, efficient = MagicMock(), MagicMock()
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.backends.cuda, "enable_flash_sdp", flash)
+    monkeypatch.setattr(torch.backends.cuda, "enable_mem_efficient_sdp", efficient)
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    algorithms_enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only_enabled = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        enable_determinism(cudnn=False, sdpa=True)
+    finally:
+        torch.use_deterministic_algorithms(
+            algorithms_enabled,
+            warn_only=warn_only_enabled,
+        )
+    flash.assert_called_once_with(False)
+    efficient.assert_called_once_with(False)
+
+
 def test_cuda_entries_are_droppable_by_the_caller(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
