@@ -24,6 +24,7 @@ names its file here.
 | `flux2` | [black-forest-labs/flux2](https://github.com/black-forest-labs/flux2) @ `50fe516` | Apache-2.0 | `model/ae/kl.py`, `model/ae/latent_norm.py` |
 | `generative-inverse-heat-dissipation` | [AaltoML/generative-inverse-heat-dissipation](https://github.com/AaltoML/generative-inverse-heat-dissipation) | MIT | `math/frequency.py` |
 | `purejaxql` | [mttga/purejaxql](https://github.com/mttga/purejaxql) | Apache-2.0 | `baselines/craftax` (PQN) |
+| `taesd` | [madebyollin/taesd](https://github.com/madebyollin/taesd) @ `fdbae2d` | MIT | `model/ae/taesd.py` |
 | `torch-dct` | [zh217/torch-dct](https://github.com/zh217/torch-dct) | MIT | `math/frequency.py` |
 | `transformerXL_PPO_JAX` | [Reytuag/transformerXL_PPO_JAX](https://github.com/Reytuag/transformerXL_PPO_JAX) | MIT | `baselines/craftax` (GTrXL) |
 | `transformers` | [huggingface/transformers](https://github.com/huggingface/transformers) @ `v5.17.0` | Apache-2.0 | `math/gated_delta_rule.py` |

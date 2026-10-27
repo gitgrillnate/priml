@@ -60,6 +60,7 @@ The `*_reference.pt` goldens replay each reference's own outputs bit for bit.
 | SDXL-VAE | `kl.sdxl()`, `kl.sdxl_fp16_fix()` | |
 | FLUX.1 | `kl.flux1()` | BFL `flux` @ `802fb47` |
 | FLUX.2 | `kl.flux2()` | BFL `flux2` @ `50fe516` |
+| TAESD / TAESDXL | `taesd.taesd()`, `taesd.taesdxl()` | `taesd` @ `fdbae2d` |
 | VTP | `vtp.vtp_small()`, `vtp_base()`, `vtp_large()` | VTP @ `5ce1eb6` |
 | RAE DINOv2-B | `rae.rae_dinov2_base()` | RAE @ `a4d18c4` |
 

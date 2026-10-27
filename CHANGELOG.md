@@ -17,6 +17,11 @@ All notable priml changes are documented here. This project follows
   `AutoencoderKL.Config.patch_size` folds the latent into channels between
   the halves, as FLUX.2 does. `testdata/kl_reference_{compvis,flux,flux2}.pt`
   replay each reference's own outputs bit for bit.
+- `priml.model.ae.taesd`: `TAESD`, the tiny distilled stand-in for SD's VAEs,
+  with `taesd()` and `taesdxl()`. Deterministic: `encode` returns a
+  `PointMass` in SD's diffusion space (its latent scale is 1), and each half
+  loads its own published file. `testdata/taesd_reference.pt` replays the
+  reference's own outputs bit for bit.
 - `priml.model.ae.latent_norm`: `ShiftScaleLatents` (FLUX.1's
   `(z - shift) * scale`) and `BatchNormLatents` (FLUX.2's frozen batch norm,
   read from the checkpoint).
