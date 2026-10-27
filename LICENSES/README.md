@@ -18,6 +18,8 @@ names its file here.
 | `REG` | [SwayStar123/REG](https://github.com/SwayStar123/REG) @ `3c51606` | MIT | `model/ae/kl.py` |
 | `TinyRecursiveModels` | [SamsungSAILMontreal/TinyRecursiveModels](https://github.com/SamsungSAILMontreal/TinyRecursiveModels) | MIT | `baselines/arcagi` |
 | `VTP` | [MiniMax-AI/VTP](https://github.com/MiniMax-AI/VTP) @ `5ce1eb6` | MIT | `model/ae/vtp.py` |
+| `Wan2.1` | [Wan-Video/Wan2.1](https://github.com/Wan-Video/Wan2.1) @ `9737cba` | Apache-2.0 | `model/ae/wan.py`, `model/ae/latent_norm.py` |
+| `Wan2.2` | [Wan-Video/Wan2.2](https://github.com/Wan-Video/Wan2.2) @ `1ea34ff` | Apache-2.0 | `model/ae/wan.py` |
 | `cifar10-airbench` | [KellerJordan/cifar10-airbench](https://github.com/KellerJordan/cifar10-airbench) | MIT | `baselines/cifar10` |
 | `ffcv-imagenet` | [libffcv/ffcv-imagenet](https://github.com/libffcv/ffcv-imagenet) | Apache-2.0 | `baselines/imagenet` |
 | `flux` | [black-forest-labs/flux](https://github.com/black-forest-labs/flux) @ `802fb47` | Apache-2.0 | `model/ae/kl.py`, `model/ae/latent_norm.py` |

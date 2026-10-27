@@ -22,6 +22,15 @@ All notable priml changes are documented here. This project follows
   `PointMass` in SD's diffusion space (its latent scale is 1), and each half
   loads its own published file. `testdata/taesd_reference.pt` replays the
   reference's own outputs bit for bit.
+- `priml.model.ae.wan`: `WanVAE`, Wan 2.1's and Wan 2.2's causal video VAEs,
+  with `wan21()` and `wan22()` pinned to the float32 releases and
+  `wan21_comfy()` / `wan22_comfy()` to Comfy's bfloat16 / float16
+  repackagings. Clips are `1 + 4k` frames, encoded and decoded whole: the
+  reference's chunked caches compute the same causal convolutions, and
+  `testdata/wan_reference_{21,22}.pt` replay both references bit for bit.
+  Wan 2.2's stage shortcuts are injected (`average_shortcut`,
+  `duplicate_shortcut`). Its latents normalize with the new
+  `InverseStdLatents`.
 - `priml.model.ae.latent_norm`: `ShiftScaleLatents` (FLUX.1's
   `(z - shift) * scale`) and `BatchNormLatents` (FLUX.2's frozen batch norm,
   read from the checkpoint).

@@ -14,6 +14,7 @@ from priml.model.ae.latent_norm import (
     BatchNormLatents,
     ChannelLatentStats,
     ElementwiseLatentStats,
+    InverseStdLatents,
     LatentNormalizer,
     ScaleLatents,
     ShiftScaleLatents,
@@ -278,6 +279,31 @@ def test_batch_norm_refuses_missing_or_misshapen_statistics(tmp_path: Path) -> N
     )
     with pytest.raises(ValueError, match="eps"):
         _ = BatchNormLatents.Config(stats=stats, eps=-1.0).make()
+
+
+def test_inverse_std_multiplies_by_the_reciprocal_and_divides_back() -> None:
+    """Wan's order: ``(z - mean) * (1 / std)``, and ``z / (1 / std) + mean``."""
+    mean, std = [0.5, -0.25, 1.5], [2.8184, 1.4541, 0.3523]
+    norm = InverseStdLatents.Config(mean=mean, std=std).make()
+    assert isinstance(norm, LatentNormalizer)
+    latent = torch.randn(2, 4, 3, 5, 6, 7, generator=torch.Generator().manual_seed(2))
+    shift = torch.tensor(mean).view(-1, 1, 1, 1)
+    reciprocal = (1.0 / torch.tensor(std)).view(-1, 1, 1, 1)
+    assert torch.equal(norm.normalize(latent), (latent - shift) * reciprocal)
+    assert torch.equal(norm.denormalize(latent), latent / reciprocal + shift)
+
+
+@pytest.mark.parametrize(
+    ("mean", "std", "match"),
+    [([], [], "one mean and one std"), ([0.0], [0.0], "nonzero")],
+)
+def test_inverse_std_refuses_degenerate_statistics(
+    mean: list[float],
+    std: list[float],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _ = InverseStdLatents.Config(mean=mean, std=std).make()
 
 
 if __name__ == "__main__":

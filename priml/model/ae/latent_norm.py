@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import field
 from typing import Protocol, cast, runtime_checkable
 
 import math
@@ -207,6 +208,75 @@ class BatchNormLatents:
         # As in ``ElementwiseLatentStats``: a copy per call would block every batch.
         if device not in self._on_device:
             self._on_device[device] = self.mean.to(device), self.var.to(device)
+        return self._on_device[device]
+
+
+class InverseStdLatents:
+    """Standardize video latents per channel through a reciprocal standard deviation.
+
+    Wan's convention: ``(z - mean) * (1 / std)``, and back by
+    ``z / (1 / std) + mean``, the reciprocal rounded once in float32, as the
+    reference holds it. Latents are ``[..., C, T, H, W]``.
+
+    References:
+      https://github.com/Wan-Video/Wan2.1/blob/9737cba9c1c3c4d04b33fcad41c111989865d315/wan/modules/vae.py
+        License: ``LICENSES/Wan2.1``.
+
+    """
+
+    class Config(Fig["InverseStdLatents"]):
+        """The published statistics, one per latent channel."""
+
+        mean: list[float] = field(default_factory=list)
+        """Subtracted from each channel."""
+
+        std: list[float] = field(default_factory=list)
+        """Each channel's standard deviation; its reciprocal scales."""
+
+    def __init__(self, config: Config) -> None:
+        if not config.mean or len(config.mean) != len(config.std):
+            raise ValueError(
+                "InverseStdLatents needs one mean and one std per channel; got "
+                f"{len(config.mean)} and {len(config.std)}.",
+            )
+        std = torch.tensor(config.std, dtype=torch.float32)
+        if not torch.all(torch.isfinite(std) & (std != 0)):
+            raise ValueError("InverseStdLatents needs finite nonzero std.")
+        self.mean = torch.tensor(config.mean, dtype=torch.float32).view(-1, 1, 1, 1)
+        self.inv_std = (1.0 / std).view(-1, 1, 1, 1)
+        self._on_device: dict[torch.device, tuple[Tensor, Tensor]] = {}
+
+    def normalize(self, latent: Tensor, /) -> Tensor:
+        """Return ``(latent - mean) * (1 / std)``.
+
+        Args:
+          latent: ``[..., C, T, H, W]`` raw latent.
+
+        Returns:
+          normalized: Standardized latent.
+
+        """
+        mean, inv_std = self._statistics(latent.device)
+        return (latent - mean) * inv_std
+
+    def denormalize(self, latent: Tensor, /) -> Tensor:
+        """Return ``latent / (1 / std) + mean``.
+
+        Args:
+          latent: ``[..., C, T, H, W]`` standardized latent.
+
+        Returns:
+          raw: Raw latent.
+
+        """
+        mean, inv_std = self._statistics(latent.device)
+        return latent / inv_std + mean
+
+    def _statistics(self, device: torch.device) -> tuple[Tensor, Tensor]:
+        """Return ``mean`` and ``1 / std`` on ``device``, copying them there once."""
+        # As in ``ElementwiseLatentStats``: a copy per call would block every batch.
+        if device not in self._on_device:
+            self._on_device[device] = self.mean.to(device), self.inv_std.to(device)
         return self._on_device[device]
 
 
