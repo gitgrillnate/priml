@@ -1,7 +1,12 @@
-"""INVAE: a 32-channel convolutional KL autoencoder, 16x downsampling.
+"""AutoencoderKL: the latent-diffusion convolutional KL autoencoder.
 
-Build the published model with ``INVAE.load()``, or parse a diffusers
-``config.json`` with :meth:`INVAE.Config.from_hf`.
+Stages of residual blocks halve the grid down to a middle of block, attention,
+block; a diagonal Gaussian over the latent sits between the halves. Published
+checkpoints differ in widths, depth, and attention placement, all config
+values, and in their tensor names, which a half's ``remap`` reads.
+
+Build a published model from its factory -- :func:`invae` -- or parse a
+diffusers ``config.json`` with :meth:`AutoencoderKL.Config.from_hf`.
 
 MIT license and attribution: ``LICENSES/REG``.
 
@@ -35,10 +40,17 @@ from priml.model.ae.checkpoint import (
     read_json,
     read_state,
 )
+from priml.model.ae.custom_types import StateDictRemap
 from priml.model.ae.distribution import DiagonalGaussian
 from priml.model.ae.latent_norm import LatentNormalizer, ScaleLatents
 from priml.model.attention.kernel import attention_kernel_cost
 from priml.model.conv import Conv2d, conv_cost
+from priml.model.custom_types import (
+    ChannelsIn,
+    ChannelsOut,
+    TensorModule,
+    propagate_attr,
+)
 from priml.model.norm import GroupNorm2d
 from priml.model.swiglu import sigmoid
 
@@ -48,11 +60,11 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-REPO: Final = "REPA-E/e2e-invae-hf"
-"""The published diffusers checkpoint."""
+INVAE_REPO: Final = "REPA-E/e2e-invae-hf"
+"""INVAE's published diffusers checkpoint."""
 
-REVISION: Final = "523ddf74b061c01ed0aebb7904c6bdb2f33e06d0"
-"""The commit of :data:`REPO` the defaults pin."""
+INVAE_REVISION: Final = "523ddf74b061c01ed0aebb7904c6bdb2f33e06d0"
+"""The commit of :data:`INVAE_REPO` the defaults pin."""
 
 
 def e2e_invae_hf() -> HubFile.Config:
@@ -63,11 +75,34 @@ def e2e_invae_hf() -> HubFile.Config:
 
     """
     return HubFile.Config(
-        repo_id=REPO,
+        repo_id=INVAE_REPO,
         filename="diffusion_pytorch_model.safetensors",
-        revision=REVISION,
+        revision=INVAE_REVISION,
         sha256="6b1f754e414a841893fd242ca233c5aeec4bbdb7d2eeab2f7956adf48742e500",
     )
+
+
+def remap_hf_state_dict(state: Mapping[str, Tensor], *, half: str) -> dict[str, Tensor]:
+    """Rename one half's diffusers tensors to this module's names.
+
+    Args:
+      state: Diffusers tensors; keys outside ``half`` are ignored.
+      half: ``"encoder"`` or ``"decoder"``.
+
+    Returns:
+      state: This half's ``state_dict``.
+
+    """
+    quant = {"encoder": "quant_conv.", "decoder": "post_quant_conv."}[half]
+    remapped: dict[str, Tensor] = {}
+    for key, tensor in state.items():
+        if key.startswith(quant):
+            remapped[key] = tensor
+        elif key.startswith(f"{half}."):
+            name = key.removeprefix(f"{half}.").replace(".to_out.0.", ".to_out.")
+            projection = _ATTENTION_PROJECTION.search(name) is not None
+            remapped[name] = tensor[..., None, None] if projection else tensor
+    return remapped
 
 
 class Encoder(nn.Module):
@@ -97,13 +132,42 @@ class Encoder(nn.Module):
         eps: float = 1e-6
         """GroupNorm epsilon."""
 
+        proj_out: Makeable[TensorModule] | None = field(
+            default_factory=lambda: Conv2d.Config(kernel_size=1, padding=0, bias=True),
+        )
+        """Projection of the moments, diffusers' ``quant_conv``; ``None`` omits it.
+
+        Its widths are set to the moments'.
+        """
+
         checkpoint: Makeable[CheckpointFile] | None = field(
             default_factory=e2e_invae_hf,
         )
-        """Diffusers weights; only ``encoder.*`` and ``quant_conv.*`` are read.
+        """Weights; only ``encoder.*`` and the moments' projection are read.
 
         ``None`` keeps the random initialization.
         """
+
+        remap: StateDictRemap = remap_hf_state_dict
+        """Renames ``checkpoint``'s tensors to this module's."""
+
+        @override
+        def finalize(self) -> Self:
+            if self.proj_out is not None:
+                moments = 2 * self.channels_latent
+                propagate_attr(
+                    self.proj_out,
+                    "channels_in",
+                    moments,
+                    protocol=ChannelsIn,
+                )
+                propagate_attr(
+                    self.proj_out,
+                    "channels_out",
+                    moments,
+                    protocol=ChannelsOut,
+                )
+            return super().finalize()
 
         def cost(
             self,
@@ -113,7 +177,7 @@ class Encoder(nn.Module):
             dtype: torch.dtype | None,
             **kwargs: object,
         ) -> Cost:
-            """Cost one forward on a square ``input_grid`` image, ``quant_conv`` included.
+            """Cost one forward on a square ``input_grid`` image, ``proj_out`` included.
 
             Args:
               input_grid: Image side.
@@ -145,13 +209,21 @@ class Encoder(nn.Module):
                 if stage != len(widths) - 1:
                     total += layers.downsample(width, side=side)
                     side //= 2
-            moments = 2 * self.channels_latent
-            return (
-                total
-                + layers.middle(width_in, side=side)
-                + layers.head(width_in, channels_out=moments, side=side)
-                + layers.conv(moments, moments, side=side, kernel_size=1)
+            total += layers.middle(width_in, side=side) + layers.head(
+                width_in,
+                channels_out=2 * self.channels_latent,
+                side=side,
             )
+            # A finalized copy's: an unfinalized slot still holds -1 widths.
+            proj_out = self.finalized().proj_out
+            if proj_out is not None:
+                total += cost(
+                    proj_out,
+                    input_grid=side,
+                    batch_size=batch_size,
+                    dtype=dtype,
+                )
+            return total
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -177,13 +249,13 @@ class Encoder(nn.Module):
             self.down_blocks.append(level)
         self.mid_block = _Middle(width_in, num_groups=groups, eps=eps)
         self.conv_norm_out = _norm(width_in, num_groups=groups, eps=eps)
-        moments = 2 * config.channels_latent
-        self.conv_out = _conv(width_in, moments, kernel_size=3)
-        self.quant_conv = _conv(moments, moments, kernel_size=1)
+        self.conv_out = _conv(width_in, 2 * config.channels_latent, kernel_size=3)
+        # Named for the checkpoints' own tensors, so a remap only strips prefixes.
+        self.quant_conv = None if config.proj_out is None else config.proj_out.make()
         if config.checkpoint is not None:
             path = config.checkpoint.make().path()
             state = read_state(path, prefixes=("encoder.", "quant_conv."))
-            self.load_state_dict(remap_hf_state_dict(state, half="encoder"))
+            self.load_state_dict(config.remap(state, half="encoder"))
 
     @override
     def forward(self, x: Tensor) -> Tensor:
@@ -193,7 +265,7 @@ class Encoder(nn.Module):
             h = level(h)
         h = self.mid_block(h)
         h = self.conv_out(_swish(self.conv_norm_out(h)))
-        return self.quant_conv(h)
+        return h if self.quant_conv is None else self.quant_conv(h)
 
 
 class Decoder(nn.Module):
@@ -223,13 +295,32 @@ class Decoder(nn.Module):
         eps: float = 1e-6
         """GroupNorm epsilon."""
 
+        proj_in: Makeable[TensorModule] | None = field(
+            default_factory=lambda: Conv2d.Config(kernel_size=1, padding=0, bias=True),
+        )
+        """Projection of the latent, diffusers' ``post_quant_conv``; ``None`` omits it.
+
+        Its widths are set to the latent's.
+        """
+
         checkpoint: Makeable[CheckpointFile] | None = field(
             default_factory=e2e_invae_hf,
         )
-        """Diffusers weights; only ``decoder.*`` and ``post_quant_conv.*`` are read.
+        """Weights; only ``decoder.*`` and the latent's projection are read.
 
         ``None`` keeps the random initialization.
         """
+
+        remap: StateDictRemap = remap_hf_state_dict
+        """Renames ``checkpoint``'s tensors to this module's."""
+
+        @override
+        def finalize(self) -> Self:
+            if self.proj_in is not None:
+                z = self.channels_latent
+                propagate_attr(self.proj_in, "channels_in", z, protocol=ChannelsIn)
+                propagate_attr(self.proj_in, "channels_out", z, protocol=ChannelsOut)
+            return super().finalize()
 
         def cost(
             self,
@@ -239,7 +330,7 @@ class Decoder(nn.Module):
             dtype: torch.dtype | None,
             **kwargs: object,
         ) -> Cost:
-            """Cost one forward on a square ``input_grid`` latent, ``post_quant_conv`` included.
+            """Cost one forward on a square ``input_grid`` latent, ``proj_in`` included.
 
             Args:
               input_grid: Latent side.
@@ -259,11 +350,19 @@ class Decoder(nn.Module):
             )
             z, side = self.channels_latent, input_grid
             width_in = self.channels_hidden[-1]
-            total = (
-                layers.conv(z, z, side=side, kernel_size=1)
-                + layers.conv(z, width_in, side=side, kernel_size=3)
-                + layers.middle(width_in, side=side)
+            total = layers.conv(z, width_in, side=side, kernel_size=3) + layers.middle(
+                width_in,
+                side=side,
             )
+            # A finalized copy's, as in ``Encoder.Config.cost``.
+            proj_in = self.finalized().proj_in
+            if proj_in is not None:
+                total += cost(
+                    proj_in,
+                    input_grid=side,
+                    batch_size=batch_size,
+                    dtype=dtype,
+                )
             stages = list(zip(self.channels_hidden, self.attention, strict=True))
             for stage, (width, attends) in reversed(list(enumerate(stages))):
                 for _ in range(self.blocks_per_stage):
@@ -284,7 +383,8 @@ class Decoder(nn.Module):
         super().__init__()
         widths, groups, eps = config.channels_hidden, config.num_groups, config.eps
         z = config.channels_latent
-        self.post_quant_conv = _conv(z, z, kernel_size=1)
+        # Named for the checkpoints' own tensors, as the encoder's ``quant_conv``.
+        self.post_quant_conv = None if config.proj_in is None else config.proj_in.make()
         width_in = widths[-1]
         self.conv_in = _conv(z, width_in, kernel_size=3)
         self.mid_block = _Middle(width_in, num_groups=groups, eps=eps)
@@ -309,26 +409,31 @@ class Decoder(nn.Module):
         if config.checkpoint is not None:
             path = config.checkpoint.make().path()
             state = read_state(path, prefixes=("decoder.", "post_quant_conv."))
-            self.load_state_dict(remap_hf_state_dict(state, half="decoder"))
+            self.load_state_dict(config.remap(state, half="decoder"))
 
     @override
     def forward(self, z: Tensor) -> Tensor:
         """Map ``[N, C, h, w]`` latents to ``[N, C_out, H, W]`` pixels in ``[-1, 1]``."""
-        h = self.mid_block(self.conv_in(self.post_quant_conv(z)))
+        if self.post_quant_conv is not None:
+            z = self.post_quant_conv(z)
+        h = self.mid_block(self.conv_in(z))
         for level in self.up_blocks:
             h = level(h)
         return self.conv_out(_swish(self.conv_norm_out(h)))
 
 
-class INVAE(nn.Module):
-    """INVAE as an ``Autoencoder``; either half may be left out.
+class AutoencoderKL(nn.Module):
+    """A KL autoencoder as an ``Autoencoder``; either half may be left out.
 
     ``encode`` returns a diagonal Gaussian; call ``sample()`` or ``mode()`` on
     it. The model is frozen and always in evaluation mode.
     """
 
-    class Config(Fig["INVAE"]):
-        """The halves, the image side, and the published latent normalizer."""
+    class Config(Fig["AutoencoderKL"]):
+        """The halves, the image side, and the published latent normalizer.
+
+        The defaults are INVAE's published model, which :func:`invae` returns.
+        """
 
         encoder: Encoder.Config | None = field(default_factory=Encoder.Config)
         """Pixels to posterior; ``None`` builds and loads no encoder."""
@@ -353,7 +458,9 @@ class INVAE(nn.Module):
         ) -> Self:
             """Parse a diffusers ``AutoencoderKL`` ``config.json``.
 
-            ``sample_size``, ``latents_mean``, and ``latents_std`` are not read.
+            The architecture only: ``sample_size``, ``scaling_factor``,
+            ``shift_factor``, ``latents_mean``, and ``latents_std`` are not read,
+            so ``image_size`` and ``latent_norm`` keep their defaults.
 
             Args:
               config: The ``config.json`` object.
@@ -392,13 +499,17 @@ class INVAE(nn.Module):
                 num_groups=groups,
                 checkpoint=checkpoint,
             )
+            if not from_plain(config.get("use_quant_conv"), bool, default=True):
+                encoder.proj_out = None
+            if not from_plain(config.get("use_post_quant_conv"), bool, default=True):
+                decoder.proj_in = None
             return cls(encoder=encoder, decoder=decoder)
 
         def latent_shape(self) -> tuple[int, int, int]:
             """Return ``(channels_latent, side, side)`` at ``image_size``."""
             half = self.encoder or self.decoder
             if half is None:
-                raise ValueError("INVAE.Config needs an encoder or a decoder.")
+                raise ValueError("AutoencoderKL.Config needs an encoder or a decoder.")
             side = self.image_size >> (len(half.channels_hidden) - 1)
             return half.channels_latent, side, side
 
@@ -423,7 +534,9 @@ class INVAE(nn.Module):
 
             """
             if self.encoder is None or self.decoder is None:
-                raise ValueError("INVAE.Config.cost prices both halves; one is None.")
+                raise ValueError(
+                    "AutoencoderKL.Config.cost prices both halves; one is None.",
+                )
             channels, side, _ = self.latent_shape()
             area = batch_size * self.image_size**2
             pixels_in = area * self.encoder.channels_in
@@ -483,7 +596,7 @@ class INVAE(nn.Module):
         super().__init__()
         halves = [half for half in (config.encoder, config.decoder) if half is not None]
         if not halves:
-            raise ValueError("INVAE needs an encoder or a decoder.")
+            raise ValueError("AutoencoderKL needs an encoder or a decoder.")
         downsample = 1 << (len(halves[0].channels_hidden) - 1)
         if config.image_size % downsample:
             raise ValueError(
@@ -504,10 +617,10 @@ class INVAE(nn.Module):
     @classmethod
     def load(
         cls,
-        path_or_repo: Path | str = REPO,
+        path_or_repo: Path | str = INVAE_REPO,
         *,
-        revision: str = REVISION,
-    ) -> INVAE:
+        revision: str = INVAE_REVISION,
+    ) -> AutoencoderKL:
         """Build from a diffusers directory or Hub repository, weights included.
 
         Args:
@@ -516,7 +629,8 @@ class INVAE(nn.Module):
           revision: Commit to read a Hub repository at.
 
         Returns:
-          model: Frozen INVAE.
+          model: Frozen autoencoder, its ``image_size`` and ``latent_norm`` the
+            defaults.
 
         """
         config = cls.Config.from_hf(
@@ -550,10 +664,12 @@ class INVAE(nn.Module):
 
         """
         if self.encoder is None:
-            raise ValueError("This INVAE was built without an encoder.")
+            raise ValueError("This AutoencoderKL was built without an encoder.")
         # A float image in [0, 1] would otherwise encode as near-black.
         if x.dtype != torch.uint8:
-            raise TypeError(f"INVAE encodes uint8 RGB in [0, 255]; got {x.dtype}.")
+            raise TypeError(
+                f"AutoencoderKL encodes uint8 RGB in [0, 255]; got {x.dtype}.",
+            )
         # ``x / 127.5 - 1``, not ``rgb2float``'s ``(x - 127.5) / 127.5``: the two
         # round 128 of the 256 levels differently, and the weights saw this one.
         pixels = x.reshape(-1, *x.shape[-3:]).float() / 127.5 - 1
@@ -576,33 +692,20 @@ class INVAE(nn.Module):
 
         """
         if self.decoder is None:
-            raise ValueError("This INVAE was built without a decoder.")
+            raise ValueError("This AutoencoderKL was built without a decoder.")
         decoded = self.decoder(z.reshape(-1, *z.shape[-3:]))
         decoded = decoded.reshape(*z.shape[:-3], *decoded.shape[1:])
         return ((decoded + 1) / 2).clamp(0, 1)
 
 
-def remap_hf_state_dict(state: Mapping[str, Tensor], *, half: str) -> dict[str, Tensor]:
-    """Rename one half's diffusers tensors to this module's names.
-
-    Args:
-      state: Diffusers tensors; keys outside ``half`` are ignored.
-      half: ``"encoder"`` or ``"decoder"``.
+def invae() -> AutoencoderKL.Config:
+    """Return INVAE: 32 channels, 16x downsampling, REG's latent scale.
 
     Returns:
-      state: This half's ``state_dict``.
+      config: The published model, weights pinned.
 
     """
-    quant = {"encoder": "quant_conv.", "decoder": "post_quant_conv."}[half]
-    remapped: dict[str, Tensor] = {}
-    for key, tensor in state.items():
-        if key.startswith(quant):
-            remapped[key] = tensor
-        elif key.startswith(f"{half}."):
-            name = key.removeprefix(f"{half}.").replace(".to_out.0.", ".to_out.")
-            projection = _ATTENTION_PROJECTION.search(name) is not None
-            remapped[name] = tensor[..., None, None] if projection else tensor
-    return remapped
+    return AutoencoderKL.Config()
 
 
 _ATTENTION_PROJECTION: Final = re.compile(r"\.to_(q|k|v|out)\.weight$")
@@ -621,9 +724,8 @@ def _reject_unsupported(config: Mapping[str, object]) -> None:
         )
     if from_plain(config.get("act_fn"), str, default="silu") != "silu":
         raise ValueError("Only the swish (silu) AutoencoderKL is supported.")
-    for name in ("mid_block_add_attention", "use_quant_conv", "use_post_quant_conv"):
-        if not from_plain(config.get(name), bool, default=True):
-            raise ValueError(f"{name}=false is unsupported.")
+    if not from_plain(config.get("mid_block_add_attention"), bool, default=True):
+        raise ValueError("mid_block_add_attention=false is unsupported.")
     for name, supported in _SUPPORTED_BLOCKS.items():
         kinds = set(from_plain(config[name], list[str]))
         if kinds - supported:

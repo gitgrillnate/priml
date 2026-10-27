@@ -15,7 +15,7 @@ names its file here.
 | `PufferLib` | [PufferAI/PufferLib](https://github.com/PufferAI/PufferLib) @ `6ffa5b10` | MIT | `baselines/craftax`, `loss/policy_gradient*.py`, `math/advantage.py`, `model/embedding.py`, `model/min_gru.py`, `optimizers/fused_muon.py` |
 | `PyTorch` | [pytorch/pytorch](https://github.com/pytorch/pytorch) | BSD-3-Clause | `math/pooling.py` |
 | `RAE` | [bytetriper/RAE](https://github.com/bytetriper/RAE) @ `a4d18c4` | MIT | `model/ae/rae.py` |
-| `REG` | [SwayStar123/REG](https://github.com/SwayStar123/REG) @ `3c51606` | MIT | `model/ae/invae.py` |
+| `REG` | [SwayStar123/REG](https://github.com/SwayStar123/REG) @ `3c51606` | MIT | `model/ae/kl.py` |
 | `TinyRecursiveModels` | [SamsungSAILMontreal/TinyRecursiveModels](https://github.com/SamsungSAILMontreal/TinyRecursiveModels) | MIT | `baselines/arcagi` |
 | `VTP` | [MiniMax-AI/VTP](https://github.com/MiniMax-AI/VTP) @ `5ce1eb6` | MIT | `model/ae/vtp.py` |
 | `cifar10-airbench` | [KellerJordan/cifar10-airbench](https://github.com/KellerJordan/cifar10-airbench) | MIT | `baselines/cifar10` |

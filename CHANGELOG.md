@@ -3,6 +3,25 @@
 All notable priml changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Changed
+
+- `priml.model.ae.invae` is now `priml.model.ae.kl`: INVAE is one published
+  config, `invae()`, of the latent-diffusion `AutoencoderKL` it always was.
+  Its arithmetic is unchanged; `testdata/kl.pt` is the former `invae.pt`
+  byte for byte. Each half gains a projection slot (`Encoder.Config.proj_out`,
+  `Decoder.Config.proj_in`; diffusers' `quant_conv` and `post_quant_conv`,
+  `None` to omit) and a `remap` for its checkpoint's tensor names. `from_hf`
+  now builds `use_quant_conv=false` and `use_post_quant_conv=false`.
+  `INVAE.Config` becomes `AutoencoderKL.Config` (or `invae()`), and `REPO` /
+  `REVISION` become `INVAE_REPO` / `INVAE_REVISION`.
+- SpeedrunDiT: a corpus receipt names the autoencoder's finalized config, so
+  the preparer and the loader agree whichever side of finalize they hold it.
+  The INVAE config's class and fields changed, so an existing INVAE corpus
+  fails its receipt: delete its `corpus.json`, then record it again with
+  `prepare_data.py --receipt-only --source <imagenet>`. Nothing is re-encoded.
+
 ## 0.1.8 - 2026-10-26
 
 ### Changed

@@ -1,6 +1,6 @@
-"""INVAE: the published architecture, its checkpoint names, and its arithmetic.
+"""AutoencoderKL: the published architectures, their checkpoint names, and the arithmetic.
 
-``testdata/invae.pt`` freezes the round trip at golden size.
+``testdata/kl.pt`` freezes the round trip at golden size, in INVAE's layout.
 """
 
 from __future__ import annotations
@@ -20,8 +20,9 @@ import torch
 from priml.cost import cost
 from priml.model.ae.checkpoint import HubFile, LocalFile
 from priml.model.ae.distribution import DiagonalGaussian
-from priml.model.ae.invae import INVAE, remap_hf_state_dict
+from priml.model.ae.kl import AutoencoderKL, invae, remap_hf_state_dict
 from priml.model.ae.latent_norm import ScaleLatents
+from priml.model.conv import Conv2d
 from priml.testing.bfb import assert_bfb_against_golden
 from priml.testing.cost import assert_cost_matches_torch
 from priml.testing.golden import assert_pprint_golden
@@ -32,9 +33,9 @@ _CWD: Final = Path(__file__).resolve().parent
 _TESTDATA: Final = _CWD / "testdata"
 
 
-def tiny() -> INVAE.Config:
+def tiny() -> AutoencoderKL.Config:
     """Return the published layout at golden size: widths 2 and 4, 16px."""
-    config = INVAE.Config()
+    config = invae()
     assert config.encoder is not None
     assert config.decoder is not None
     for half in (config.encoder, config.decoder):
@@ -49,8 +50,8 @@ def tiny() -> INVAE.Config:
     return config
 
 
-def _published() -> INVAE.Config:
-    return INVAE.Config.from_hf(
+def _published() -> AutoencoderKL.Config:
+    return AutoencoderKL.Config.from_hf(
         json_loads(
             (_TESTDATA / "e2e_invae_hf_config.json").read_text(),
             dict[str, object],
@@ -76,15 +77,15 @@ def _image() -> Tensor:
 
 
 def _round_trip(module: nn.Module, image: Tensor) -> Tensor:
-    assert isinstance(module, INVAE)
+    assert isinstance(module, AutoencoderKL)
     latent = module.encode(image).sample()
     return torch.cat([latent.flatten(), module.decode(latent).flatten()])
 
 
-def test_invae_round_trip_bfb() -> None:
+def test_round_trip_bfb() -> None:
     assert_bfb_against_golden(
         golden_dir=_TESTDATA,
-        golden_name="invae",
+        golden_name="kl",
         build_module=lambda: tiny().make(),
         build_input=_image,
         run=_round_trip,
@@ -97,7 +98,7 @@ def test_satisfies_the_autoencoder_protocol() -> None:
 
 
 def test_from_hf_parses_the_published_architecture_into_the_defaults() -> None:
-    parsed, default = _published(), INVAE.Config()
+    parsed, default = _published(), invae()
     assert parsed.latent_shape() == (32, 16, 16)
     assert default.encoder is not None
     assert default.decoder is not None
@@ -120,7 +121,7 @@ def test_published_halves_load_exactly_the_published_tensors() -> None:
 
 
 def test_the_published_checkpoint_is_pinned_on_both_halves() -> None:
-    config = INVAE.Config()
+    config = invae()
     assert config.encoder is not None
     assert config.decoder is not None
     assert isinstance(config.encoder.checkpoint, HubFile.Config)
@@ -213,7 +214,7 @@ def test_train_leaves_the_frozen_model_in_eval_mode() -> None:
 
 
 def test_latent_norm_is_the_published_scale() -> None:
-    norm = INVAE.Config().latent_norm
+    norm = invae().latent_norm
     assert isinstance(norm, ScaleLatents.Config)
     assert norm.scale == 0.3099
 
@@ -248,7 +249,7 @@ def test_rejects_halves_that_disagree_on_the_grid() -> None:
     [
         ("_class_name", "AutoencoderTiny", "AutoencoderKL"),
         ("act_fn", "gelu", "silu"),
-        ("use_quant_conv", False, "use_quant_conv"),
+        ("mid_block_add_attention", False, "mid_block_add_attention"),
         ("down_block_types", ["CrossAttnDownBlock2D"], "down_block_types"),
     ],
 )
@@ -263,7 +264,55 @@ def test_from_hf_refuses_an_architecture_it_does_not_build(
     )
     config[field] = value
     with pytest.raises(ValueError, match=match):
-        _ = INVAE.Config.from_hf(config)
+        _ = AutoencoderKL.Config.from_hf(config)
+
+
+def test_from_hf_omits_the_projections_a_config_turns_off() -> None:
+    config = json_loads(
+        (_TESTDATA / "e2e_invae_hf_config.json").read_text(),
+        dict[str, object],
+    )
+    config.update(use_quant_conv=False, use_post_quant_conv=False)
+    parsed = AutoencoderKL.Config.from_hf(config)
+    assert parsed.encoder is not None
+    assert parsed.decoder is not None
+    assert parsed.encoder.proj_out is None
+    assert parsed.decoder.proj_in is None
+
+
+def test_omitted_projections_build_no_modules_and_cost_nothing() -> None:
+    """Without them the moments and the latent pass straight through."""
+    with_proj, without = tiny(), tiny()
+    assert without.encoder is not None
+    assert without.decoder is not None
+    without.encoder.proj_out = None
+    without.decoder.proj_in = None
+    model = without.make()
+    assert model.encoder is not None
+    assert model.decoder is not None
+    assert model.encoder.quant_conv is None
+    assert model.decoder.post_quant_conv is None
+    # The two 1x1 convolutions, on the moments (2 * 2 channels) and the latent (2).
+    removed = (4 * 4 + 4) + (2 * 2 + 2)
+    full, bare = (
+        cost(config.copy_tree().finalize(), batch_size=2, dtype=None)
+        for config in (with_proj, without)
+    )
+    assert full.params - bare.params == removed
+    assert bare.params == sum(p.numel() for p in model.parameters())
+    image = _image()
+    assert model.decode(model.encode(image).mode()).shape == (2, 3, 16, 16)
+
+
+def test_projection_widths_follow_the_latent() -> None:
+    config = tiny().copy_tree().finalize()
+    assert config.encoder is not None
+    assert config.decoder is not None
+    proj_out, proj_in = config.encoder.proj_out, config.decoder.proj_in
+    assert isinstance(proj_out, Conv2d.Config)
+    assert isinstance(proj_in, Conv2d.Config)
+    assert (proj_out.channels_in, proj_out.channels_out) == (4, 4)
+    assert (proj_in.channels_in, proj_in.channels_out) == (2, 2)
 
 
 def test_load_reads_a_local_diffusers_directory(tmp_path: Path) -> None:
@@ -289,7 +338,7 @@ def test_load_reads_a_local_diffusers_directory(tmp_path: Path) -> None:
         **_to_diffusers(source.decoder.state_dict(), half="decoder"),
     }
     save_file(state, str(tmp_path / "diffusion_pytorch_model.safetensors"))
-    loaded = INVAE.load(tmp_path)
+    loaded = AutoencoderKL.load(tmp_path)
     image = _image()
     assert torch.equal(loaded.encode(image).mode(), source.encode(image).mode())
 
@@ -333,7 +382,7 @@ def test_cost_prices_the_pixel_maps_at_the_configured_channels() -> None:
 
 
 def _round_trip_decode(module: nn.Module, image: Tensor) -> Tensor:
-    assert isinstance(module, INVAE)
+    assert isinstance(module, AutoencoderKL)
     return module.decode(module.encode(image).sample())
 
 
@@ -346,7 +395,7 @@ def test_cost_params_are_every_parameter() -> None:
 
 def test_published_cost_is_linear_in_batch_size() -> None:
     """The pinned FLOPs are torch's for one 256px image through the published build."""
-    config = INVAE.Config().copy_tree().finalize()
+    config = invae().copy_tree().finalize()
     one = cost(config, batch_size=1, dtype=torch.bfloat16)
     two = cost(config, batch_size=2, dtype=torch.bfloat16)
     assert one["flops", "primal", "matmul", torch.bfloat16] == 390_131_613_696
@@ -355,7 +404,7 @@ def test_published_cost_is_linear_in_batch_size() -> None:
 
 
 def test_invae_config_pprint() -> None:
-    assert_pprint_golden(test_file=__file__, name="invae_config", config=INVAE.Config())
+    assert_pprint_golden(test_file=__file__, name="invae_config", config=invae())
 
 
 def test_config_needs_a_half_for_its_latent_shape() -> None:
