@@ -5,6 +5,22 @@ All notable priml changes are documented here. This project follows
 
 ## Unreleased
 
+### Added
+
+- `priml.model.ae.kl`: the published SD-1.x, SDXL, FLUX.1, and FLUX.2
+  autoencoders, as configs of `AutoencoderKL` with pinned weights:
+  `sd_ft_mse()` (vae-ft-mse-840000, EMA), `sdxl()`, `sdxl_fp16_fix()`,
+  `flux1()`, and `flux2()`. `remap_ldm_state_dict` reads the latent-diffusion
+  tensor names SD, SDXL, and BFL's files use. Each half's attention is an
+  injected `attn_kernel`: `LdmAttention`, the reference's `bmm` arithmetic
+  INVAE always used, or `SdpaFused`, as SDXL and FLUX compute it.
+  `AutoencoderKL.Config.patch_size` folds the latent into channels between
+  the halves, as FLUX.2 does. `testdata/kl_reference_{compvis,flux,flux2}.pt`
+  replay each reference's own outputs bit for bit.
+- `priml.model.ae.latent_norm`: `ShiftScaleLatents` (FLUX.1's
+  `(z - shift) * scale`) and `BatchNormLatents` (FLUX.2's frozen batch norm,
+  read from the checkpoint).
+
 ### Changed
 
 - `priml.model.ae.invae` is now `priml.model.ae.kl`: INVAE is one published

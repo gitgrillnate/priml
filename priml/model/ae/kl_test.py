@@ -1,12 +1,21 @@
 """AutoencoderKL: the published architectures, their checkpoint names, and the arithmetic.
 
 ``testdata/kl.pt`` freezes the round trip at golden size, in INVAE's layout.
+``testdata/kl_reference_{compvis,flux,flux2}.pt`` each hold a reference at its
+pinned commit -- CompVis's latent-diffusion modules, BFL's FLUX.1 and FLUX.2
+autoencoders -- at widths 2 and 4: its weights, an image, and its own moments,
+normalized latent, and pixels. The references hardcode 32 GroupNorm groups,
+so each was minted with its GroupNorms built at 2; their forward code ran
+unmodified, under ``host_agnostic_numerics``. Replaying them here, through
+``remap_ldm_state_dict``, proves the port against each reference's own
+arithmetic: CompVis's attention for SD-1.x, SDPA for SDXL and FLUX. SDXL
+differs from those two only in values.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import json
 
@@ -20,12 +29,33 @@ import torch
 from priml.cost import cost
 from priml.model.ae.checkpoint import HubFile, LocalFile
 from priml.model.ae.distribution import DiagonalGaussian
-from priml.model.ae.kl import AutoencoderKL, invae, remap_hf_state_dict
-from priml.model.ae.latent_norm import ScaleLatents
+from priml.model.ae.kl import (
+    AutoencoderKL,
+    LdmAttention,
+    flux1,
+    flux2,
+    invae,
+    remap_hf_state_dict,
+    remap_ldm_state_dict,
+    sd_ft_mse,
+    sdxl,
+    sdxl_fp16_fix,
+)
+from priml.model.ae.latent_norm import (
+    BatchNormLatents,
+    LatentNormalizer,
+    ScaleLatents,
+    ShiftScaleLatents,
+)
+from priml.model.attention.kernel import SdpaFused
 from priml.model.conv import Conv2d
-from priml.testing.bfb import assert_bfb_against_golden
+from priml.testing.bfb import assert_bfb_against_golden, host_agnostic_numerics
 from priml.testing.cost import assert_cost_matches_torch
-from priml.testing.golden import assert_pprint_golden
+from priml.testing.golden import assert_pprint_golden, mismatches, read_tensors
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -59,11 +89,11 @@ def _published() -> AutoencoderKL.Config:
     )
 
 
-def _published_keys() -> dict[str, tuple[int, ...]]:
-    """Every tensor in the published safetensors, by name, with its shape."""
-    lines = (_TESTDATA / "e2e_invae_hf_keys.txt").read_text().splitlines()
+def _published_keys(listing: str) -> dict[str, tuple[int, ...]]:
+    """Every tensor in a published file, by name, with its shape."""
+    lines = (_TESTDATA / listing).read_text().splitlines()
     return {
-        name: tuple(int(n) for n in shape.split("x"))
+        name: () if shape == "scalar" else tuple(int(n) for n in shape.split("x"))
         for name, shape in (line.split() for line in lines)
     }
 
@@ -108,7 +138,7 @@ def test_from_hf_parses_the_published_architecture_into_the_defaults() -> None:
 
 def test_published_halves_load_exactly_the_published_tensors() -> None:
     """Remapped, the diffusers names and shapes are each half's state, strictly."""
-    published = _published_keys()
+    published = _published_keys("e2e_invae_hf_keys.txt")
     with torch.device("meta"):
         model = _published().make()
         state = {name: torch.empty(shape) for name, shape in published.items()}
@@ -421,6 +451,228 @@ def test_cost_needs_both_halves() -> None:
     config.decoder = None
     with pytest.raises(ValueError, match="prices both halves"):
         _ = config.cost(batch_size=1, dtype=None)
+
+
+_REFERENCE_COMMITS: Final = {
+    "compvis": "21f890f9da3cfbeaba8e2ac3c425ee9e998d5229",
+    "flux": "802fb4713906133fcbd0d8dc5351620ca4773036",
+    "flux2": "50fe5162777813d869182b139e83b10743caef15",
+}
+
+
+def _reference_layout(source: str) -> AutoencoderKL.Config:
+    """Return the layout a reference golden was minted at: :func:`tiny`, 5 latents."""
+    config = tiny()
+    assert config.encoder is not None
+    assert config.decoder is not None
+    for half in (config.encoder, config.decoder):
+        half.channels_latent = 5
+        half.remap = remap_ldm_state_dict
+        # BFL's stages never attend, and its attention is SDPA's.
+        if source != "compvis":
+            half.attention = (False, False)
+            half.attn_kernel = SdpaFused.Config()
+    if source == "flux":
+        config.encoder.proj_out = None
+        config.decoder.proj_in = None
+    if source == "flux2":
+        config.patch_size = 2
+    return config
+
+
+def _reference_norm(
+    source: str,
+    state: dict[str, Tensor],
+    directory: Path,
+) -> LatentNormalizer:
+    """Return the normalizer each reference's ``encode`` applies; CompVis's applies none."""
+    if source == "flux":
+        return ShiftScaleLatents.Config(shift=0.1159, scale=0.3611).make()
+    if source == "flux2":
+        stats = {key: state[key] for key in ("bn.running_mean", "bn.running_var")}
+        save_file(stats, str(directory / "bn.safetensors"))
+        path = directory / "bn.safetensors"
+        return BatchNormLatents.Config(
+            stats=LocalFile.Config(path=path),
+            eps=1e-4,
+        ).make()
+    return ScaleLatents.Config().make()
+
+
+def _replay_reference(
+    source: str,
+    directory: Path,
+    *,
+    nudge: bool = False,
+) -> list[str]:
+    """Return how the port, loading a reference's tensors, misses its bits."""
+    reference = read_tensors(_TESTDATA / f"kl_reference_{source}.pt")
+    commit = reference.pop("source_commit").numpy().tobytes().decode()
+    assert commit == _REFERENCE_COMMITS[source]
+    # Inside (-1, 1), so decode's clamp leaves every compared bit visible.
+    assert reference["decoded"].abs().max() < 1
+    state = {
+        key.removeprefix("state."): value
+        for key, value in reference.items()
+        if key.startswith("state.")
+    }
+    model = _reference_layout(source).make()
+    assert model.encoder is not None
+    assert model.decoder is not None
+    model.encoder.load_state_dict(remap_ldm_state_dict(state, half="encoder"))
+    model.decoder.load_state_dict(remap_ldm_state_dict(state, half="decoder"))
+    if nudge:
+        bias = model.decoder.conv_out.bias
+        assert bias is not None
+        bias[0] = torch.nextafter(bias[0], torch.tensor(torch.inf))
+    norm = _reference_norm(source, state, directory)
+    image = reference["image"]
+    with host_agnostic_numerics():
+        actual = {
+            "moments": model.encoder(image.float() / 127.5 - 1),
+            "latent": norm.normalize(model.encode(image).mode()),
+        }
+        latent = reference.get("latent", actual["latent"])
+        actual["decoded"] = model.decode(norm.denormalize(latent))
+    expected = {
+        "moments": reference["moments"],
+        "latent": reference.get("latent", actual["latent"]),
+        "decoded": ((reference["decoded"] + 1) / 2).clamp(0, 1),
+    }
+    return mismatches(expected, actual=actual)
+
+
+@pytest.mark.parametrize("source", sorted(_REFERENCE_COMMITS))
+def test_matches_the_reference_implementation(source: str, tmp_path: Path) -> None:
+    report = _replay_reference(source, tmp_path)
+    assert not report, report
+
+
+def test_the_reference_replay_sees_one_ulp(tmp_path: Path) -> None:
+    """One ULP on one decoder bias moves the pixels, and the comparison reports it."""
+    report = _replay_reference("compvis", tmp_path, nudge=True)
+    assert [line.split(":")[0] for line in report] == ["decoded"]
+
+
+@pytest.mark.parametrize(
+    ("factory", "listing", "count"),
+    [
+        (sd_ft_mse, "sd_vae_ft_mse_keys.txt", 250),
+        # SDXL's and its float16 fix's files hold SD-1.x's names and shapes.
+        (sdxl, "sd_vae_ft_mse_keys.txt", 250),
+        (sdxl_fp16_fix, "sd_vae_ft_mse_keys.txt", 250),
+        (flux1, "flux1_ae_keys.txt", 244),
+        (flux2, "flux2_ae_keys.txt", 251),
+    ],
+    ids=["sd_ft_mse", "sdxl", "sdxl_fp16_fix", "flux1", "flux2"],
+)
+def test_published_ldm_halves_load_exactly_the_published_tensors(
+    factory: Callable[[], AutoencoderKL.Config],
+    listing: str,
+    count: int,
+) -> None:
+    """Remapped, each file's names and shapes are each half's state, strictly."""
+    published = _published_keys(listing)
+    config = factory()
+    assert config.encoder is not None
+    assert config.decoder is not None
+    config.encoder.checkpoint = config.decoder.checkpoint = None
+    with torch.device("meta"):
+        model = config.make()
+        state = {name: torch.empty(shape) for name, shape in published.items()}
+    for half, module in (("encoder", model.encoder), ("decoder", model.decoder)):
+        assert module is not None
+        expected = {k: tuple(v.shape) for k, v in module.state_dict().items()}
+        remapped = remap_ldm_state_dict(state, half=half)
+        assert {k: tuple(v.shape) for k, v in remapped.items()} == expected
+    assert len(published) == count
+
+
+@pytest.mark.parametrize(
+    ("factory", "latent_shape"),
+    [
+        (sd_ft_mse, (4, 32, 32)),
+        (sdxl, (4, 128, 128)),
+        (sdxl_fp16_fix, (4, 128, 128)),
+        (flux1, (16, 128, 128)),
+        (flux2, (128, 64, 64)),
+    ],
+    ids=["sd_ft_mse", "sdxl", "sdxl_fp16_fix", "flux1", "flux2"],
+)
+def test_published_latents_and_pinned_checkpoints(
+    factory: Callable[[], AutoencoderKL.Config],
+    latent_shape: tuple[int, int, int],
+) -> None:
+    config = factory()
+    assert config.latent_shape() == latent_shape
+    assert config.encoder is not None
+    assert config.decoder is not None
+    assert isinstance(config.encoder.checkpoint, HubFile.Config)
+    assert config.encoder.checkpoint == config.decoder.checkpoint
+    assert config.encoder.checkpoint is not config.decoder.checkpoint
+
+
+def test_published_latent_norms() -> None:
+    norms = [factory().latent_norm for factory in (sd_ft_mse, sdxl, flux1, flux2)]
+    sd, xl, one, two = norms
+    assert sd == ScaleLatents.Config(scale=0.18215)
+    assert xl == ScaleLatents.Config(scale=0.13025)
+    assert one == ShiftScaleLatents.Config(shift=0.1159, scale=0.3611)
+    assert isinstance(two, BatchNormLatents.Config)
+    assert two.eps == 1e-4
+    config = flux2()
+    assert config.encoder is not None
+    assert two.stats == config.encoder.checkpoint
+
+
+_PUBLISHED_LDM: Final = {
+    "sd_ft_mse": sd_ft_mse,
+    "sdxl": sdxl,
+    "sdxl_fp16_fix": sdxl_fp16_fix,
+    "flux1": flux1,
+    "flux2": flux2,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_PUBLISHED_LDM))
+def test_published_config_pprint(name: str) -> None:
+    assert_pprint_golden(
+        test_file=__file__,
+        name=f"{name}_config",
+        config=_PUBLISHED_LDM[name](),
+    )
+
+
+@pytest.mark.parametrize("source", ["flux", "flux2"])
+def test_sdpa_and_folded_layouts_cost_matches_torch(source: str) -> None:
+    analytical = assert_cost_matches_torch(
+        _reference_layout(source),
+        build_input=_image,
+        run=_round_trip_decode,
+        batch_size=2,
+        dtype=None,
+    )
+    assert analytical["adjoint"].sum() == 0
+
+
+def test_folding_needs_an_image_the_patch_divides() -> None:
+    config = _reference_layout("flux2")
+    config.image_size = 18
+    with pytest.raises(ValueError, match="divisible by 4"):
+        _ = config.make()
+
+
+def test_rejects_a_patch_that_folds_nothing() -> None:
+    config = _reference_layout("flux2")
+    config.patch_size = 0
+    with pytest.raises(ValueError, match="patch_size must be positive"):
+        _ = config.make()
+
+
+def test_ldm_attention_has_one_head() -> None:
+    q = torch.randn(2, 5, 3, 4)
+    with pytest.raises(ValueError, match="one head"):
+        _ = LdmAttention()(q, q, q)
 
 
 if __name__ == "__main__":

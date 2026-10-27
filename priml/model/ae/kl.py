@@ -2,19 +2,26 @@
 
 Stages of residual blocks halve the grid down to a middle of block, attention,
 block; a diagonal Gaussian over the latent sits between the halves. Published
-checkpoints differ in widths, depth, and attention placement, all config
-values, and in their tensor names, which a half's ``remap`` reads.
+checkpoints differ in widths, depth, attention placement, and whether the halves
+project the latent, all config values; in the arithmetic of their attention,
+an injected kernel; and in their tensor names, which a half's ``remap`` reads.
 
-Build a published model from its factory -- :func:`invae` -- or parse a
+Build a published model from its factory -- :func:`invae`, :func:`sd_ft_mse`,
+:func:`sdxl`, :func:`sdxl_fp16_fix`, :func:`flux1`, :func:`flux2` -- or parse a
 diffusers ``config.json`` with :meth:`AutoencoderKL.Config.from_hf`.
 
-MIT license and attribution: ``LICENSES/REG``.
+Licenses and attribution: ``LICENSES/REG``, ``LICENSES/flux``,
+``LICENSES/flux2``. CompVis's code, under CreativeML Open RAIL-M, is not
+ported: its outputs are replayed in the tests.
 
 References:
   https://github.com/SwayStar123/REG/blob/3c51606c801dd9e87ee9ef778782766ab7c379ca/models/invae.py
   https://huggingface.co/REPA-E/e2e-invae-hf
     Leng et al. 2025. REPA-E: Unlocking VAE for end-to-end tuning with latent
     diffusion transformers.
+  https://github.com/CompVis/stable-diffusion/blob/21f890f9da3cfbeaba8e2ac3c425ee9e998d5229/ldm/modules/diffusionmodules/model.py
+    Rombach et al. 2022. High-resolution image synthesis with latent
+    diffusion models.
 
 """
 
@@ -33,6 +40,7 @@ from treekle import from_plain
 import torch
 
 from priml.cost import Cost, cost, elementwise_cost, traffic
+from priml.math.pixel import patchify, unpatchify
 from priml.model.ae.checkpoint import (
     CheckpointFile,
     HubFile,
@@ -42,10 +50,16 @@ from priml.model.ae.checkpoint import (
 )
 from priml.model.ae.custom_types import StateDictRemap
 from priml.model.ae.distribution import DiagonalGaussian
-from priml.model.ae.latent_norm import LatentNormalizer, ScaleLatents
-from priml.model.attention.kernel import attention_kernel_cost
+from priml.model.ae.latent_norm import (
+    BatchNormLatents,
+    LatentNormalizer,
+    ScaleLatents,
+    ShiftScaleLatents,
+)
+from priml.model.attention.kernel import SdpaFused, attention_kernel_cost
 from priml.model.conv import Conv2d, conv_cost
 from priml.model.custom_types import (
+    AttentionKernel,
     ChannelsIn,
     ChannelsOut,
     TensorModule,
@@ -105,6 +119,121 @@ def remap_hf_state_dict(state: Mapping[str, Tensor], *, half: str) -> dict[str, 
     return remapped
 
 
+def remap_ldm_state_dict(
+    state: Mapping[str, Tensor],
+    *,
+    half: str,
+) -> dict[str, Tensor]:
+    """Rename one half's latent-diffusion tensors to this module's names.
+
+    Reads the CompVis layout SD-1.x and SDXL ship (``down.0.block.1``,
+    ``mid.attn_1.q``, ``nin_shortcut``), with its projections at the top level,
+    and BFL's FLUX files, which nest them under their half
+    (``encoder.quant_conv``). The decoder's ``up`` levels count from the finest
+    grid, its stages from the coarsest.
+
+    Args:
+      state: Latent-diffusion tensors; keys outside ``half`` are ignored.
+      half: ``"encoder"`` or ``"decoder"``.
+
+    Returns:
+      state: This half's ``state_dict``.
+
+    """
+    quant = {"encoder": "quant_conv.", "decoder": "post_quant_conv."}[half]
+    prefix = f"{half}."
+    levels = 1 + max(
+        (
+            int(match.group(1))
+            for key in state
+            if (match := _LDM_UP.match(key.removeprefix(prefix))) is not None
+        ),
+        default=-1,
+    )
+    remapped: dict[str, Tensor] = {}
+    for key, tensor in state.items():
+        nested = key.removeprefix(prefix)
+        if key.startswith(quant) or (
+            key.startswith(prefix) and nested.startswith(quant)
+        ):
+            remapped[key.removeprefix(prefix)] = tensor
+        elif key.startswith(prefix):
+            name = _LDM_UP.sub(
+                lambda match: f"up_blocks.{levels - 1 - int(match.group(1))}.",
+                nested,
+            )
+            for pattern, replacement in _LDM_RENAMES:
+                name = pattern.sub(replacement, name)
+            remapped[name] = tensor
+    return remapped
+
+
+class LdmAttention(nn.Module):
+    """Single-head attention in the latent-diffusion reference's own arithmetic.
+
+    Scores are one ``bmm`` multiplied by ``channels ** -0.5``, and the values are
+    weighted by a second ``bmm``, as CompVis's and REG's ``AttnBlock`` compute
+    them; :class:`~priml.model.attention.kernel.SdpaFused` divides and rounds
+    differently. Takes and returns ``[N, S, 1, C]``.
+
+    References:
+      https://github.com/CompVis/stable-diffusion/blob/21f890f9da3cfbeaba8e2ac3c425ee9e998d5229/ldm/modules/diffusionmodules/model.py
+
+    """
+
+    class Config(Fig["LdmAttention"]):
+        @classmethod
+        def cost(
+            cls,
+            *,
+            seq_len: int,
+            batch_size: int = 1,
+            dtype: torch.dtype | None,
+            num_heads: int,
+            channels_head: int,
+            **kwargs: object,
+        ) -> Cost:
+            """Cost the two products and the softmax.
+
+            Args:
+              seq_len: Grid positions.
+              batch_size: Grids in this invocation.
+              dtype: Activation dtype; ``None`` is torch's default.
+              num_heads: Heads; the reference has one.
+              channels_head: Channels.
+              **kwargs: The rest of the owner's bus, unread.
+
+            Returns:
+              cost: Whole-invocation FLOPs and logical tensor bytes.
+
+            """
+            del kwargs
+            return attention_kernel_cost(
+                seq_len=seq_len,
+                batch_size=batch_size,
+                dtype=dtype,
+                num_heads=num_heads,
+                channels_head=channels_head,
+            )
+
+    def __init__(self, config: Config | None = None) -> None:
+        del config
+        super().__init__()
+
+    @override
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, **kwargs: object) -> Tensor:
+        """Attend ``[N, S, 1, C]`` queries to keys and values of the same shape."""
+        del kwargs
+        if q.shape[-2] != 1:
+            raise ValueError(f"LdmAttention has one head; got {q.shape[-2]}.")
+        # The reference's operands, strides included: the queries ``[N, S, C]``,
+        # the keys and values ``[N, C, S]``.
+        scores = torch.bmm(q.squeeze(-2), k.squeeze(-2).transpose(1, 2))
+        weights = functional.softmax(scores * (q.shape[-1] ** (-0.5)), dim=2)
+        attended = torch.bmm(v.squeeze(-2).transpose(1, 2), weights.permute(0, 2, 1))
+        return attended.transpose(1, 2).unsqueeze(-2)
+
+
 class Encoder(nn.Module):
     """Pixels in ``[-1, 1]`` to posterior moments: stages halving the grid, then a middle."""
 
@@ -131,6 +260,11 @@ class Encoder(nn.Module):
 
         eps: float = 1e-6
         """GroupNorm epsilon."""
+
+        attn_kernel: Makeable[AttentionKernel] = field(
+            default_factory=LdmAttention.Config,
+        )
+        """Every self-attention's arithmetic; ``SdpaFused`` where the reference calls SDPA."""
 
         proj_out: Makeable[TensorModule] | None = field(
             default_factory=lambda: Conv2d.Config(kernel_size=1, padding=0, bias=True),
@@ -193,6 +327,7 @@ class Encoder(nn.Module):
             layers = _Layers(
                 batch_size=batch_size,
                 num_groups=self.num_groups,
+                attn_kernel=self.attn_kernel,
                 dtype=dtype,
             )
             widths, side = self.channels_hidden, input_grid
@@ -228,6 +363,7 @@ class Encoder(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
         widths, groups, eps = config.channels_hidden, config.num_groups, config.eps
+        kernel = config.attn_kernel
         self.conv_in = _conv(config.channels_in, widths[0], kernel_size=3)
         self.down_blocks: nn.ModuleList[_Stage] = nn.ModuleList()
         width_in = widths[0]
@@ -242,12 +378,12 @@ class Encoder(nn.Module):
                 width_in = width
                 if attends:
                     level.attentions.append(
-                        _Attention(width, num_groups=groups, eps=eps),
+                        _Attention(width, num_groups=groups, eps=eps, kernel=kernel),
                     )
             if stage != len(widths) - 1:
                 level.downsamplers.append(_Downsample(width))
             self.down_blocks.append(level)
-        self.mid_block = _Middle(width_in, num_groups=groups, eps=eps)
+        self.mid_block = _Middle(width_in, num_groups=groups, eps=eps, kernel=kernel)
         self.conv_norm_out = _norm(width_in, num_groups=groups, eps=eps)
         self.conv_out = _conv(width_in, 2 * config.channels_latent, kernel_size=3)
         # Named for the checkpoints' own tensors, so a remap only strips prefixes.
@@ -294,6 +430,11 @@ class Decoder(nn.Module):
 
         eps: float = 1e-6
         """GroupNorm epsilon."""
+
+        attn_kernel: Makeable[AttentionKernel] = field(
+            default_factory=LdmAttention.Config,
+        )
+        """Every self-attention's arithmetic; ``SdpaFused`` where the reference calls SDPA."""
 
         proj_in: Makeable[TensorModule] | None = field(
             default_factory=lambda: Conv2d.Config(kernel_size=1, padding=0, bias=True),
@@ -346,6 +487,7 @@ class Decoder(nn.Module):
             layers = _Layers(
                 batch_size=batch_size,
                 num_groups=self.num_groups,
+                attn_kernel=self.attn_kernel,
                 dtype=dtype,
             )
             z, side = self.channels_latent, input_grid
@@ -382,12 +524,13 @@ class Decoder(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
         widths, groups, eps = config.channels_hidden, config.num_groups, config.eps
+        kernel = config.attn_kernel
         z = config.channels_latent
         # Named for the checkpoints' own tensors, as the encoder's ``quant_conv``.
         self.post_quant_conv = None if config.proj_in is None else config.proj_in.make()
         width_in = widths[-1]
         self.conv_in = _conv(z, width_in, kernel_size=3)
-        self.mid_block = _Middle(width_in, num_groups=groups, eps=eps)
+        self.mid_block = _Middle(width_in, num_groups=groups, eps=eps, kernel=kernel)
         self.up_blocks: nn.ModuleList[_Stage] = nn.ModuleList()
         stages = list(zip(widths, config.attention, strict=True))
         for stage, (width, attends) in reversed(list(enumerate(stages))):
@@ -399,7 +542,7 @@ class Decoder(nn.Module):
                 width_in = width
                 if attends:
                     level.attentions.append(
-                        _Attention(width, num_groups=groups, eps=eps),
+                        _Attention(width, num_groups=groups, eps=eps, kernel=kernel),
                     )
             if stage != 0:
                 level.upsamplers.append(_Upsample(width))
@@ -443,6 +586,13 @@ class AutoencoderKL(nn.Module):
 
         image_size: int = 256
         """Side of the square image the checkpoint was trained at."""
+
+        patch_size: int = 1
+        """Side of the patch folded into channels between the halves.
+
+        The posterior and the latent ``decode`` takes are over the folded grid,
+        ``channels_latent * patch_size**2`` channels; FLUX.2 folds 2.
+        """
 
         latent_norm: Makeable[LatentNormalizer] = field(
             default_factory=lambda: ScaleLatents.Config(scale=0.3099),
@@ -506,12 +656,14 @@ class AutoencoderKL(nn.Module):
             return cls(encoder=encoder, decoder=decoder)
 
         def latent_shape(self) -> tuple[int, int, int]:
-            """Return ``(channels_latent, side, side)`` at ``image_size``."""
+            """Return ``(channels, side, side)`` of the folded latent at ``image_size``."""
             half = self.encoder or self.decoder
             if half is None:
                 raise ValueError("AutoencoderKL.Config needs an encoder or a decoder.")
-            side = self.image_size >> (len(half.channels_hidden) - 1)
-            return half.channels_latent, side, side
+            side = (
+                self.image_size >> (len(half.channels_hidden) - 1)
+            ) // self.patch_size
+            return half.channels_latent * self.patch_size**2, side, side
 
         def cost(
             self,
@@ -557,7 +709,7 @@ class AutoencoderKL(nn.Module):
                     self.decoder,
                     **{
                         **kwargs,
-                        "input_grid": side,
+                        "input_grid": side * self.patch_size,
                         "batch_size": batch_size,
                         "dtype": dtype,
                     },
@@ -586,6 +738,15 @@ class AutoencoderKL(nn.Module):
                 + _pointwise(pixels_out, flops=1, dtype=dtype).tile(2)
                 + _pointwise(pixels_out, flops=2, dtype=dtype)
             )
+            if self.patch_size > 1:
+                # Folding the mean and the log-variance, unfolding the draw: each
+                # a strided copy, read once and written once.
+                full += traffic(
+                    "primal",
+                    kernel="elementwise",
+                    elements=6 * latents,
+                    dtype=dtype,
+                )
             return Cost(
                 cells=full.only("primal").cells,
                 params=full.params,
@@ -597,7 +758,9 @@ class AutoencoderKL(nn.Module):
         halves = [half for half in (config.encoder, config.decoder) if half is not None]
         if not halves:
             raise ValueError("AutoencoderKL needs an encoder or a decoder.")
-        downsample = 1 << (len(halves[0].channels_hidden) - 1)
+        if config.patch_size < 1:
+            raise ValueError(f"patch_size must be positive; got {config.patch_size}.")
+        downsample = (1 << (len(halves[0].channels_hidden) - 1)) * config.patch_size
         if config.image_size % downsample:
             raise ValueError(
                 f"image_size {config.image_size} must be divisible by {downsample}.",
@@ -611,6 +774,7 @@ class AutoencoderKL(nn.Module):
             )
         self.encoder = None if config.encoder is None else config.encoder.make()
         self.decoder = None if config.decoder is None else config.decoder.make()
+        self.patch = (config.patch_size, config.patch_size)
         self.eval()
         self.requires_grad_(False)
 
@@ -656,7 +820,8 @@ class AutoencoderKL(nn.Module):
           x: ``[..., 3, H, W]`` uint8 RGB.
 
         Returns:
-          posterior: Diagonal Gaussian over ``[..., channels_latent, h, w]``.
+          posterior: Diagonal Gaussian over the folded latent
+            ``[..., channels_latent * patch_size**2, h, w]``.
 
         Raises:
           TypeError: ``x`` is not uint8.
@@ -676,13 +841,15 @@ class AutoencoderKL(nn.Module):
         moments = self.encoder(pixels)
         moments = moments.reshape(*x.shape[:-3], *moments.shape[1:])
         mean, logvar = moments.chunk(2, dim=-3)
+        if self.patch != (1, 1):
+            mean, logvar = patchify(mean, self.patch), patchify(logvar, self.patch)
         return DiagonalGaussian(mean, logvar)
 
     def decode(self, z: Tensor, /) -> Tensor:
         """Decode latents to RGB in ``[0, 1]``.
 
         Args:
-          z: ``[..., channels_latent, h, w]`` raw latents.
+          z: ``[..., channels_latent * patch_size**2, h, w]`` raw latents.
 
         Returns:
           image: ``[..., 3, H, W]`` float RGB, clamped.
@@ -693,6 +860,8 @@ class AutoencoderKL(nn.Module):
         """
         if self.decoder is None:
             raise ValueError("This AutoencoderKL was built without a decoder.")
+        if self.patch != (1, 1):
+            z = unpatchify(z, self.patch)
         decoded = self.decoder(z.reshape(-1, *z.shape[-3:]))
         decoded = decoded.reshape(*z.shape[:-3], *decoded.shape[1:])
         return ((decoded + 1) / 2).clamp(0, 1)
@@ -708,7 +877,199 @@ def invae() -> AutoencoderKL.Config:
     return AutoencoderKL.Config()
 
 
+def sd_ft_mse() -> AutoencoderKL.Config:
+    """Return SD-1.x's VAE fine-tuned 840k steps on MSE, EMA weights: 4 channels, 8x.
+
+    Attention in CompVis's arithmetic, the code SD-1.x shipped with.
+
+    Returns:
+      config: The published model, weights pinned.
+
+    References:
+      https://huggingface.co/stabilityai/sd-vae-ft-mse-original
+      Rombach et al. 2022. High-resolution image synthesis with latent
+      diffusion models.
+
+    """
+    config = _ldm(
+        HubFile.Config(
+            repo_id="stabilityai/sd-vae-ft-mse-original",
+            filename="vae-ft-mse-840000-ema-pruned.safetensors",
+            revision="629b3ad3030ce36e15e70c5db7d91df0d60c627f",
+            sha256="735e4c3a447a3255760d7f86845f09f937809baa529c17370d83e4c3758f3c75",
+        ),
+        channels_latent=4,
+        attn_kernel=LdmAttention.Config(),
+    )
+    config.latent_norm = ScaleLatents.Config(scale=0.18215)
+    return config
+
+
+def sdxl() -> AutoencoderKL.Config:
+    """Return SDXL's VAE: SD-1.x's architecture retrained, 4 channels, 8x.
+
+    Attention through SDPA, as Stability's ``sgm`` computes it.
+
+    Returns:
+      config: The published model, weights pinned.
+
+    References:
+      https://huggingface.co/stabilityai/sdxl-vae
+      Podell et al. 2023. SDXL: Improving latent diffusion models for
+      high-resolution image synthesis.
+
+    """
+    config = _ldm(
+        HubFile.Config(
+            repo_id="stabilityai/sdxl-vae",
+            filename="sdxl_vae.safetensors",
+            revision="6f5909a7e596173e25d4e97b07fd19cdf9611c76",
+            sha256="63aeecb90ff7bc1c115395962d3e803571385b61938377bc7089b36e81e92e2e",
+        ),
+        channels_latent=4,
+        attn_kernel=SdpaFused.Config(),
+    )
+    config.image_size = 1024
+    config.latent_norm = ScaleLatents.Config(scale=0.13025)
+    return config
+
+
+def sdxl_fp16_fix() -> AutoencoderKL.Config:
+    """Return SDXL's VAE fine-tuned to keep its activations finite in float16.
+
+    The latents match :func:`sdxl`'s closely but not exactly.
+
+    Returns:
+      config: The published model, weights pinned.
+
+    References:
+      https://huggingface.co/madebyollin/sdxl-vae-fp16-fix
+
+    """
+    config = sdxl()
+    checkpoint = HubFile.Config(
+        repo_id="madebyollin/sdxl-vae-fp16-fix",
+        filename="sdxl_vae.safetensors",
+        revision="207b116dae70ace3637169f1ddd2434b91b3a8cd",
+        sha256="235745af8d86bf4a4c1b5b4f529868b37019a10f7c0b2e79ad0abca3a22bc6e1",
+    )
+    assert config.encoder is not None
+    assert config.decoder is not None
+    config.encoder.checkpoint = checkpoint
+    config.decoder.checkpoint = checkpoint.copy_tree()
+    return config
+
+
+def flux1() -> AutoencoderKL.Config:
+    """Return FLUX.1's VAE: 16 channels, 8x, no projection between the halves.
+
+    Returns:
+      config: The published model, weights pinned.
+
+    References:
+      https://huggingface.co/black-forest-labs/FLUX.1-dev
+      https://github.com/black-forest-labs/flux/blob/802fb4713906133fcbd0d8dc5351620ca4773036/src/flux/modules/autoencoder.py
+        License: ``LICENSES/flux``.
+
+    """
+    config = _ldm(
+        HubFile.Config(
+            repo_id="black-forest-labs/FLUX.1-dev",
+            filename="ae.safetensors",
+            revision="3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+            sha256="afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+        ),
+        channels_latent=16,
+        attn_kernel=SdpaFused.Config(),
+    )
+    assert config.encoder is not None
+    assert config.decoder is not None
+    config.encoder.proj_out = None
+    config.decoder.proj_in = None
+    config.image_size = 1024
+    config.latent_norm = ShiftScaleLatents.Config(shift=0.1159, scale=0.3611)
+    return config
+
+
+def flux2() -> AutoencoderKL.Config:
+    """Return FLUX.2's VAE: 32 channels at 8x, folded 2x2 to 128 channels at 16x.
+
+    Its normalizer is the checkpoint's own frozen batch norm over the folded
+    latent.
+
+    Returns:
+      config: The published model, weights pinned.
+
+    References:
+      https://huggingface.co/black-forest-labs/FLUX.2-dev
+      https://github.com/black-forest-labs/flux2/blob/50fe5162777813d869182b139e83b10743caef15/src/flux2/autoencoder.py
+        License: ``LICENSES/flux2``.
+
+    """
+    checkpoint = HubFile.Config(
+        repo_id="black-forest-labs/FLUX.2-dev",
+        filename="ae.safetensors",
+        revision="26afe3a78bb242c0a8bb181dcc8937bb16e5c66c",
+        sha256="868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3",
+    )
+    config = _ldm(
+        checkpoint,
+        channels_latent=32,
+        attn_kernel=SdpaFused.Config(),
+    )
+    config.image_size = 1024
+    config.patch_size = 2
+    stats = checkpoint.copy_tree()
+    config.latent_norm = BatchNormLatents.Config(stats=stats, eps=1e-4)
+    return config
+
+
+# Every published latent-diffusion checkpoint shares this layout; each half gets its
+# own copies, so a fork editing one half's checkpoint or kernel leaves the other's.
+def _ldm(
+    checkpoint: HubFile.Config,
+    *,
+    channels_latent: int,
+    attn_kernel: Makeable[AttentionKernel],
+) -> AutoencoderKL.Config:
+    """Return the latent-diffusion 8x layout with this checkpoint, width, and kernel."""
+    config = AutoencoderKL.Config()
+    assert config.encoder is not None
+    assert config.decoder is not None
+    for half in (config.encoder, config.decoder):
+        half.channels_hidden = (128, 256, 512, 512)
+        half.attention = (False, False, False, False)
+        half.channels_latent = channels_latent
+        half.attn_kernel = attn_kernel.copy_tree()
+        half.checkpoint = checkpoint.copy_tree()
+        half.remap = remap_ldm_state_dict
+    return config
+
+
 _ATTENTION_PROJECTION: Final = re.compile(r"\.to_(q|k|v|out)\.weight$")
+
+_LDM_UP: Final = re.compile(r"^up\.(\d+)\.")
+
+_LDM_RENAMES: Final = tuple(
+    (re.compile(pattern), replacement)
+    for pattern, replacement in (
+        (r"^down\.(\d+)\.block\.", r"down_blocks.\1.resnets."),
+        (r"^down\.(\d+)\.attn\.", r"down_blocks.\1.attentions."),
+        (r"^down\.(\d+)\.downsample\.", r"down_blocks.\1.downsamplers.0."),
+        (r"^(up_blocks\.\d+)\.block\.", r"\1.resnets."),
+        (r"^(up_blocks\.\d+)\.attn\.", r"\1.attentions."),
+        (r"^(up_blocks\.\d+)\.upsample\.", r"\1.upsamplers.0."),
+        (r"^mid\.block_1\.", "mid_block.resnets.0."),
+        (r"^mid\.block_2\.", "mid_block.resnets.1."),
+        (r"^mid\.attn_1\.", "mid_block.attentions.0."),
+        (r"^norm_out\.", "conv_norm_out."),
+        (r"\.nin_shortcut\.", ".conv_shortcut."),
+        (r"(attentions\.\d+)\.norm\.", r"\1.group_norm."),
+        (r"(attentions\.\d+)\.(q|k|v)\.", r"\1.to_\2."),
+        (r"(attentions\.\d+)\.proj_out\.", r"\1.to_out."),
+    )
+)
+"""Latent-diffusion names to this module's, applied in order after ``up`` reindexing."""
 
 _SUPPORTED_BLOCKS: Final = {
     "down_block_types": {"DownEncoderBlock2D", "AttnDownEncoderBlock2D"},
@@ -801,24 +1162,33 @@ class _Resnet(nn.Module):
 class _Attention(nn.Module):
     """Single-head self-attention over the grid, added to its input."""
 
-    def __init__(self, channels: int, *, num_groups: int, eps: float) -> None:
+    def __init__(
+        self,
+        channels: int,
+        *,
+        num_groups: int,
+        eps: float,
+        kernel: Makeable[AttentionKernel],
+    ) -> None:
         super().__init__()
         self.group_norm = _norm(channels, num_groups=num_groups, eps=eps)
         self.to_q = _conv(channels, channels, kernel_size=1)
         self.to_k = _conv(channels, channels, kernel_size=1)
         self.to_v = _conv(channels, channels, kernel_size=1)
         self.to_out = _conv(channels, channels, kernel_size=1)
+        self.kernel = kernel.make()
 
     @override
     def forward(self, x: Tensor) -> Tensor:
         h = self.group_norm(x)
-        q, k, v = self.to_q(h), self.to_k(h), self.to_v(h)
-        b, c, height, width = q.shape
-        # The reference's products and its scale, a multiply by ``c ** -0.5``:
-        # ``scaled_dot_product_attention`` divides and rounds differently.
-        scores = torch.bmm(q.reshape(b, c, -1).permute(0, 2, 1), k.reshape(b, c, -1))
-        weights = functional.softmax(scores * (c ** (-0.5)), dim=2)
-        attended = torch.bmm(v.reshape(b, c, -1), weights.permute(0, 2, 1))
+        b, c, height, width = x.shape
+        # ``[N, S, 1, C]`` views of the projections, which :class:`LdmAttention`
+        # turns back into the reference's own operands without a copy.
+        q, k, v = (
+            projection(h).reshape(b, c, -1).permute(0, 2, 1).unsqueeze(2)
+            for projection in (self.to_q, self.to_k, self.to_v)
+        )
+        attended = self.kernel(q, k, v).squeeze(2).permute(0, 2, 1)
         return x + self.to_out(attended.reshape(b, c, height, width))
 
 
@@ -874,14 +1244,21 @@ class _Stage(nn.Module):
 class _Middle(nn.Module):
     """Residual block, attention, residual block, at the coarsest grid."""
 
-    def __init__(self, channels: int, *, num_groups: int, eps: float) -> None:
+    def __init__(
+        self,
+        channels: int,
+        *,
+        num_groups: int,
+        eps: float,
+        kernel: Makeable[AttentionKernel],
+    ) -> None:
         super().__init__()
         self.resnets: nn.ModuleList[_Resnet] = nn.ModuleList(
             _Resnet(channels, channels, num_groups=num_groups, eps=eps)
             for _ in range(2)
         )
         self.attentions: nn.ModuleList[_Attention] = nn.ModuleList(
-            [_Attention(channels, num_groups=num_groups, eps=eps)],
+            [_Attention(channels, num_groups=num_groups, eps=eps, kernel=kernel)],
         )
 
     @override
@@ -891,10 +1268,11 @@ class _Middle(nn.Module):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Layers:
-    """Price the reference's layers at one batch size, group count, and dtype."""
+    """Price the reference's layers at one batch size, group count, kernel, and dtype."""
 
     batch_size: int
     num_groups: int
+    attn_kernel: Makeable[AttentionKernel]
     dtype: torch.dtype | None
 
     def conv(
@@ -998,7 +1376,8 @@ class _Layers:
         return (
             self.norm(channels, side=side)
             + self.conv(channels, channels, side=side, kernel_size=1).tile(4, copies=4)
-            + attention_kernel_cost(
+            + cost(
+                self.attn_kernel,
                 seq_len=side * side,
                 batch_size=self.batch_size,
                 dtype=self.dtype,

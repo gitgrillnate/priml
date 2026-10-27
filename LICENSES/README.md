@@ -20,6 +20,8 @@ names its file here.
 | `VTP` | [MiniMax-AI/VTP](https://github.com/MiniMax-AI/VTP) @ `5ce1eb6` | MIT | `model/ae/vtp.py` |
 | `cifar10-airbench` | [KellerJordan/cifar10-airbench](https://github.com/KellerJordan/cifar10-airbench) | MIT | `baselines/cifar10` |
 | `ffcv-imagenet` | [libffcv/ffcv-imagenet](https://github.com/libffcv/ffcv-imagenet) | Apache-2.0 | `baselines/imagenet` |
+| `flux` | [black-forest-labs/flux](https://github.com/black-forest-labs/flux) @ `802fb47` | Apache-2.0 | `model/ae/kl.py`, `model/ae/latent_norm.py` |
+| `flux2` | [black-forest-labs/flux2](https://github.com/black-forest-labs/flux2) @ `50fe516` | Apache-2.0 | `model/ae/kl.py`, `model/ae/latent_norm.py` |
 | `generative-inverse-heat-dissipation` | [AaltoML/generative-inverse-heat-dissipation](https://github.com/AaltoML/generative-inverse-heat-dissipation) | MIT | `math/frequency.py` |
 | `purejaxql` | [mttga/purejaxql](https://github.com/mttga/purejaxql) | Apache-2.0 | `baselines/craftax` (PQN) |
 | `torch-dct` | [zh217/torch-dct](https://github.com/zh217/torch-dct) | MIT | `math/frequency.py` |
