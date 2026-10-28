@@ -46,8 +46,9 @@ from priml.model.ae.checkpoint import CheckpointFile, HubFile, read_state
 from priml.model.ae.custom_types import StateDictRemap
 from priml.model.ae.distribution import DiagonalGaussian
 from priml.model.ae.latent_norm import InverseStdLatents, LatentNormalizer
+from priml.model.ae.video import CausalConv3d, per_frame
 from priml.model.attention.kernel import SdpaFused
-from priml.model.conv import Conv2d, Conv3d, conv_cost
+from priml.model.conv import Conv2d, conv_cost
 from priml.model.custom_types import AttentionKernel
 from priml.model.swiglu import silu
 
@@ -328,7 +329,7 @@ class Encoder(nn.Module):
                 f"got {len(config.temporal)}.",
             )
         self.patch_size = p
-        self.conv1 = _CausalConv3d(config.channels_in * p * p, widths[0])
+        self.conv1 = CausalConv3d(config.channels_in * p * p, widths[0])
         self.downsamples: nn.ModuleList[_Stage] = nn.ModuleList()
         width_in = widths[0]
         for stage, width_out in enumerate(widths):
@@ -354,7 +355,7 @@ class Encoder(nn.Module):
         self.head = _head(width_in, 2 * config.channels_latent)
         moments = 2 * config.channels_latent
         # Named for the checkpoints' own tensors, as ``kl`` names its projections.
-        self.quant_conv = _CausalConv3d(moments, moments, (1, 1, 1), padding=(0, 0, 0))
+        self.quant_conv = CausalConv3d(moments, moments, (1, 1, 1), past=0)
         if config.checkpoint is not None:
             state = read_state(
                 config.checkpoint.make().path(),
@@ -487,8 +488,8 @@ class Decoder(nn.Module):
             )
         self.patch_size = p
         # Named for the checkpoints' own tensors, as the encoder's ``quant_conv``.
-        self.post_quant_conv = _CausalConv3d(z, z, (1, 1, 1), padding=(0, 0, 0))
-        self.conv1 = _CausalConv3d(z, widths[0])
+        self.post_quant_conv = CausalConv3d(z, z, (1, 1, 1), past=0)
+        self.conv1 = CausalConv3d(z, widths[0])
         self.middle = _middle(widths[0], kernel=config.attn_kernel)
         self.upsamples: nn.ModuleList[_Stage] = nn.ModuleList()
         width_in = widths[0]
@@ -855,37 +856,6 @@ def _unfold(x: Tensor, p: int) -> Tensor:
     return unfolded.transpose(-1, -2).transpose(1, 2)
 
 
-class _CausalConv3d(Conv3d):
-    """A biased ``Conv3d`` padded in time on its past side only."""
-
-    def __init__(
-        self,
-        channels_in: int,
-        channels_out: int,
-        kernel_size: tuple[int, int, int] = (3, 3, 3),
-        *,
-        stride: tuple[int, int, int] = (1, 1, 1),
-        padding: tuple[int, int, int] = (1, 1, 1),
-    ) -> None:
-        super().__init__(
-            Conv3d.Config(
-                channels_in,
-                channels_out,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=0,
-                bias=True,
-            ),
-        )
-        t, h, w = padding
-        self.causal = (w, w, h, h, 2 * t, 0)
-
-    @override
-    def forward(self, input: Tensor, **kwargs: object) -> Tensor:
-        del kwargs
-        return super().forward(functional.pad(input, self.causal))
-
-
 class _RMSNorm(nn.Module):
     """The reference's channel-first RMS norm: ``normalize(x) * sqrt(C) * gamma``."""
 
@@ -910,14 +880,14 @@ class _Residual(nn.Module):
         self.residual = nn.Sequential(
             _RMSNorm(channels_in, spatial_axes=3),
             nn.SiLU(),
-            _CausalConv3d(channels_in, channels_out),
+            CausalConv3d(channels_in, channels_out),
             _RMSNorm(channels_out, spatial_axes=3),
             nn.SiLU(),
             nn.Identity(),
-            _CausalConv3d(channels_out, channels_out),
+            CausalConv3d(channels_out, channels_out),
         )
         self.shortcut = (
-            _CausalConv3d(channels_in, channels_out, (1, 1, 1), padding=(0, 0, 0))
+            CausalConv3d(channels_in, channels_out, (1, 1, 1), past=0)
             if channels_in != channels_out
             else nn.Identity()
         )
@@ -985,12 +955,12 @@ class _Down(nn.Module):
             ).make(),
         )
         self.time_conv = (
-            _CausalConv3d(
+            CausalConv3d(
                 channels,
                 channels,
                 (3, 1, 1),
                 stride=(2, 1, 1),
-                padding=(0, 0, 0),
+                past=0,
             )
             if temporal
             else None
@@ -998,7 +968,7 @@ class _Down(nn.Module):
 
     @override
     def forward(self, x: Tensor) -> Tensor:
-        x = _per_frame(self.resample, x)
+        x = per_frame(self.resample, x)
         if self.time_conv is None or x.shape[2] == 1:
             return x
         return torch.cat([x[:, :, :1], self.time_conv(x)], dim=2)
@@ -1020,9 +990,7 @@ class _Up(nn.Module):
             ).make(),
         )
         self.time_conv = (
-            _CausalConv3d(channels, 2 * channels, (3, 1, 1), padding=(1, 0, 0))
-            if temporal
-            else None
+            CausalConv3d(channels, 2 * channels, (3, 1, 1)) if temporal else None
         )
 
     @override
@@ -1036,7 +1004,7 @@ class _Up(nn.Module):
                 [x[:, :, :1], doubled.reshape(b, c, 2 * (t - 1), h, w)],
                 dim=2,
             )
-        return _per_frame(self.resample, x)
+        return per_frame(self.resample, x)
 
 
 class _Stage(nn.Module):
@@ -1088,15 +1056,8 @@ def _head(channels: int, channels_out: int) -> nn.Sequential:
     return nn.Sequential(
         _RMSNorm(channels, spatial_axes=3),
         nn.SiLU(),
-        _CausalConv3d(channels, channels_out),
+        CausalConv3d(channels, channels_out),
     )
-
-
-def _per_frame(module: nn.Module, x: Tensor) -> Tensor:
-    """Apply a 2D ``module`` to every frame of ``[N, C, T, H, W]``."""
-    b, _, t = x.shape[:3]
-    frames = cast(Tensor, module(x.transpose(1, 2).flatten(0, 1)))
-    return frames.unflatten(0, (b, t)).transpose(1, 2)
 
 
 _POINTWISE: Final = map_cost(primal=1, adjoint=0, adjoint_inputs=0, adjoint_outputs=0)

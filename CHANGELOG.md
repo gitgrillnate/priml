@@ -31,6 +31,14 @@ All notable priml changes are documented here. This project follows
   Wan 2.2's stage shortcuts are injected (`average_shortcut`,
   `duplicate_shortcut`). Its latents normalize with the new
   `InverseStdLatents`.
+- `priml.model.ae.mochi`: `MochiVAE`, Mochi 1's asymmetric causal video VAE,
+  with `mochi()` pinned to genmo's float32 halves, each its own file, and
+  `mochi_comfy()` to Comfy's float16 repackaging. Clips are `1 + 6k`
+  frames; the encoder reads RGB with its Fourier features and attends
+  causally along time. `testdata/mochi_reference.pt` replays the reference's
+  own outputs bit for bit. Its latents normalize with the new `StdLatents`.
+- `priml.model.ae.video`: `CausalConv3d` and `per_frame`, shared by the Wan
+  and Mochi ports.
 - `priml.model.ae.latent_norm`: `ShiftScaleLatents` (FLUX.1's
   `(z - shift) * scale`) and `BatchNormLatents` (FLUX.2's frozen batch norm,
   read from the checkpoint).

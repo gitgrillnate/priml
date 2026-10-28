@@ -234,16 +234,12 @@ class InverseStdLatents:
         """Each channel's standard deviation; its reciprocal scales."""
 
     def __init__(self, config: Config) -> None:
-        if not config.mean or len(config.mean) != len(config.std):
-            raise ValueError(
-                "InverseStdLatents needs one mean and one std per channel; got "
-                f"{len(config.mean)} and {len(config.std)}.",
-            )
-        std = torch.tensor(config.std, dtype=torch.float32)
-        if not torch.all(torch.isfinite(std) & (std != 0)):
-            raise ValueError("InverseStdLatents needs finite nonzero std.")
-        self.mean = torch.tensor(config.mean, dtype=torch.float32).view(-1, 1, 1, 1)
-        self.inv_std = (1.0 / std).view(-1, 1, 1, 1)
+        self.mean, std = _video_channel_stats(
+            "InverseStdLatents",
+            config.mean,
+            config.std,
+        )
+        self.inv_std = 1.0 / std
         self._on_device: dict[torch.device, tuple[Tensor, Tensor]] = {}
 
     def normalize(self, latent: Tensor, /) -> Tensor:
@@ -278,6 +274,87 @@ class InverseStdLatents:
         if device not in self._on_device:
             self._on_device[device] = self.mean.to(device), self.inv_std.to(device)
         return self._on_device[device]
+
+
+class StdLatents:
+    """Standardize video latents per channel: ``(z - mean) / std``.
+
+    Mochi's convention, back by ``z * std + mean``. Latents are
+    ``[..., C, T, H, W]``.
+
+    References:
+      https://github.com/genmoai/mochi/blob/15c9bad662df1fa3e7b53136423695b286484c08/src/genmo/mochi_preview/vae/vae_stats.py
+        License: ``LICENSES/mochi``.
+
+    """
+
+    class Config(Fig["StdLatents"]):
+        """The published statistics, one per latent channel."""
+
+        mean: list[float] = field(default_factory=list)
+        """Subtracted from each channel."""
+
+        std: list[float] = field(default_factory=list)
+        """Each channel's standard deviation, divided out."""
+
+    def __init__(self, config: Config) -> None:
+        self.mean, self.std = _video_channel_stats(
+            "StdLatents",
+            config.mean,
+            config.std,
+        )
+        self._on_device: dict[torch.device, tuple[Tensor, Tensor]] = {}
+
+    def normalize(self, latent: Tensor, /) -> Tensor:
+        """Return ``(latent - mean) / std``.
+
+        Args:
+          latent: ``[..., C, T, H, W]`` raw latent.
+
+        Returns:
+          normalized: Standardized latent.
+
+        """
+        mean, std = self._statistics(latent.device)
+        return (latent - mean) / std
+
+    def denormalize(self, latent: Tensor, /) -> Tensor:
+        """Return ``latent * std + mean``.
+
+        Args:
+          latent: ``[..., C, T, H, W]`` standardized latent.
+
+        Returns:
+          raw: Raw latent.
+
+        """
+        mean, std = self._statistics(latent.device)
+        return latent * std + mean
+
+    def _statistics(self, device: torch.device) -> tuple[Tensor, Tensor]:
+        """Return ``mean`` and ``std`` on ``device``, copying them there once."""
+        # As in ``ElementwiseLatentStats``: a copy per call would block every batch.
+        if device not in self._on_device:
+            self._on_device[device] = self.mean.to(device), self.std.to(device)
+        return self._on_device[device]
+
+
+def _video_channel_stats(
+    name: str,
+    mean: list[float],
+    std: list[float],
+) -> tuple[Tensor, Tensor]:
+    """Return per-channel ``mean`` and ``std`` as ``[C, 1, 1, 1]`` float32, validated."""
+    if not mean or len(mean) != len(std):
+        raise ValueError(
+            f"{name} needs one mean and one std per channel; got {len(mean)} and "
+            f"{len(std)}.",
+        )
+    deviation = torch.tensor(std, dtype=torch.float32)
+    if not torch.all(torch.isfinite(deviation) & (deviation != 0)):
+        raise ValueError(f"{name} needs finite nonzero std.")
+    shape = (-1, 1, 1, 1)
+    return torch.tensor(mean, dtype=torch.float32).view(shape), deviation.view(shape)
 
 
 class ElementwiseLatentStats:

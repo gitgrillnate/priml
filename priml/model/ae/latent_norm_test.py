@@ -18,6 +18,7 @@ from priml.model.ae.latent_norm import (
     LatentNormalizer,
     ScaleLatents,
     ShiftScaleLatents,
+    StdLatents,
 )
 
 
@@ -304,6 +305,22 @@ def test_inverse_std_refuses_degenerate_statistics(
 ) -> None:
     with pytest.raises(ValueError, match=match):
         _ = InverseStdLatents.Config(mean=mean, std=std).make()
+
+
+def test_std_divides_and_multiplies_back() -> None:
+    """Mochi's order: ``(z - mean) / std``, and ``z * std + mean``."""
+    mean, std = [0.5, -0.25, 1.5], [0.9263, 1.3720, 0.8813]
+    norm = StdLatents.Config(mean=mean, std=std).make()
+    assert isinstance(norm, LatentNormalizer)
+    latent = torch.randn(2, 4, 3, 5, 6, 7, generator=torch.Generator().manual_seed(3))
+    shift, scale = (torch.tensor(v).view(-1, 1, 1, 1) for v in (mean, std))
+    assert torch.equal(norm.normalize(latent), (latent - shift) / scale)
+    assert torch.equal(norm.denormalize(latent), latent * scale + shift)
+
+
+def test_std_refuses_mismatched_statistics() -> None:
+    with pytest.raises(ValueError, match="one mean and one std"):
+        _ = StdLatents.Config(mean=[0.0, 1.0], std=[1.0]).make()
 
 
 if __name__ == "__main__":
