@@ -227,10 +227,10 @@ class InverseStdLatents:
     class Config(Fig["InverseStdLatents"]):
         """The published statistics, one per latent channel."""
 
-        mean: list[float] = field(default_factory=list)
+        mean: list[float] = field(default_factory=list[float])
         """Subtracted from each channel."""
 
-        std: list[float] = field(default_factory=list)
+        std: list[float] = field(default_factory=list[float])
         """Each channel's standard deviation; its reciprocal scales."""
 
     def __init__(self, config: Config) -> None:
@@ -291,10 +291,10 @@ class StdLatents:
     class Config(Fig["StdLatents"]):
         """The published statistics, one per latent channel."""
 
-        mean: list[float] = field(default_factory=list)
+        mean: list[float] = field(default_factory=list[float])
         """Subtracted from each channel."""
 
-        std: list[float] = field(default_factory=list)
+        std: list[float] = field(default_factory=list[float])
         """Each channel's standard deviation, divided out."""
 
     def __init__(self, config: Config) -> None:

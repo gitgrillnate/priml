@@ -23,7 +23,7 @@ import torch
 from priml.model.ae.checkpoint import HubFile, LocalFile
 from priml.model.ae.distribution import DiagonalGaussian
 from priml.model.ae.latent_norm import InverseStdLatents
-from priml.model.ae.video import CausalVideoVAE
+from priml.model.ae.video import CausalConv3d, CausalVideoVAE
 from priml.model.ae.wan import (
     Decoder,
     Encoder,
@@ -35,7 +35,7 @@ from priml.model.ae.wan import (
     wan22,
     wan22_comfy,
 )
-from priml.testing.bfb import host_agnostic_numerics
+from priml.testing.bfb import assert_bfb_against_golden, host_agnostic_numerics
 from priml.testing.cost import assert_cost_matches_torch
 from priml.testing.golden import assert_pprint_golden, mismatches, read_tensors
 
@@ -74,8 +74,8 @@ def tiny(version: str = "21") -> CausalVideoVAE.Config:
     encoder.channels_hidden = (2, 4, 4)
     decoder.channels_hidden = (4, 4, 2)
     decoder.channels_upsampled = (2, 2) if version == "21" else (4, 4)
-    encoder.temporal = (False, True)
-    decoder.temporal = (True, False)
+    encoder.temporal = (1, 2)
+    decoder.temporal = (2, 1)
     encoder.blocks_per_stage, decoder.blocks_per_stage = 1, 2
     encoder.channels_latent = decoder.channels_latent = 3
     encoder.checkpoint = decoder.checkpoint = None
@@ -91,17 +91,18 @@ def _clip(config: CausalVideoVAE.Config, *, frames: int = 5) -> Tensor:
 
 
 def _reference_layout(version: str) -> CausalVideoVAE.Config:
-    """Return the layout a reference golden was minted at."""
+    """Return the layout the reference goldens were minted at, on a 3-frame 4x8 clip."""
     config = tiny(version)
     assert isinstance(config.encoder, Encoder.Config)
     assert isinstance(config.decoder, Decoder.Config)
     encoder, decoder = config.encoder, config.decoder
     encoder.channels_hidden = decoder.channels_hidden = (2, 2)
-    encoder.temporal = decoder.temporal = (True,)
+    encoder.temporal = decoder.temporal = (2,)
     # Wan 2.1's decoder halves its width at each upsampling, 2 to 1 here.
     decoder.channels_upsampled = (1,) if version == "21" else (2,)
     if version == "22":
         encoder.blocks_per_stage, decoder.blocks_per_stage = 0, 1
+    config.num_frames, config.image_size = 3, (4, 8)
     return config
 
 
@@ -115,22 +116,25 @@ def _replay_reference(version: str, *, nudge: bool = False) -> list[str]:
         for key, value in reference.items()
         if key.startswith("state.")
     }
-    model = _reference_layout(version).make()
-    assert model.encoder is not None
-    assert model.decoder is not None
+    config = _reference_layout(version)
+    model = config.make()
+    assert isinstance(model.encoder, Encoder)
+    assert isinstance(model.decoder, Decoder)
     model.encoder.load_state_dict(remap_wan_state_dict(state, half="encoder"))
     model.decoder.load_state_dict(remap_wan_state_dict(state, half="decoder"))
     if nudge:
-        bias = model.decoder.head[2].bias
-        assert isinstance(bias, Tensor)
+        conv_out = model.decoder.head[2]
+        assert isinstance(conv_out, CausalConv3d)
+        bias = conv_out.bias
+        assert bias is not None
         bias[0] = torch.nextafter(bias[0], torch.tensor(torch.inf))
     # Batch, frames, and sides tie at 2 and 3: the references' sizes at the golden
     # ceiling, and their own bits catch any transposed axis.
     image = reference["image"]
     with host_agnostic_numerics():
-        moments = model.encoder(image.float() / 127.5 - 1)
+        moments = model.encoder.forward(image.float() / 127.5 - 1)
         mean = model.encode(image).mode()
-        decoded = model.decoder(mean)
+        decoded = model.decoder.forward(mean)
     expected = {
         "moments": reference["moments"],
         "mean": reference["moments"].chunk(2, dim=1)[0],
@@ -257,21 +261,53 @@ def test_both_halves_load_one_release_file(tmp_path: Path) -> None:
     assert torch.equal(loaded.decode(latent), source.decode(latent))
 
 
-def test_rejects_resampling_flags_that_miss_a_stage() -> None:
-    encoder_short, decoder_short = tiny(), tiny()
-    assert isinstance(encoder_short.encoder, Encoder.Config)
-    assert isinstance(decoder_short.decoder, Decoder.Config)
-    encoder_short.encoder.temporal = (True,)
-    decoder_short.decoder.channels_upsampled = (2,)
-    with pytest.raises(ValueError, match="one flag per downsampling stage"):
-        _ = encoder_short.make()
-    with pytest.raises(ValueError, match="one entry per upsampling stage"):
-        _ = decoder_short.make()
+@pytest.mark.parametrize(
+    ("half", "message"),
+    [
+        (
+            Encoder.Config(channels_hidden=(2, 4, 4), temporal=(2,)),
+            "one factor, 1 or 2, per resampling stage",
+        ),
+        (
+            Encoder.Config(channels_hidden=(2, 4, 4), temporal=(1, 3)),
+            "one factor, 1 or 2, per resampling stage",
+        ),
+        (
+            Decoder.Config(channels_hidden=(4, 4, 2), temporal=(2, 1, 1)),
+            "one factor, 1 or 2, per resampling stage",
+        ),
+        (
+            Decoder.Config(channels_hidden=(4, 4, 2), temporal=(2, 1)),
+            "one width per upsampling stage",
+        ),
+    ],
+    ids=["encoder_short", "encoder_thirds", "decoder_long", "decoder_widths"],
+)
+def test_halves_refuse_resampling_that_misses_a_stage_or_is_not_wans(
+    half: Encoder.Config | Decoder.Config,
+    message: str,
+) -> None:
+    half.checkpoint = None
+    with pytest.raises(ValueError, match=message):
+        _ = half.make()
 
 
 def _round_trip(module: nn.Module, clip: Tensor) -> Tensor:
     assert isinstance(module, CausalVideoVAE)
     return module.decode(module.encode(clip).sample())
+
+
+@pytest.mark.parametrize("version", ["21", "22"])
+def test_round_trip_bfb(version: str) -> None:
+    """The port's own round trip, ``sample()`` included, as ``kl.pt`` freezes AutoencoderKL's."""
+    config = _reference_layout(version)
+    assert_bfb_against_golden(
+        golden_dir=_TESTDATA,
+        golden_name=f"wan{version}",
+        build_module=config.make,
+        build_input=lambda: _clip(config, frames=3),
+        run=_round_trip,
+    )
 
 
 @pytest.mark.parametrize("version", ["21", "22"])

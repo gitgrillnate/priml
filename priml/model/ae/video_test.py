@@ -7,7 +7,8 @@ import torch
 
 from priml.model.ae import wan
 from priml.model.ae.custom_types import Autoencoder
-from priml.model.ae.video import CausalVideoVAE
+from priml.model.ae.video import CausalConv3d, CausalVideoVAE
+from priml.testing.cost import assert_cost_matches_torch
 
 
 def tiny() -> CausalVideoVAE.Config:
@@ -15,7 +16,7 @@ def tiny() -> CausalVideoVAE.Config:
     return CausalVideoVAE.Config(
         encoder=wan.Encoder.Config(
             channels_hidden=(2, 4, 4),
-            temporal=(False, True),
+            temporal=(1, 2),
             blocks_per_stage=1,
             channels_latent=3,
             checkpoint=None,
@@ -23,7 +24,7 @@ def tiny() -> CausalVideoVAE.Config:
         decoder=wan.Decoder.Config(
             channels_hidden=(4, 4, 2),
             channels_upsampled=(2, 2),
-            temporal=(True, False),
+            temporal=(2, 1),
             blocks_per_stage=1,
             channels_latent=3,
             checkpoint=None,
@@ -99,8 +100,24 @@ def test_rejects_halves_that_disagree_on_the_latent() -> None:
 def test_rejects_halves_that_disagree_on_the_factors() -> None:
     config = tiny()
     assert isinstance(config.decoder, wan.Decoder.Config)
-    config.decoder.temporal = (True, True)
+    config.decoder.temporal = (2, 2)
     with pytest.raises(ValueError, match="factors"):
+        _ = config.make()
+
+
+@pytest.mark.parametrize(
+    ("num_frames", "image_size"),
+    [(6, (8, 12)), (5, (8, 10))],
+    ids=["frames", "sides"],
+)
+def test_rejects_a_stated_clip_the_model_cannot_encode(
+    num_frames: int,
+    image_size: tuple[int, int],
+) -> None:
+    """``latent_shape`` and ``cost`` would otherwise round a clip ``encode`` refuses."""
+    config = tiny()
+    config.num_frames, config.image_size = num_frames, image_size
+    with pytest.raises(ValueError, match="must be 1 \\+ 2k and image_size"):
         _ = config.make()
 
 
@@ -118,6 +135,37 @@ def test_cost_needs_both_halves() -> None:
     config.decoder = None
     with pytest.raises(ValueError, match="prices both halves"):
         _ = config.cost(batch_size=1, dtype=None)
+
+
+@pytest.mark.parametrize("padding_mode", ["constant", "replicate"])
+def test_causal_conv3d_keeps_the_grid_and_sees_no_later_frame(
+    padding_mode: str,
+) -> None:
+    conv = CausalConv3d.Config(2, 3, padding_mode=padding_mode).make()
+    x = torch.randn(2, 2, 5, 4, 6)
+    later = x.clone()
+    later[:, :, 3:] = torch.randn(2, 2, 2, 4, 6)
+    with torch.no_grad():
+        y, y_later = conv(x), conv(later)
+    assert y.shape == (2, 3, 5, 4, 6)
+    assert torch.equal(y[:, :, :3], y_later[:, :, :3])
+    assert not torch.equal(y[:, :, 3:], y_later[:, :, 3:])
+
+
+def test_causal_conv3d_refuses_conv3d_padding_on_top_of_its_own() -> None:
+    with pytest.raises(ValueError, match="padding must be 0"):
+        _ = CausalConv3d.Config(2, 3, padding=1).make()
+
+
+def test_causal_conv3d_cost_matches_torch() -> None:
+    """A strided, unpadded time convolution, Wan's downsampler's."""
+    _ = assert_cost_matches_torch(
+        CausalConv3d.Config(2, 3, kernel_size=(3, 1, 1), stride=(2, 1, 1), past=0),
+        build_input=lambda: torch.randn(2, 2, 5, 4, 6, requires_grad=True),
+        input_grid=(5, 4, 6),
+        batch_size=2,
+        dtype=None,
+    )
 
 
 if __name__ == "__main__":

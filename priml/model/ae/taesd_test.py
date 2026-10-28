@@ -25,8 +25,16 @@ from priml.cost import cost
 from priml.model.ae.checkpoint import HubFile, LocalFile
 from priml.model.ae.distribution import PointMass
 from priml.model.ae.latent_norm import ScaleLatents
-from priml.model.ae.taesd import TAESD, remap_taesd_state_dict, taesd, taesdxl
-from priml.testing.bfb import host_agnostic_numerics
+from priml.model.ae.taesd import (
+    TAESD,
+    Decoder,
+    Encoder,
+    remap_taesd_state_dict,
+    taesd,
+    taesdxl,
+)
+from priml.model.conv import Conv2d
+from priml.testing.bfb import assert_bfb_against_golden, host_agnostic_numerics
 from priml.testing.cost import assert_cost_matches_torch
 from priml.testing.golden import assert_pprint_golden, mismatches, read_tensors
 
@@ -39,7 +47,7 @@ _REFERENCE_COMMIT: Final = "fdbae2df989db95761f482efb8977e1182fb68d2"
 
 
 def tiny() -> TAESD.Config:
-    """Return the published layout at golden size: width 2, 16x24 images."""
+    """Return the published layout at golden size: width 2, stated at 16x16 images."""
     config = taesd()
     assert config.encoder is not None
     assert config.decoder is not None
@@ -78,8 +86,8 @@ def test_matches_the_reference_implementation() -> None:
     commit = reference.pop("source_commit").numpy().tobytes().decode()
     assert commit == _REFERENCE_COMMIT
     model = tiny().make()
-    assert model.encoder is not None
-    assert model.decoder is not None
+    assert isinstance(model.encoder, Encoder)
+    assert isinstance(model.decoder, Decoder)
     for half, module in (("encoder", model.encoder), ("decoder", model.decoder)):
         state = {
             key.removeprefix(f"state.{half}."): value
@@ -92,7 +100,7 @@ def test_matches_the_reference_implementation() -> None:
     image = reference["image"]
     with host_agnostic_numerics():
         latent = model.encode(image).mode()
-        decoded = model.decoder(reference["latent"])
+        decoded = model.decoder.forward(reference["latent"])
         clamped = model.decode(reference["latent"])
     expected = {
         "latent": reference["latent"],
@@ -107,18 +115,20 @@ def test_matches_the_reference_implementation() -> None:
 def test_the_reference_replay_sees_one_ulp() -> None:
     reference = read_tensors(_TESTDATA / "taesd_reference.pt")
     model = tiny().make()
-    assert model.decoder is not None
+    assert isinstance(model.decoder, Decoder)
     state = {
         key.removeprefix("state.decoder."): value
         for key, value in reference.items()
         if key.startswith("state.decoder.")
     }
     model.decoder.load_state_dict(remap_taesd_state_dict(state, half="decoder"))
-    bias = model.decoder.layers[-1].bias
-    assert isinstance(bias, Tensor)
+    conv_out = model.decoder.layers[-1]
+    assert isinstance(conv_out, Conv2d)
+    bias = conv_out.bias
+    assert bias is not None
     bias[0] = torch.nextafter(bias[0], torch.tensor(torch.inf))
     with host_agnostic_numerics():
-        decoded = model.decoder(reference["latent"])
+        decoded = model.decoder.forward(reference["latent"])
     report = mismatches({"decoded": reference["decoded"]}, actual={"decoded": decoded})
     assert [line.split(":")[0] for line in report] == ["decoded"]
 
@@ -265,6 +275,17 @@ def test_cost_needs_both_halves() -> None:
 def _round_trip(module: nn.Module, image: Tensor) -> Tensor:
     assert isinstance(module, TAESD)
     return module.decode(module.encode(image).mode())
+
+
+def test_round_trip_bfb() -> None:
+    """The port's own round trip, as ``kl.pt`` freezes AutoencoderKL's."""
+    assert_bfb_against_golden(
+        golden_dir=_TESTDATA,
+        golden_name="taesd",
+        build_module=tiny().make,
+        build_input=_image,
+        run=_round_trip,
+    )
 
 
 def test_cost_matches_torch_for_a_forward_round_trip() -> None:

@@ -4,30 +4,35 @@ A family -- ``wan``, ``mochi`` -- supplies an encoder and a decoder;
 :class:`CausalVideoVAE` maps uint8 clips to the posterior and latents back to
 RGB around them. Every convolution is causal in time, so a clip is ``1 + k``
 times the time factor in frames, and its first frame encodes as the image it is.
+
+Apache-2.0 license and attribution: ``LICENSES/Wan2.1``, ``LICENSES/Wan2.2``,
+``LICENSES/mochi``.
+
+References:
+  https://github.com/Wan-Video/Wan2.1/blob/9737cba9c1c3c4d04b33fcad41c111989865d315/wan/modules/vae.py
+  https://github.com/genmoai/mochi/blob/15c9bad662df1fa3e7b53136423695b286484c08/src/genmo/mochi_preview/vae/models.py
+
 """
 
 from __future__ import annotations
 
-from dataclasses import field
-from typing import TYPE_CHECKING, Final, Protocol, Self, cast, override
+from dataclasses import KW_ONLY, field
+from typing import Protocol, Self, cast, override
 
 import math
 
-from configgle import Fig, Makeable
+from configgle import Fig, Makeable, Makes
 from torch import Tensor, nn
 from torch.nn import functional
 
 import torch
 
-from priml.cost import Cost, cost, map_cost, traffic
+from priml.cost import Cost, cost, traffic
 from priml.model.ae.distribution import DiagonalGaussian
+from priml.model.ae.frozen_cost import kl_round_trip_cost
 from priml.model.ae.latent_norm import LatentNormalizer, ScaleLatents
-from priml.model.conv import Conv3d, conv_cost
+from priml.model.conv import Conv3d
 from priml.model.custom_types import ChannelsIn, ChannelsOut
-
-
-if TYPE_CHECKING:
-    from priml.math.custom_types import TensorFn
 
 
 class LatentFactors(Protocol):
@@ -120,7 +125,6 @@ class CausalVideoVAE(nn.Module):
             pixels_in = batch_size * self.encoder.channels_in * math.prod(clip)
             pixels_out = batch_size * self.decoder.channels_out * math.prod(clip)
             latents = batch_size * channels * frames * height * width
-            f32 = torch.float32
             full = (
                 cost(
                     self.encoder,
@@ -140,24 +144,12 @@ class CausalVideoVAE(nn.Module):
                         "dtype": dtype,
                     },
                 )
-                # ``clip.float() / 127.5 - 1`` in.
-                + traffic(
-                    "primal",
-                    kernel="elementwise",
-                    elements=pixels_in,
-                    dtype=torch.uint8,
+                + kl_round_trip_cost(
+                    pixels_in=pixels_in,
+                    latents=latents,
+                    pixels_out=pixels_out,
+                    dtype=dtype,
                 )
-                + traffic("primal", kernel="elementwise", elements=pixels_in, dtype=f32)
-                + _POINTWISE(channels=pixels_in, dtype=f32).tile(2)
-                # Clamp the log-variance; ``exp(0.5 * logvar)``.
-                + _CLAMP(channels=latents, dtype=dtype)
-                + _POINTWISE(channels=latents, dtype=dtype).tile(2)
-                # ``mean + std * noise``: the noise written, a product, a sum.
-                + traffic("primal", kernel="elementwise", elements=latents, dtype=dtype)
-                + _SUM(channels=latents, dtype=dtype).tile(2)
-                # ``(x + 1) / 2`` and a two-sided clamp out.
-                + _POINTWISE(channels=pixels_out, dtype=dtype).tile(2)
-                + _CLAMP(channels=pixels_out, dtype=dtype)
             )
             return Cost(
                 cells=full.only("primal").cells,
@@ -178,6 +170,16 @@ class CausalVideoVAE(nn.Module):
                 "the decoder would not return the clip.",
             )
         self.time, self.space = config.factors()
+        height, width = config.image_size
+        if (
+            (config.num_frames - 1) % self.time
+            or height % self.space
+            or width % self.space
+        ):
+            raise ValueError(
+                f"num_frames {config.num_frames} must be 1 + {self.time}k and "
+                f"image_size {config.image_size} divisible by {self.space}.",
+            )
         self.encoder = None if config.encoder is None else config.encoder.make()
         self.decoder = None if config.decoder is None else config.decoder.make()
         self.eval()
@@ -218,7 +220,7 @@ class CausalVideoVAE(nn.Module):
             )
         # ``x / 127.5 - 1``, the references' own map, as ``kl`` maps uint8 pixels.
         pixels = x.reshape(-1, *x.shape[-4:]).float() / 127.5 - 1
-        moments = self.encoder(pixels)
+        moments = cast(Tensor, self.encoder(pixels))
         moments = moments.reshape(*x.shape[:-4], *moments.shape[1:])
         mean, logvar = moments.chunk(2, dim=-4)
         return DiagonalGaussian(mean, logvar)
@@ -244,49 +246,87 @@ class CausalVideoVAE(nn.Module):
 
 
 class CausalConv3d(Conv3d):
-    """A biased ``Conv3d`` padded in time on its past side only.
+    """A ``Conv3d`` padded in time on its past side only.
 
     Time is padded by ``past`` frames before the first; each side by
     ``(kernel - 1) // 2``, both ways, so a stride-1 convolution keeps the grid.
     """
 
-    def __init__(
-        self,
-        channels_in: int,
-        channels_out: int,
-        kernel_size: tuple[int, int, int] = (3, 3, 3),
-        *,
-        stride: tuple[int, int, int] = (1, 1, 1),
-        past: int = 2,
-        padding_mode: str = "constant",
-    ) -> None:
-        """Build the convolution.
+    class Config(Makes["CausalConv3d"], Conv3d.Config, kw_only=False):
+        """``Conv3d`` settings, its own padding replaced by the causal pad."""
 
-        Args:
-          channels_in: Input channels.
-          channels_out: Output channels.
-          kernel_size: ``(time, height, width)`` extents.
-          stride: ``(time, height, width)`` steps.
-          past: Frames padded before the first.
-          padding_mode: ``functional.pad``'s mode: ``"constant"`` pads zeros,
-            ``"replicate"`` the edge.
+        _: KW_ONLY
 
-        """
-        super().__init__(
-            Conv3d.Config(
-                channels_in,
-                channels_out,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=0,
-                bias=True,
-            ),
-        )
-        height, width = ((side - 1) // 2 for side in kernel_size[1:])
-        self.causal = (width, width, height, height, past, 0)
+        kernel_size: int | tuple[int, int, int] = (3, 3, 3)
+        """``(time, height, width)`` extents."""
+
+        padding: int | tuple[int, int, int] | str = 0
+        """``Conv3d``'s own; the causal pad replaces it, so only 0 builds."""
+
+        bias: bool = True
+        """Include bias in the convolution."""
+
+        past: int = 2
+        """Frames padded before the first."""
+
+        padding_mode: str = "constant"
+        """``functional.pad``'s mode: ``"constant"`` pads zeros, ``"replicate"`` the edge."""
+
+        def causal_padding(self) -> tuple[int, int, int, int, int, int]:
+            """Return the pad ``functional.pad`` takes: width, height, then time."""
+            kernel = self.kernel_size
+            _, height, width = (kernel,) * 3 if isinstance(kernel, int) else kernel
+            height, width = (height - 1) // 2, (width - 1) // 2
+            return (width, width, height, height, self.past, 0)
+
+        @override
+        def cost(
+            self,
+            *,
+            input_grid: int | tuple[int, ...],
+            batch_size: int,
+            dtype: torch.dtype | None,
+            **kwargs: object,
+        ) -> Cost:
+            """Cost the pad's copy, then the convolution on the padded grid.
+
+            Args:
+              input_grid: ``(frames, height, width)`` in; a scalar broadcasts.
+              batch_size: Clips in this invocation.
+              dtype: Activation dtype; ``None`` is torch's default.
+              **kwargs: The open bus, forwarded to ``Conv3d``'s cost.
+
+            Returns:
+              cost: Forward and adjoint.
+
+            """
+            t, h, w = (input_grid,) * 3 if isinstance(input_grid, int) else input_grid
+            width, _, height, _, past, _ = self.causal_padding()
+            padded = (t + past, h + 2 * height, w + 2 * width)
+            moved = batch_size * self.channels_in * (t * h * w + math.prod(padded))
+            return traffic(
+                "primal",
+                kernel="elementwise",
+                elements=moved,
+                dtype=dtype,
+            ) + super().cost(
+                input_grid=padded,
+                batch_size=batch_size,
+                dtype=dtype,
+                **kwargs,
+            )
+
+    def __init__(self, config: Config) -> None:
+        if config.padding != 0:
+            raise ValueError(
+                f"CausalConv3d pads causally itself; padding must be 0, got "
+                f"{config.padding!r}.",
+            )
+        super().__init__(config)
+        self.causal = config.causal_padding()
         # Not ``padding_mode``: that is ``Conv3d``'s own, and anything but "zeros"
         # makes it pad again.
-        self.pad_mode = padding_mode
+        self.pad_mode = config.padding_mode
 
     @override
     def forward(self, input: Tensor, **kwargs: object) -> Tensor:
@@ -294,86 +334,3 @@ class CausalConv3d(Conv3d):
         return super().forward(
             functional.pad(input, self.causal, mode=self.pad_mode),
         )
-
-
-def causal_conv3d_cost(
-    channels_in: int,
-    channels_out: int,
-    kernel_size: tuple[int, int, int] = (3, 3, 3),
-    *,
-    stride: tuple[int, int, int] = (1, 1, 1),
-    past: int = 2,
-    input_grid: tuple[int, int, int],
-    batch_size: int,
-    dtype: torch.dtype | None,
-) -> Cost:
-    """Cost :class:`CausalConv3d`: the pad's copy, then the unpadded convolution.
-
-    Args:
-      channels_in: Input channels.
-      channels_out: Output channels.
-      kernel_size: ``(time, height, width)`` extents.
-      stride: ``(time, height, width)`` steps.
-      past: Frames padded before the first.
-      input_grid: ``(frames, height, width)`` in.
-      batch_size: Clips in this invocation.
-      dtype: Activation dtype; ``None`` is torch's default.
-
-    Returns:
-      cost: Forward and adjoint.
-
-    """
-    t, h, w = input_grid
-    height, width = ((side - 1) // 2 for side in kernel_size[1:])
-    padded = (t + past, h + 2 * height, w + 2 * width)
-    moved = batch_size * channels_in * (math.prod(input_grid) + math.prod(padded))
-    return traffic(
-        "primal",
-        kernel="elementwise",
-        elements=moved,
-        dtype=dtype,
-    ) + conv_cost(
-        channels_in=channels_in,
-        channels_out=channels_out,
-        kernel_size=kernel_size,
-        ndim=3,
-        groups=1,
-        bias=True,
-        input_grid=padded,
-        batch_size=batch_size,
-        stride=stride,
-        padding=0,
-        dtype=dtype,
-    )
-
-
-def per_frame(fn: TensorFn, x: Tensor) -> Tensor:
-    """Apply a 2D map to every frame of ``[N, C, T, H, W]``.
-
-    Args:
-      fn: Maps ``[N T, C, H, W]`` to ``[N T, C', H', W']``.
-      x: Video.
-
-    Returns:
-      y: ``[N, C', T, H', W']``.
-
-    """
-    b, _, t = x.shape[:3]
-    frames = fn(x.transpose(1, 2).flatten(0, 1))
-    return frames.unflatten(0, (b, t)).transpose(1, 2)
-
-
-_POINTWISE: Final = map_cost(primal=1, adjoint=0, adjoint_inputs=0, adjoint_outputs=0)
-"""A forward elementwise op with one scalar operand."""
-
-_SUM: Final = map_cost(
-    primal=1,
-    adjoint=0,
-    inputs=2,
-    adjoint_inputs=0,
-    adjoint_outputs=0,
-)
-"""A forward sum or product of two tensors."""
-
-_CLAMP: Final = map_cost(primal=2, adjoint=0, adjoint_inputs=0, adjoint_outputs=0)
-"""A forward two-sided clamp."""

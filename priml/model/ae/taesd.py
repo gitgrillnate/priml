@@ -26,10 +26,10 @@ from torch import Tensor, nn
 import torch
 
 from priml.cost import Cost, cost, map_cost, traffic
-from priml.math.numeric import softcap
 from priml.model.ae.checkpoint import CheckpointFile, HubFile, read_state
 from priml.model.ae.custom_types import StateDictRemap
 from priml.model.ae.distribution import PointMass
+from priml.model.ae.frozen_cost import CLAMP, POINTWISE, SUM
 from priml.model.ae.latent_norm import LatentNormalizer, ScaleLatents
 from priml.model.conv import Conv2d, conv_cost
 from priml.model.swiglu import relu
@@ -51,20 +51,8 @@ _STAGES: Final = 3
 _BLOCKS_PER_STAGE: Final = 3
 """Residual blocks in each stage the reference repeats."""
 
-_CLAMP: Final = 3.0
+_LATENT_BOUND: Final = 3.0
 """The decoder first squashes latents into ``(-3, 3)``: ``3 tanh(z / 3)``."""
-
-_SUM: Final = map_cost(
-    primal=1,
-    adjoint=0,
-    inputs=2,
-    adjoint_inputs=0,
-    adjoint_outputs=0,
-)
-"""A forward sum of two tensors, per element."""
-
-_DIVIDE: Final = map_cost(primal=1, adjoint=0, adjoint_inputs=0, adjoint_outputs=0)
-"""A forward divide by a scalar, per element."""
 
 _SQUASH: Final = map_cost(
     primal=3,
@@ -75,9 +63,6 @@ _SQUASH: Final = map_cost(
     adjoint_outputs=0,
 )
 """``tanh(z / 3) * 3``: a divide, a tanh, a multiply, per element."""
-
-_CLAMP_OUT: Final = map_cost(primal=2, adjoint=0, adjoint_inputs=0, adjoint_outputs=0)
-"""A two-sided clamp, per element."""
 
 
 def remap_taesd_state_dict(
@@ -379,8 +364,8 @@ class TAESD(nn.Module):
                     elements=pixels_in,
                     dtype=torch.float32,
                 )
-                + _DIVIDE(channels=pixels_in, dtype=torch.float32)
-                + _CLAMP_OUT(channels=pixels_out, dtype=dtype)
+                + POINTWISE(channels=pixels_in, dtype=torch.float32)
+                + CLAMP(channels=pixels_out, dtype=dtype)
             )
             return Cost(
                 cells=full.only("primal").cells,
@@ -515,9 +500,9 @@ class _Clamp(nn.Module):
 
     @override
     def forward(self, x: Tensor) -> Tensor:
-        # In float32 even for a narrower input, as ``softcap`` computes; the
+        # Not ``softcap``: it computes a narrower input in float32, where the
         # reference rounds at the input's width.
-        return softcap(x, _CLAMP)
+        return torch.tanh(x / _LATENT_BOUND) * _LATENT_BOUND
 
 
 class _Block(nn.Module):
@@ -585,5 +570,5 @@ class _Layers:
         return (
             self.conv(channels, channels, side=side).tile(3, copies=3)
             + self.relu(channels, side=side).tile(3)
-            + _SUM(channels=elements, dtype=self.dtype)
+            + SUM(channels=elements, dtype=self.dtype)
         )

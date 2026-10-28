@@ -9,7 +9,9 @@ features, 15 channels.
 Each half is published as its own float32 file, named as this module names
 it. Mochi's own draw, ``noise * exp(logvar * 0.5) + mean``, is
 :class:`~priml.model.ae.distribution.DiagonalGaussian`'s without the
-log-variance clamp. Build the published model from :func:`mochi`, or :func:`mochi_comfy` for
+log-variance clamp, which never binds on its moments.
+
+Build the published model from :func:`mochi`, or :func:`mochi_comfy` for
 Comfy's float16 repackaging of both halves in one file: each a
 :class:`~priml.model.ae.video.CausalVideoVAE` around this module's halves.
 
@@ -37,15 +39,12 @@ import torch
 
 from priml.cost import Cost, cost, map_cost, traffic
 from priml.math.pixel import unpatchify
+from priml.math.tensor import per_frame
 from priml.model.ae.checkpoint import CheckpointFile, HubFile, read_state
 from priml.model.ae.custom_types import StateDictRemap
+from priml.model.ae.frozen_cost import POINTWISE, SUM
 from priml.model.ae.latent_norm import StdLatents
-from priml.model.ae.video import (
-    CausalConv3d,
-    CausalVideoVAE,
-    causal_conv3d_cost,
-    per_frame,
-)
+from priml.model.ae.video import CausalConv3d, CausalVideoVAE
 from priml.model.attention.kernel import SdpaFused
 from priml.model.conv import Conv3d
 from priml.model.custom_types import AttentionKernel
@@ -211,12 +210,21 @@ class Encoder(nn.Module):
                 bias=True,
                 channels_last=False,
             )
-            total += layers.blocks(
-                widths[0],
-                self.blocks_per_stage[0],
-                grid=grid,
-                attention=self if self.attention[0] else None,
-            )
+
+            def group(index: int, width: int, grid: tuple[int, int, int]) -> Cost:
+                count = self.blocks_per_stage[index]
+                blocks = layers.blocks(width, count, grid=grid)
+                if not self.attention[index]:
+                    return blocks
+                return blocks + layers.attention(
+                    width,
+                    count,
+                    grid=grid,
+                    channels_head=self.channels_head,
+                    attn_kernel=self.attn_kernel,
+                )
+
+            total += group(0, widths[0], grid)
             for stage, (t, s) in enumerate(
                 zip(self.temporal, self.spatial, strict=True),
             ):
@@ -227,21 +235,11 @@ class Encoder(nn.Module):
                     s,
                     grid=grid,
                 )
-                total += down + layers.blocks(
-                    widths[stage + 1],
-                    self.blocks_per_stage[stage + 1],
-                    grid=grid,
-                    attention=self if self.attention[stage + 1] else None,
-                )
+                total += down + group(stage + 1, widths[stage + 1], grid)
             width = widths[-1]
             return (
                 total
-                + layers.blocks(
-                    width,
-                    self.blocks_per_stage[-1],
-                    grid=grid,
-                    attention=self if self.attention[-1] else None,
-                )
+                + group(-1, width, grid)
                 + layers.norm(width, grid=grid)
                 + cost(silu, channels=batch_size * width * math.prod(grid), dtype=dtype)
                 + layers.linear(
@@ -289,14 +287,14 @@ class Encoder(nn.Module):
         for stage, (t, s) in enumerate(
             zip(config.temporal, config.spatial, strict=True),
         ):
-            down = CausalConv3d(
+            down = CausalConv3d.Config(
                 widths[stage],
                 widths[stage + 1],
-                (t, s, s),
+                kernel_size=(t, s, s),
                 stride=(t, s, s),
                 past=t - 1,
                 padding_mode="replicate",
-            )
+            ).make()
             layers.append(_Downsample(down, *blocks(widths[stage + 1], stage + 1)))
         layers.extend(blocks(widths[-1], stages))
         # The release's names: ``layers``, ``output_norm``, ``output_proj``.
@@ -395,12 +393,7 @@ class Decoder(nn.Module):
                 input_grid=grid,
                 batch_size=batch_size,
                 dtype=dtype,
-            ) + layers.blocks(
-                widths[0],
-                self.blocks_per_stage[0],
-                grid=grid,
-                attention=None,
-            )
+            ) + layers.blocks(widths[0], self.blocks_per_stage[0], grid=grid)
             for stage, (t, s) in enumerate(
                 zip(self.temporal, self.spatial, strict=True),
             ):
@@ -416,12 +409,7 @@ class Decoder(nn.Module):
             width = widths[-1]
             return (
                 total
-                + layers.blocks(
-                    width,
-                    self.blocks_per_stage[-1],
-                    grid=grid,
-                    attention=None,
-                )
+                + layers.blocks(width, self.blocks_per_stage[-1], grid=grid)
                 + cost(silu, channels=batch_size * width * math.prod(grid), dtype=dtype)
                 + layers.linear(
                     width,
@@ -654,10 +642,10 @@ class _ResBlock(nn.Module):
         self.stack = nn.Sequential(
             _FrameGroupNorm(channels, num_groups=num_groups),
             nn.SiLU(),
-            CausalConv3d(channels, channels, padding_mode="replicate"),
+            CausalConv3d.Config(channels, channels, padding_mode="replicate").make(),
             _FrameGroupNorm(channels, num_groups=num_groups),
             nn.SiLU(),
-            CausalConv3d(channels, channels, padding_mode="replicate"),
+            CausalConv3d.Config(channels, channels, padding_mode="replicate").make(),
         )
         self.attn_block = nn.Identity() if attn_block is None else attn_block
 
@@ -701,18 +689,6 @@ class _Upsample(nn.Module):
         # The first frame is not repeated: only one of its copies stays.
         return x[:, :, self.patch[0] - 1 :]
 
-
-_POINTWISE: Final = map_cost(primal=1, adjoint=0, adjoint_inputs=0, adjoint_outputs=0)
-"""A forward elementwise op with one scalar operand."""
-
-_SUM: Final = map_cost(
-    primal=1,
-    adjoint=0,
-    inputs=2,
-    adjoint_inputs=0,
-    adjoint_outputs=0,
-)
-"""A forward sum or product of two tensors."""
 
 _SIN_COS: Final = map_cost(
     primal=4,
@@ -791,54 +767,58 @@ class _Layers:
 
     def causal(self, channels: int, *, grid: tuple[int, int, int]) -> Cost:
         """Cost a residual block's replicating ``CausalConv3d``."""
-        return causal_conv3d_cost(
-            channels,
-            channels,
+        return cost(
+            CausalConv3d.Config(channels, channels, padding_mode="replicate"),
             input_grid=grid,
             batch_size=self.batch_size,
             dtype=self.dtype,
         )
 
-    def blocks(
-        self,
-        channels: int,
-        count: int,
-        *,
-        grid: tuple[int, int, int],
-        attention: Encoder.Config | None,
-    ) -> Cost:
-        """Cost ``count`` ``_ResBlock`` on ``grid``, each attending as ``attention`` says."""
+    def blocks(self, channels: int, count: int, *, grid: tuple[int, int, int]) -> Cost:
+        """Cost ``count`` ``_ResBlock`` stacks on ``grid``, their attention apart."""
         elements = self.batch_size * channels * math.prod(grid)
         block = (
             self.norm(channels, grid=grid).tile(2, copies=2)
             + cost(silu, channels=elements, dtype=self.dtype).tile(2)
             + self.causal(channels, grid=grid).tile(2, copies=2)
-            + _SUM(channels=elements, dtype=self.dtype)
+            + SUM(channels=elements, dtype=self.dtype)
         )
-        if attention is not None:
-            t, h, w = grid
-            block += (
-                self.norm(channels, grid=grid)
-                # Into rows of time and back.
-                + traffic(
-                    "primal",
-                    kernel="elementwise",
-                    elements=4 * elements,
-                    dtype=self.dtype,
-                )
-                + self.rows(channels, 3 * channels, rows=math.prod(grid), bias=False)
-                + _POINTWISE(channels=2 * elements, dtype=self.dtype).tile(3)
-                + cost(
-                    attention.attn_kernel,
-                    seq_len=t,
-                    batch_size=self.batch_size * h * w,
-                    dtype=self.dtype,
-                    num_heads=channels // attention.channels_head,
-                    channels_head=attention.channels_head,
-                )
-                + self.rows(channels, channels, rows=math.prod(grid), bias=True)
-                + _SUM(channels=elements, dtype=self.dtype)
+        return block.tile(count, copies=count)
+
+    def attention(
+        self,
+        channels: int,
+        count: int,
+        *,
+        grid: tuple[int, int, int],
+        channels_head: int,
+        attn_kernel: Makeable[AttentionKernel],
+    ) -> Cost:
+        """Cost ``count`` ``_AttentionBlock`` on ``grid``: causal attention along time."""
+        t, h, w = grid
+        elements = self.batch_size * channels * math.prod(grid)
+        block = (
+            self.norm(channels, grid=grid)
+            # Into rows of time and back.
+            + traffic(
+                "primal",
+                kernel="elementwise",
+                elements=4 * elements,
+                dtype=self.dtype,
             )
+            + self.rows(channels, 3 * channels, rows=math.prod(grid), bias=False)
+            + POINTWISE(channels=2 * elements, dtype=self.dtype).tile(3)
+            + cost(
+                attn_kernel,
+                seq_len=t,
+                batch_size=self.batch_size * h * w,
+                dtype=self.dtype,
+                num_heads=channels // channels_head,
+                channels_head=channels_head,
+            )
+            + self.rows(channels, channels, rows=math.prod(grid), bias=True)
+            + SUM(channels=elements, dtype=self.dtype)
+        )
         return block.tile(count, copies=count)
 
     def down(
@@ -852,12 +832,15 @@ class _Layers:
     ) -> tuple[Cost, tuple[int, int, int]]:
         """Cost a downsampling convolution; return it with the grid it leaves."""
         t, h, w = grid
-        return causal_conv3d_cost(
-            channels_in,
-            channels_out,
-            (factor_t, factor_s, factor_s),
-            stride=(factor_t, factor_s, factor_s),
-            past=factor_t - 1,
+        return cost(
+            CausalConv3d.Config(
+                channels_in,
+                channels_out,
+                kernel_size=(factor_t, factor_s, factor_s),
+                stride=(factor_t, factor_s, factor_s),
+                past=factor_t - 1,
+                padding_mode="replicate",
+            ),
             input_grid=grid,
             batch_size=self.batch_size,
             dtype=self.dtype,
@@ -883,7 +866,7 @@ class _Layers:
         out = (factor_t * t - factor_t + 1, h * factor_s, w * factor_s)
         unfolded = self.batch_size * expanded * math.prod(grid)
         total = (
-            self.blocks(channels_in, count, grid=grid, attention=None)
+            self.blocks(channels_in, count, grid=grid)
             + self.linear(
                 channels_in,
                 expanded,

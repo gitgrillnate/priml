@@ -30,7 +30,7 @@ from priml.model.ae.mochi import (
     remap_mochi_state_dict,
 )
 from priml.model.ae.video import CausalVideoVAE
-from priml.testing.bfb import host_agnostic_numerics
+from priml.testing.bfb import assert_bfb_against_golden, host_agnostic_numerics
 from priml.testing.cost import assert_cost_matches_torch
 from priml.testing.golden import assert_pprint_golden, mismatches, read_tensors
 
@@ -74,29 +74,21 @@ def _clip(*, frames: int = 4) -> Tensor:
     )
 
 
-def _keys(listing: str, prefix: str = "") -> dict[str, tuple[int, ...]]:
-    lines = (_TESTDATA / listing).read_text().splitlines()
-    return {
-        prefix + name: tuple(int(n) for n in shape.split("x"))
-        for name, shape in (line.split() for line in lines)
-    }
-
-
 def _replay_reference(*, nudge: bool = False) -> list[str]:
     """Return how the port, loading the reference's tensors, misses its bits."""
     reference = read_tensors(_TESTDATA / "mochi_reference.pt")
     commit = reference.pop("source_commit").numpy().tobytes().decode()
     assert commit == _REFERENCE_COMMIT
     model = tiny().make()
+    assert isinstance(model.encoder, Encoder)
+    assert isinstance(model.decoder, Decoder)
     for half, module in (("encoder", model.encoder), ("decoder", model.decoder)):
-        assert module is not None
         state = {
             key.removeprefix(f"state.{half}."): value
             for key, value in reference.items()
             if key.startswith(f"state.{half}.")
         }
         module.load_state_dict(remap_mochi_state_dict(state, half=half))
-    assert model.decoder is not None
     if nudge:
         bias = model.decoder.output_proj.bias
         assert isinstance(bias, Tensor)
@@ -106,13 +98,10 @@ def _replay_reference(*, nudge: bool = False) -> list[str]:
     image = reference["image"]
     assert reference["decoded"].abs().max() < 1
     with host_agnostic_numerics():
-        moments = (
-            model.encoder.forward(image.float() / 127.5 - 1) if model.encoder else None
-        )
+        moments = model.encoder.forward(image.float() / 127.5 - 1)
         mean = model.encode(image).mode()
-        decoded = model.decoder(mean)
+        decoded = model.decoder.forward(mean)
         clamped = model.decode(mean)
-    assert moments is not None
     expected = {
         "moments": reference["moments"],
         "decoded": reference["decoded"],
@@ -132,6 +121,35 @@ def test_the_reference_replay_sees_one_ulp() -> None:
     assert [line.split(":")[0] for line in report] == ["clamped", "decoded"]
 
 
+def test_the_draw_is_mochis_inside_the_log_variance_clamp() -> None:
+    """Mochi draws ``noise * exp(logvar * 0.5) + mean``, unclamped; ours clamps.
+
+    The clamp, ``[-30, 20]``, never binds on the reference's own moments, and
+    there the two draws are the same bits.
+    """
+    moments = read_tensors(_TESTDATA / "mochi_reference.pt")["moments"]
+    mean, logvar = moments.chunk(2, dim=1)
+    assert logvar.min() > -30
+    assert logvar.max() < 20
+    noise = torch.randn(mean.shape, generator=torch.Generator().manual_seed(0))
+    mochis = noise * torch.exp(logvar * 0.5) + mean
+    ours = DiagonalGaussian(mean, logvar).sample(
+        generator=torch.Generator().manual_seed(0),
+    )
+    assert torch.equal(ours, mochis)
+
+
+def test_round_trip_bfb() -> None:
+    """The port's own round trip, ``sample()`` included, as ``kl.pt`` freezes AutoencoderKL's."""
+    assert_bfb_against_golden(
+        golden_dir=_TESTDATA,
+        golden_name="mochi",
+        build_module=tiny().make,
+        build_input=_clip,
+        run=_round_trip,
+    )
+
+
 @pytest.mark.parametrize("comfy", [False, True], ids=["released", "comfy"])
 def test_published_halves_load_exactly_the_published_tensors(comfy: bool) -> None:
     """Each released half's names and shapes are its state, strictly.
@@ -148,7 +166,12 @@ def test_published_halves_load_exactly_the_published_tensors(comfy: bool) -> Non
         model = config.make()
     for half, module in (("encoder", model.encoder), ("decoder", model.decoder)):
         assert module is not None
-        published = _keys(f"mochi_{half}_keys.txt", f"{half}." if comfy else "")
+        lines = (_TESTDATA / f"mochi_{half}_keys.txt").read_text().splitlines()
+        prefix = f"{half}." if comfy else ""
+        published = {
+            prefix + name: tuple(int(n) for n in shape.split("x"))
+            for name, shape in (line.split() for line in lines)
+        }
         with torch.device("meta"):
             state = {key: torch.empty(shape) for key, shape in published.items()}
         expected = {k: tuple(v.shape) for k, v in module.state_dict().items()}

@@ -41,17 +41,14 @@ from torch.nn import functional
 
 import torch
 
-from priml.cost import Cost, cost, elementwise_cost, map_cost, traffic
+from priml.cost import Cost, cost, elementwise_cost, traffic
 from priml.math.pixel import patchify, unpatchify
+from priml.math.tensor import per_frame
 from priml.model.ae.checkpoint import CheckpointFile, HubFile, read_state
 from priml.model.ae.custom_types import StateDictRemap
+from priml.model.ae.frozen_cost import SUM
 from priml.model.ae.latent_norm import InverseStdLatents
-from priml.model.ae.video import (
-    CausalConv3d,
-    CausalVideoVAE,
-    causal_conv3d_cost,
-    per_frame,
-)
+from priml.model.ae.video import CausalConv3d, CausalVideoVAE
 from priml.model.attention.kernel import SdpaFused
 from priml.model.conv import Conv2d, conv_cost
 from priml.model.custom_types import AttentionKernel
@@ -112,7 +109,9 @@ def remap_wan_state_dict(
       state: This half's ``state_dict``.
 
     """
-    quant, projection = {
+    # The checkpoint's name for the projection between the halves, then this
+    # module's, which ``kl``'s halves share.
+    released, projection = {
         "encoder": ("conv1.", "quant_conv."),
         "decoder": ("conv2.", "post_quant_conv."),
     }[half]
@@ -123,8 +122,8 @@ def remap_wan_state_dict(
     remapped: dict[str, Tensor] = {}
     flat: dict[int, dict[str, Tensor]] = {}
     for key, tensor in state.items():
-        if key.startswith(quant):
-            remapped[projection + key.removeprefix(quant)] = tensor
+        if key.startswith(released):
+            remapped[projection + key.removeprefix(released)] = tensor
         elif key.startswith(f"{half}."):
             name = key.removeprefix(f"{half}.")
             match = flat_block.match(name)
@@ -246,8 +245,8 @@ class Encoder(nn.Module):
         blocks_per_stage: int = 2
         """Residual blocks per stage."""
 
-        temporal: tuple[bool, ...] = (False, True, True)
-        """Whether each stage's downsampling also halves time; one per stage but the last."""
+        temporal: tuple[int, ...] = (1, 2, 2)
+        """Time each stage's downsampling divides by, 1 or 2; one per stage but the last."""
 
         channels_latent: int = 16
         """Latent channels; the encoder emits twice as many, mean then log-variance."""
@@ -270,7 +269,7 @@ class Encoder(nn.Module):
         def factors(self) -> tuple[int, int]:
             """Return the ``(time, space)`` downsampling from pixels to latent."""
             space = self.patch_size << (len(self.channels_hidden) - 1)
-            return 1 << sum(self.temporal), space
+            return math.prod(self.temporal), space
 
         def cost(
             self,
@@ -310,9 +309,12 @@ class Encoder(nn.Module):
                 for _ in range(self.blocks_per_stage):
                     total += layers.residual(width_in, width_out, grid=grid)
                     width_in = width_out
-                temporal = stage < len(self.temporal) and self.temporal[stage]
                 if stage != len(widths) - 1:
-                    down, grid = layers.down(width_out, grid=grid, temporal=temporal)
+                    down, grid = layers.down(
+                        width_out,
+                        grid=grid,
+                        temporal=self.temporal[stage] == 2,
+                    )
                     total += down
                 if self.shortcut is not None:
                     total += layers.shortcut(stage_in, grid=grid_in, grid_out=grid)
@@ -333,13 +335,9 @@ class Encoder(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
         p, widths = config.patch_size, config.channels_hidden
-        if len(config.temporal) != len(widths) - 1:
-            raise ValueError(
-                f"temporal needs one flag per downsampling stage, {len(widths) - 1}; "
-                f"got {len(config.temporal)}.",
-            )
+        _check_temporal(config.temporal, stages=len(widths) - 1)
         self.patch_size = p
-        self.conv1 = CausalConv3d(config.channels_in * p * p, widths[0])
+        self.conv1 = CausalConv3d.Config(config.channels_in * p * p, widths[0]).make()
         self.downsamples: nn.ModuleList[_Stage] = nn.ModuleList()
         width_in = widths[0]
         for stage, width_out in enumerate(widths):
@@ -348,15 +346,15 @@ class Encoder(nn.Module):
                 blocks.append(_Residual(width_in, width_out))
                 width_in = width_out
             down = stage != len(widths) - 1
-            temporal = down and config.temporal[stage]
+            factor_t = config.temporal[stage] if down else 1
             if down:
-                blocks.append(_Down(width_out, temporal=temporal))
+                blocks.append(_Down(width_out, temporal=factor_t == 2))
             self.downsamples.append(
                 _Stage(
                     nn.Sequential(*blocks),
                     attribute="downsamples",
                     channels_out=width_out,
-                    factor_t=2 if temporal else 1,
+                    factor_t=factor_t,
                     factor_s=2 if down else 1,
                     shortcut=config.shortcut,
                 ),
@@ -365,7 +363,12 @@ class Encoder(nn.Module):
         self.head = _head(width_in, 2 * config.channels_latent)
         moments = 2 * config.channels_latent
         # Named for the checkpoints' own tensors, as ``kl`` names its projections.
-        self.quant_conv = CausalConv3d(moments, moments, (1, 1, 1), past=0)
+        self.quant_conv = CausalConv3d.Config(
+            moments,
+            moments,
+            kernel_size=(1, 1, 1),
+            past=0,
+        ).make()
         if config.checkpoint is not None:
             state = read_state(
                 config.checkpoint.make().path(),
@@ -405,8 +408,8 @@ class Decoder(nn.Module):
         blocks_per_stage: int = 3
         """Residual blocks per stage; the published decoders run one more than their encoders."""
 
-        temporal: tuple[bool, ...] = (True, True, False)
-        """Whether each stage's upsampling also doubles time; one per stage but the last."""
+        temporal: tuple[int, ...] = (2, 2, 1)
+        """Time each stage's upsampling multiplies by, 1 or 2, less the first frame's copy; one per stage but the last."""
 
         channels_latent: int = 16
         """Latent channels."""
@@ -429,7 +432,7 @@ class Decoder(nn.Module):
         def factors(self) -> tuple[int, int]:
             """Return the ``(time, space)`` downsampling from pixels to latent."""
             space = self.patch_size << (len(self.channels_hidden) - 1)
-            return 1 << sum(self.temporal), space
+            return math.prod(self.temporal), space
 
         def cost(
             self,
@@ -475,7 +478,7 @@ class Decoder(nn.Module):
                         width_out,
                         width_in,
                         grid=grid,
-                        temporal=self.temporal[stage],
+                        temporal=self.temporal[stage] == 2,
                     )
                     total += up
                     if self.shortcut is not None:
@@ -495,16 +498,21 @@ class Decoder(nn.Module):
         super().__init__()
         p, widths, z = config.patch_size, config.channels_hidden, config.channels_latent
         stages = len(widths) - 1
-        if len(config.temporal) != stages or len(config.channels_upsampled) != stages:
+        _check_temporal(config.temporal, stages=stages)
+        if len(config.channels_upsampled) != stages:
             raise ValueError(
-                "temporal and channels_upsampled need one entry per upsampling stage, "
-                f"{stages}; got {len(config.temporal)} and "
-                f"{len(config.channels_upsampled)}.",
+                f"channels_upsampled needs one width per upsampling stage, {stages}; "
+                f"got {len(config.channels_upsampled)}.",
             )
         self.patch_size = p
         # Named for the checkpoints' own tensors, as the encoder's ``quant_conv``.
-        self.post_quant_conv = CausalConv3d(z, z, (1, 1, 1), past=0)
-        self.conv1 = CausalConv3d(z, widths[0])
+        self.post_quant_conv = CausalConv3d.Config(
+            z,
+            z,
+            kernel_size=(1, 1, 1),
+            past=0,
+        ).make()
+        self.conv1 = CausalConv3d.Config(z, widths[0]).make()
         self.middle = _middle(widths[0], kernel=config.attn_kernel)
         self.upsamples: nn.ModuleList[_Stage] = nn.ModuleList()
         width_in = widths[0]
@@ -514,16 +522,16 @@ class Decoder(nn.Module):
                 blocks.append(_Residual(width_in, width_out))
                 width_in = width_out
             up = stage != len(widths) - 1
-            temporal = up and config.temporal[stage]
+            factor_t = config.temporal[stage] if up else 1
             if up:
                 width_in = config.channels_upsampled[stage]
-                blocks.append(_Up(width_out, width_in, temporal=temporal))
+                blocks.append(_Up(width_out, width_in, temporal=factor_t == 2))
             self.upsamples.append(
                 _Stage(
                     nn.Sequential(*blocks),
                     attribute="upsamples",
                     channels_out=width_in,
-                    factor_t=2 if temporal else 1,
+                    factor_t=factor_t,
                     factor_s=2,
                     shortcut=config.shortcut if up else None,
                 ),
@@ -676,6 +684,15 @@ def _repoint(config: CausalVideoVAE.Config, checkpoint: HubFile.Config) -> None:
     config.decoder.checkpoint = checkpoint.copy_tree()
 
 
+def _check_temporal(temporal: tuple[int, ...], *, stages: int) -> None:
+    """Raise unless ``temporal`` holds one factor, 1 or 2, per resampling stage."""
+    if len(temporal) != stages or not set(temporal) <= {1, 2}:
+        raise ValueError(
+            f"temporal needs one factor, 1 or 2, per resampling stage, {stages}; "
+            f"got {temporal}.",
+        )
+
+
 def _fold(x: Tensor, p: int) -> Tensor:
     """Fold ``p x p`` pixels into channels, width factor outermost, as Wan 2.2 does."""
     # ``(c r q)``, ``r`` the width factor: ``patchify`` with the sides swapped, and
@@ -695,14 +712,14 @@ class _RMSNorm(nn.Module):
 
     def __init__(self, channels: int, *, spatial_axes: int) -> None:
         super().__init__()
-        self.scale = channels**0.5
+        self.scale = cast(float, channels**0.5)
         self.gamma = nn.Parameter(torch.ones(channels, *(1,) * spatial_axes))
 
     @override
     def forward(self, x: Tensor) -> Tensor:
         normalized = functional.normalize(x, dim=1) * self.scale
         # ``+ 0.0`` is the reference's absent bias; it turns -0.0 into 0.0.
-        return cast(Tensor, normalized * self.gamma + 0.0)
+        return normalized * self.gamma + 0.0
 
 
 class _Residual(nn.Module):
@@ -714,14 +731,19 @@ class _Residual(nn.Module):
         self.residual = nn.Sequential(
             _RMSNorm(channels_in, spatial_axes=3),
             nn.SiLU(),
-            CausalConv3d(channels_in, channels_out),
+            CausalConv3d.Config(channels_in, channels_out).make(),
             _RMSNorm(channels_out, spatial_axes=3),
             nn.SiLU(),
             nn.Identity(),
-            CausalConv3d(channels_out, channels_out),
+            CausalConv3d.Config(channels_out, channels_out).make(),
         )
         self.shortcut = (
-            CausalConv3d(channels_in, channels_out, (1, 1, 1), past=0)
+            CausalConv3d.Config(
+                channels_in,
+                channels_out,
+                kernel_size=(1, 1, 1),
+                past=0,
+            ).make()
             if channels_in != channels_out
             else nn.Identity()
         )
@@ -789,13 +811,13 @@ class _Down(nn.Module):
             ).make(),
         )
         self.time_conv = (
-            CausalConv3d(
+            CausalConv3d.Config(
                 channels,
                 channels,
-                (3, 1, 1),
+                kernel_size=(3, 1, 1),
                 stride=(2, 1, 1),
                 past=0,
-            )
+            ).make()
             if temporal
             else None
         )
@@ -824,7 +846,9 @@ class _Up(nn.Module):
             ).make(),
         )
         self.time_conv = (
-            CausalConv3d(channels, 2 * channels, (3, 1, 1)) if temporal else None
+            CausalConv3d.Config(channels, 2 * channels, kernel_size=(3, 1, 1)).make()
+            if temporal
+            else None
         )
 
     @override
@@ -890,18 +914,8 @@ def _head(channels: int, channels_out: int) -> nn.Sequential:
     return nn.Sequential(
         _RMSNorm(channels, spatial_axes=3),
         nn.SiLU(),
-        CausalConv3d(channels, channels_out),
+        CausalConv3d.Config(channels, channels_out).make(),
     )
-
-
-_SUM: Final = map_cost(
-    primal=1,
-    adjoint=0,
-    inputs=2,
-    adjoint_inputs=0,
-    adjoint_outputs=0,
-)
-"""A forward sum or product of two tensors."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -916,19 +930,21 @@ class _Layers:
         self,
         channels_in: int,
         channels_out: int,
-        kernel: tuple[int, int, int] = (3, 3, 3),
         *,
         grid: tuple[int, int, int],
+        kernel: tuple[int, int, int] = (3, 3, 3),
         stride: tuple[int, int, int] = (1, 1, 1),
         past: int = 2,
     ) -> Cost:
         """Cost ``CausalConv3d`` on ``grid``."""
-        return causal_conv3d_cost(
-            channels_in,
-            channels_out,
-            kernel,
-            stride=stride,
-            past=past,
+        return cost(
+            CausalConv3d.Config(
+                channels_in,
+                channels_out,
+                kernel_size=kernel,
+                stride=stride,
+                past=past,
+            ),
             input_grid=grid,
             batch_size=self.batch_size,
             dtype=self.dtype,
@@ -998,7 +1014,7 @@ class _Layers:
             + self.causal(channels_in, channels_out, grid=grid)
             + self.norm_silu(channels_out, grid=grid)
             + self.causal(channels_out, channels_out, grid=grid)
-            + _SUM(
+            + SUM(
                 channels=self.batch_size * channels_out * math.prod(grid),
                 dtype=self.dtype,
             )
@@ -1036,7 +1052,7 @@ class _Layers:
                 channels_head=channels,
             )
             + self.frames(channels, channels, grid=grid, kernel_size=1)
-            + _SUM(channels=elements, dtype=self.dtype)
+            + SUM(channels=elements, dtype=self.dtype)
         )
         return (
             self.residual(channels, channels, grid=grid).tile(2, copies=2) + attention
@@ -1151,7 +1167,7 @@ class _Layers:
             kernel="elementwise",
             elements=3 * moved,
             dtype=self.dtype,
-        ) + _SUM(
+        ) + SUM(
             channels=moved,
             dtype=self.dtype,
         )

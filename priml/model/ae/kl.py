@@ -28,7 +28,7 @@ References:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Final, Self, override
+from typing import TYPE_CHECKING, Final, Self, cast, override
 
 import re
 
@@ -39,7 +39,7 @@ from treekle import from_plain
 
 import torch
 
-from priml.cost import Cost, cost, elementwise_cost, traffic
+from priml.cost import Cost, cost, traffic
 from priml.math.pixel import patchify, unpatchify
 from priml.model.ae.checkpoint import (
     CheckpointFile,
@@ -50,6 +50,7 @@ from priml.model.ae.checkpoint import (
 )
 from priml.model.ae.custom_types import StateDictRemap
 from priml.model.ae.distribution import DiagonalGaussian
+from priml.model.ae.frozen_cost import SUM, kl_round_trip_cost
 from priml.model.ae.latent_norm import (
     BatchNormLatents,
     LatentNormalizer,
@@ -221,15 +222,47 @@ class LdmAttention(nn.Module):
         super().__init__()
 
     @override
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, **kwargs: object) -> Tensor:
-        """Attend ``[N, S, 1, C]`` queries to keys and values of the same shape."""
+    def forward(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        *,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+        attn_mask: Tensor | None = None,
+        window: int = -1,
+        scale: float | None = None,
+        **kwargs: object,
+    ) -> Tensor:
+        """Attend ``[N, S, 1, C]`` queries to keys and values of the same shape.
+
+        Raises:
+          ValueError: More than one head, or a dropout, causal mask, mask,
+            window, or scale, none of which the reference computes.
+
+        """
         del kwargs
         if q.shape[-2] != 1:
             raise ValueError(f"LdmAttention has one head; got {q.shape[-2]}.")
+        if (
+            dropout_p
+            or is_causal
+            or attn_mask is not None
+            or window >= 0
+            or (scale is not None)
+        ):
+            raise ValueError(
+                "LdmAttention attends every key at the reference's 1/sqrt(C) scale; "
+                "it takes no dropout, causal mask, mask, window, or scale.",
+            )
         # The reference's operands, strides included: the queries ``[N, S, C]``,
         # the keys and values ``[N, C, S]``.
         scores = torch.bmm(q.squeeze(-2), k.squeeze(-2).transpose(1, 2))
-        weights = functional.softmax(scores * (q.shape[-1] ** (-0.5)), dim=2)
+        weights = functional.softmax(
+            scores * cast(float, q.shape[-1] ** (-0.5)),
+            dim=2,
+        )
         attended = torch.bmm(v.squeeze(-2).transpose(1, 2), weights.permute(0, 2, 1))
         return attended.transpose(1, 2).unsqueeze(-2)
 
@@ -597,7 +630,10 @@ class AutoencoderKL(nn.Module):
         latent_norm: Makeable[LatentNormalizer] = field(
             default_factory=lambda: ScaleLatents.Config(scale=0.3099),
         )
-        """The scale the REG corpora train with; the autoencoder never applies it."""
+        """The normalizer the paired diffusion models train with; INVAE's, REG's scale, by default.
+
+        The autoencoder never applies it.
+        """
 
         @classmethod
         def from_hf(
@@ -694,7 +730,6 @@ class AutoencoderKL(nn.Module):
             pixels_in = area * self.encoder.channels_in
             pixels_out = area * self.decoder.channels_out
             latents = batch_size * channels * side * side
-            f32 = torch.float32
             full = (
                 cost(
                     self.encoder,
@@ -714,29 +749,12 @@ class AutoencoderKL(nn.Module):
                         "dtype": dtype,
                     },
                 )
-                # ``image.float() / 127.5 - 1`` in.
-                + traffic(
-                    "primal",
-                    kernel="elementwise",
-                    elements=pixels_in,
-                    dtype=torch.uint8,
+                + kl_round_trip_cost(
+                    pixels_in=pixels_in,
+                    latents=latents,
+                    pixels_out=pixels_out,
+                    dtype=dtype,
                 )
-                + traffic(
-                    "primal",
-                    kernel="elementwise",
-                    elements=pixels_in,
-                    dtype=f32,
-                )
-                + _pointwise(pixels_in, flops=1, dtype=f32).tile(2)
-                # Clamp the log-variance; ``exp(0.5 * logvar)``.
-                + _pointwise(latents, flops=2, dtype=dtype)
-                + _pointwise(latents, flops=1, dtype=dtype).tile(2)
-                # ``mean + std * noise``: the noise written, a product, a sum.
-                + traffic("primal", kernel="elementwise", elements=latents, dtype=dtype)
-                + _pointwise(latents, flops=1, inputs=2, dtype=dtype).tile(2)
-                # ``(x + 1) / 2`` and a two-sided clamp out.
-                + _pointwise(pixels_out, flops=1, dtype=dtype).tile(2)
-                + _pointwise(pixels_out, flops=2, dtype=dtype)
             )
             if self.patch_size > 1:
                 # Folding the mean and the log-variance, unfolding the draw: each
@@ -1356,7 +1374,7 @@ class _Layers:
             + self.norm(channels_out, side=side)
             + _swish_cost(elements_out, dtype=self.dtype)
             + self.conv(channels_out, channels_out, side=side, kernel_size=3)
-            + _pointwise(elements_out, flops=1, inputs=2, dtype=self.dtype)
+            + SUM(channels=elements_out, dtype=self.dtype)
         )
         if channels_in != channels_out:
             block += self.conv(channels_in, channels_out, side=side, kernel_size=1)
@@ -1384,12 +1402,7 @@ class _Layers:
                 num_heads=1,
                 channels_head=channels,
             )
-            + _pointwise(
-                self.batch_size * channels * side * side,
-                flops=1,
-                inputs=2,
-                dtype=self.dtype,
-            )
+            + SUM(channels=self.batch_size * channels * side * side, dtype=self.dtype)
         )
 
     def middle(self, channels: int, *, side: int) -> Cost:
@@ -1456,28 +1469,7 @@ class _Layers:
 
 def _swish_cost(elements: int, *, dtype: torch.dtype | None) -> Cost:
     """Cost ``_swish``: a sigmoid, then its product with the input."""
-    return cost(sigmoid, channels=elements, dtype=dtype) + _pointwise(
-        elements,
-        flops=1,
-        inputs=2,
-        dtype=dtype,
-    )
-
-
-def _pointwise(
-    elements: int,
-    *,
-    flops: int,
-    inputs: int = 1,
-    dtype: torch.dtype | None,
-) -> Cost:
-    """Cost one forward tensor op doing ``flops`` per element of its output."""
-    return elementwise_cost(
-        primal=flops * elements,
-        adjoint=0,
+    return cost(sigmoid, channels=elements, dtype=dtype) + SUM(
         channels=elements,
-        inputs=inputs,
-        adjoint_inputs=0,
-        adjoint_outputs=0,
         dtype=dtype,
     )

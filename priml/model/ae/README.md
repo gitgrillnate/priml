@@ -64,7 +64,7 @@ The `*_reference.pt` goldens replay each reference's own outputs bit for bit.
 | Wan2.1 | `wan.wan21()`, `wan.wan21_comfy()` | Wan2.1 @ `9737cba` |
 | Wan2.2 | `wan.wan22()`, `wan.wan22_comfy()` | Wan2.2 @ `1ea34ff` |
 | Mochi 1 | `mochi.mochi()`, `mochi.mochi_comfy()` | mochi @ `15c9bad` |
-| VTP | `vtp.vtp_small()`, `vtp_base()`, `vtp_large()` | VTP @ `5ce1eb6` |
+| VTP | `vtp.vtp_small()`, `vtp.vtp_base()`, `vtp.vtp_large()` | VTP @ `5ce1eb6` |
 | RAE DINOv2-B | `rae.rae_dinov2_base()` | RAE @ `a4d18c4` |
 
 SDXL's architecture is SD1.x's, computing its attention through SDPA as FLUX's

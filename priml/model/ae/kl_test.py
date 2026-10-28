@@ -480,25 +480,6 @@ def _reference_layout(source: str) -> AutoencoderKL.Config:
     return config
 
 
-def _reference_norm(
-    source: str,
-    state: dict[str, Tensor],
-    directory: Path,
-) -> LatentNormalizer:
-    """Return the normalizer each reference's ``encode`` applies; CompVis's applies none."""
-    if source == "flux":
-        return ShiftScaleLatents.Config(shift=0.1159, scale=0.3611).make()
-    if source == "flux2":
-        stats = {key: state[key] for key in ("bn.running_mean", "bn.running_var")}
-        save_file(stats, str(directory / "bn.safetensors"))
-        path = directory / "bn.safetensors"
-        return BatchNormLatents.Config(
-            stats=LocalFile.Config(path=path),
-            eps=1e-4,
-        ).make()
-    return ScaleLatents.Config().make()
-
-
 def _replay_reference(
     source: str,
     directory: Path,
@@ -525,7 +506,17 @@ def _replay_reference(
         bias = model.decoder.conv_out.bias
         assert bias is not None
         bias[0] = torch.nextafter(bias[0], torch.tensor(torch.inf))
-    norm = _reference_norm(source, state, directory)
+    # The normalizer each reference's ``encode`` applies; CompVis's applies none.
+    norm: LatentNormalizer = ScaleLatents.Config().make()
+    if source == "flux":
+        norm = ShiftScaleLatents.Config(shift=0.1159, scale=0.3611).make()
+    elif source == "flux2":
+        stats = {key: state[key] for key in ("bn.running_mean", "bn.running_var")}
+        save_file(stats, str(directory / "bn.safetensors"))
+        norm = BatchNormLatents.Config(
+            stats=LocalFile.Config(path=directory / "bn.safetensors"),
+            eps=1e-4,
+        ).make()
     image = reference["image"]
     with host_agnostic_numerics():
         actual = {
@@ -673,6 +664,28 @@ def test_ldm_attention_has_one_head() -> None:
     q = torch.randn(2, 5, 3, 4)
     with pytest.raises(ValueError, match="one head"):
         _ = LdmAttention()(q, q, q)
+
+
+_QUERY: Final = torch.zeros(2, 5, 1, 4)
+
+
+@pytest.mark.parametrize(
+    "attend",
+    [
+        lambda: LdmAttention()(_QUERY, _QUERY, _QUERY, dropout_p=0.1),
+        lambda: LdmAttention()(_QUERY, _QUERY, _QUERY, is_causal=True),
+        lambda: LdmAttention()(_QUERY, _QUERY, _QUERY, attn_mask=torch.zeros(5, 5)),
+        lambda: LdmAttention()(_QUERY, _QUERY, _QUERY, window=2),
+        lambda: LdmAttention()(_QUERY, _QUERY, _QUERY, scale=0.5),
+    ],
+    ids=["dropout", "causal", "mask", "window", "scale"],
+)
+def test_ldm_attention_refuses_what_the_reference_does_not_compute(
+    attend: Callable[[], Tensor],
+) -> None:
+    """A causal or scaled slot must not silently get full, fixed-scale attention."""
+    with pytest.raises(ValueError, match="takes no"):
+        _ = attend()
 
 
 if __name__ == "__main__":
