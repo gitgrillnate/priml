@@ -14,7 +14,8 @@ up.
 
 Build a published model from :func:`wan21` or :func:`wan22`, or their Comfy
 repackagings, :func:`wan21_comfy` and :func:`wan22_comfy`, the same tensors
-rounded to bfloat16 and float16.
+rounded to bfloat16 and float16: each a
+:class:`~priml.model.ae.video.CausalVideoVAE` around this module's halves.
 
 Apache-2.0 license and attribution: ``LICENSES/Wan2.1``, ``LICENSES/Wan2.2``.
 
@@ -29,7 +30,7 @@ References:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Final, Protocol, Self, cast, override
+from typing import TYPE_CHECKING, Final, Protocol, cast, override
 
 import math
 import re
@@ -44,9 +45,13 @@ from priml.cost import Cost, cost, elementwise_cost, map_cost, traffic
 from priml.math.pixel import patchify, unpatchify
 from priml.model.ae.checkpoint import CheckpointFile, HubFile, read_state
 from priml.model.ae.custom_types import StateDictRemap
-from priml.model.ae.distribution import DiagonalGaussian
-from priml.model.ae.latent_norm import InverseStdLatents, LatentNormalizer
-from priml.model.ae.video import CausalConv3d, per_frame
+from priml.model.ae.latent_norm import InverseStdLatents
+from priml.model.ae.video import (
+    CausalConv3d,
+    CausalVideoVAE,
+    causal_conv3d_cost,
+    per_frame,
+)
 from priml.model.attention.kernel import SdpaFused
 from priml.model.conv import Conv2d, conv_cost
 from priml.model.custom_types import AttentionKernel
@@ -262,6 +267,11 @@ class Encoder(nn.Module):
         remap: StateDictRemap = remap_wan_state_dict
         """Renames ``checkpoint``'s tensors to this module's."""
 
+        def factors(self) -> tuple[int, int]:
+            """Return the ``(time, space)`` downsampling from pixels to latent."""
+            space = self.patch_size << (len(self.channels_hidden) - 1)
+            return 1 << sum(self.temporal), space
+
         def cost(
             self,
             *,
@@ -316,7 +326,7 @@ class Encoder(nn.Module):
                     moments,
                     grid=grid,
                     kernel=(1, 1, 1),
-                    padding=(0, 0, 0),
+                    past=0,
                 )
             )
 
@@ -416,6 +426,11 @@ class Decoder(nn.Module):
         remap: StateDictRemap = remap_wan_state_dict
         """Renames ``checkpoint``'s tensors to this module's."""
 
+        def factors(self) -> tuple[int, int]:
+            """Return the ``(time, space)`` downsampling from pixels to latent."""
+            space = self.patch_size << (len(self.channels_hidden) - 1)
+            return 1 << sum(self.temporal), space
+
         def cost(
             self,
             *,
@@ -443,7 +458,7 @@ class Decoder(nn.Module):
                 attn_kernel=self.attn_kernel,
             )
             z, widths, grid = self.channels_latent, self.channels_hidden, input_grid
-            total = layers.causal(z, z, grid=grid, kernel=(1, 1, 1), padding=(0, 0, 0))
+            total = layers.causal(z, z, grid=grid, kernel=(1, 1, 1), past=0)
             total += layers.causal(z, widths[0], grid=grid) + layers.middle(
                 widths[0],
                 grid=grid,
@@ -557,200 +572,7 @@ _WAN22_STD: Final = [
 ]  # fmt: skip
 
 
-class WanVAE(nn.Module):
-    """A Wan VAE as an ``Autoencoder`` over videos; either half may be left out.
-
-    ``encode`` returns a diagonal Gaussian; call ``sample()`` or ``mode()`` on
-    it. The model is frozen and always in evaluation mode.
-    """
-
-    class Config(Fig["WanVAE"]):
-        """The halves, the clip geometry, and the published latent normalizer.
-
-        The defaults are Wan 2.1's published model, which :func:`wan21` returns.
-        """
-
-        encoder: Encoder.Config | None = field(default_factory=Encoder.Config)
-        """Pixels to posterior; ``None`` builds and loads no encoder."""
-
-        decoder: Decoder.Config | None = field(default_factory=Decoder.Config)
-        """Latents to pixels; ``None`` builds and loads no decoder."""
-
-        num_frames: int = 81
-        """Frames in the clip the latent shape and the cost are stated at."""
-
-        image_size: tuple[int, int] = (480, 832)
-        """``(height, width)`` of those frames."""
-
-        latent_norm: Makeable[LatentNormalizer] = field(
-            default_factory=lambda: InverseStdLatents.Config(
-                mean=list(_WAN21_MEAN),
-                std=list(_WAN21_STD),
-            ),
-        )
-        """The statistics Wan's diffusion models train with; the autoencoder never applies them."""
-
-        def factors(self) -> tuple[int, int]:
-            """Return the ``(time, space)`` downsampling from pixels to latent."""
-            half = self.encoder or self.decoder
-            if half is None:
-                raise ValueError("WanVAE.Config needs an encoder or a decoder.")
-            space = half.patch_size << (len(half.channels_hidden) - 1)
-            return 1 << sum(half.temporal), space
-
-        def latent_shape(self) -> tuple[int, int, int, int]:
-            """Return ``(channels_latent, frames, height, width)`` of the clip's latent."""
-            time, space = self.factors()
-            half = self.encoder or self.decoder
-            assert half is not None
-            height, width = self.image_size
-            frames = 1 + (self.num_frames - 1) // time
-            return half.channels_latent, frames, height // space, width // space
-
-        def cost(
-            self,
-            *,
-            batch_size: int,
-            dtype: torch.dtype | None,
-            **kwargs: object,
-        ) -> Cost:
-            """Cost one ``decode(encode(clip).sample())`` round trip of the stated clip.
-
-            Forward only; the parameters are still owned.
-
-            Args:
-              batch_size: Clips in this invocation.
-              dtype: Activation dtype; ``None`` is torch's default.
-              **kwargs: The open bus, forwarded to both halves.
-
-            Returns:
-              cost: Forward FLOPs, logical bytes, and parameter ownership.
-
-            """
-            if self.encoder is None or self.decoder is None:
-                raise ValueError("WanVAE.Config.cost prices both halves; one is None.")
-            channels, frames, height, width = self.latent_shape()
-            clip = (self.num_frames, *self.image_size)
-            pixels_in = batch_size * self.encoder.channels_in * math.prod(clip)
-            pixels_out = batch_size * self.decoder.channels_out * math.prod(clip)
-            latents = batch_size * channels * frames * height * width
-            f32 = torch.float32
-            full = (
-                cost(
-                    self.encoder,
-                    **{
-                        **kwargs,
-                        "input_grid": clip,
-                        "batch_size": batch_size,
-                        "dtype": dtype,
-                    },
-                )
-                + cost(
-                    self.decoder,
-                    **{
-                        **kwargs,
-                        "input_grid": (frames, height, width),
-                        "batch_size": batch_size,
-                        "dtype": dtype,
-                    },
-                )
-                # ``clip.float() / 127.5 - 1`` in.
-                + traffic(
-                    "primal",
-                    kernel="elementwise",
-                    elements=pixels_in,
-                    dtype=torch.uint8,
-                )
-                + traffic("primal", kernel="elementwise", elements=pixels_in, dtype=f32)
-                + _POINTWISE(channels=pixels_in, dtype=f32).tile(2)
-                # Clamp the log-variance; ``exp(0.5 * logvar)``.
-                + _CLAMP(channels=latents, dtype=dtype)
-                + _POINTWISE(channels=latents, dtype=dtype).tile(2)
-                # ``mean + std * noise``: the noise written, a product, a sum.
-                + traffic("primal", kernel="elementwise", elements=latents, dtype=dtype)
-                + _SUM(channels=latents, dtype=dtype).tile(2)
-                # ``(x + 1) / 2`` and a two-sided clamp out.
-                + _POINTWISE(channels=pixels_out, dtype=dtype).tile(2)
-                + _CLAMP(channels=pixels_out, dtype=dtype)
-            )
-            return Cost(
-                cells=full.only("primal").cells,
-                params=full.params,
-                params_active=full.params_active,
-            )
-
-    def __init__(self, config: Config) -> None:
-        super().__init__()
-        halves = [half for half in (config.encoder, config.decoder) if half is not None]
-        if not halves:
-            raise ValueError("WanVAE needs an encoder or a decoder.")
-        if len({half.channels_latent for half in halves}) != 1:
-            raise ValueError("The encoder and decoder disagree on channels_latent.")
-        self.time, self.space = config.factors()
-        self.encoder = None if config.encoder is None else config.encoder.make()
-        self.decoder = None if config.decoder is None else config.decoder.make()
-        self.eval()
-        self.requires_grad_(False)
-
-    @override
-    def train(self, mode: bool = True) -> Self:
-        """Stay in evaluation mode: the published weights are frozen."""
-        del mode
-        return super().train(False)
-
-    def encode(self, x: Tensor, /) -> DiagonalGaussian:
-        """Return the posterior over latents.
-
-        Args:
-          x: ``[..., 3, T, H, W]`` uint8 RGB, ``T = 1 + 4k`` frames.
-
-        Returns:
-          posterior: Diagonal Gaussian over ``[..., channels_latent, t, h, w]``.
-
-        Raises:
-          TypeError: ``x`` is not uint8.
-          ValueError: The model was built without an encoder, or the clip's
-            frames or sides do not divide.
-
-        """
-        if self.encoder is None:
-            raise ValueError("This WanVAE was built without an encoder.")
-        if x.dtype != torch.uint8:
-            raise TypeError(f"WanVAE encodes uint8 RGB in [0, 255]; got {x.dtype}.")
-        frames, height, width = x.shape[-3:]
-        if (frames - 1) % self.time or height % self.space or width % self.space:
-            raise ValueError(
-                f"WanVAE encodes 1 + {self.time}k frames of sides divisible by "
-                f"{self.space}; got {frames} frames of {height}x{width}.",
-            )
-        # ``x / 127.5 - 1``, as ``kl`` maps uint8 pixels.
-        pixels = x.reshape(-1, *x.shape[-4:]).float() / 127.5 - 1
-        moments = self.encoder(pixels)
-        moments = moments.reshape(*x.shape[:-4], *moments.shape[1:])
-        mean, logvar = moments.chunk(2, dim=-4)
-        return DiagonalGaussian(mean, logvar)
-
-    def decode(self, z: Tensor, /) -> Tensor:
-        """Decode latents to RGB in ``[0, 1]``.
-
-        Args:
-          z: ``[..., channels_latent, t, h, w]`` raw latents.
-
-        Returns:
-          video: ``[..., 3, 1 + 4 (t - 1), H, W]`` float RGB, clamped.
-
-        Raises:
-          ValueError: The model was built without a decoder.
-
-        """
-        if self.decoder is None:
-            raise ValueError("This WanVAE was built without a decoder.")
-        decoded = self.decoder(z.reshape(-1, *z.shape[-4:]))
-        decoded = decoded.reshape(*z.shape[:-4], *decoded.shape[1:])
-        return ((decoded + 1) / 2).clamp(0, 1)
-
-
-def wan21() -> WanVAE.Config:
+def wan21() -> CausalVideoVAE.Config:
     """Return Wan 2.1's VAE: 16 channels, 4x in time, 8x in space.
 
     Wan 2.2's A14B models use it too.
@@ -759,10 +581,19 @@ def wan21() -> WanVAE.Config:
       config: The published model, float32 weights pinned.
 
     """
-    return WanVAE.Config()
+    return CausalVideoVAE.Config(
+        encoder=Encoder.Config(),
+        decoder=Decoder.Config(),
+        num_frames=81,
+        image_size=(480, 832),
+        latent_norm=InverseStdLatents.Config(
+            mean=list(_WAN21_MEAN),
+            std=list(_WAN21_STD),
+        ),
+    )
 
 
-def wan22() -> WanVAE.Config:
+def wan22() -> CausalVideoVAE.Config:
     """Return Wan 2.2's VAE: 48 channels, 4x in time, 16x in space.
 
     Pixels fold 2x2 into channels before an 8x encoder, and each stage adds a
@@ -772,29 +603,32 @@ def wan22() -> WanVAE.Config:
       config: The published model, float32 weights pinned.
 
     """
-    config = WanVAE.Config()
-    assert config.encoder is not None
-    assert config.decoder is not None
-    encoder, decoder = config.encoder, config.decoder
-    encoder.patch_size = decoder.patch_size = 2
-    encoder.channels_hidden = (160, 320, 640, 640)
-    encoder.shortcut = average_shortcut
-    decoder.channels_hidden = (1024, 1024, 512, 256)
-    decoder.channels_upsampled = (1024, 1024, 512)
-    decoder.shortcut = duplicate_shortcut
-    encoder.channels_latent = decoder.channels_latent = 48
-    encoder.checkpoint = wan22_vae()
-    decoder.checkpoint = wan22_vae()
-    config.image_size = (704, 1280)
-    config.num_frames = 121
-    config.latent_norm = InverseStdLatents.Config(
-        mean=list(_WAN22_MEAN),
-        std=list(_WAN22_STD),
+    return CausalVideoVAE.Config(
+        encoder=Encoder.Config(
+            patch_size=2,
+            channels_hidden=(160, 320, 640, 640),
+            channels_latent=48,
+            shortcut=average_shortcut,
+            checkpoint=wan22_vae(),
+        ),
+        decoder=Decoder.Config(
+            patch_size=2,
+            channels_hidden=(1024, 1024, 512, 256),
+            channels_upsampled=(1024, 1024, 512),
+            channels_latent=48,
+            shortcut=duplicate_shortcut,
+            checkpoint=wan22_vae(),
+        ),
+        num_frames=121,
+        image_size=(704, 1280),
+        latent_norm=InverseStdLatents.Config(
+            mean=list(_WAN22_MEAN),
+            std=list(_WAN22_STD),
+        ),
     )
-    return config
 
 
-def wan21_comfy() -> WanVAE.Config:
+def wan21_comfy() -> CausalVideoVAE.Config:
     """Return :func:`wan21` read from Comfy's repackaging, rounded to bfloat16.
 
     Returns:
@@ -814,7 +648,7 @@ def wan21_comfy() -> WanVAE.Config:
     return config
 
 
-def wan22_comfy() -> WanVAE.Config:
+def wan22_comfy() -> CausalVideoVAE.Config:
     """Return :func:`wan22` read from Comfy's repackaging, rounded to float16.
 
     Returns:
@@ -834,10 +668,10 @@ def wan22_comfy() -> WanVAE.Config:
     return config
 
 
-def _repoint(config: WanVAE.Config, checkpoint: HubFile.Config) -> None:
+def _repoint(config: CausalVideoVAE.Config, checkpoint: HubFile.Config) -> None:
     """Point both halves at their own copies of ``checkpoint``."""
-    assert config.encoder is not None
-    assert config.decoder is not None
+    assert isinstance(config.encoder, Encoder.Config)
+    assert isinstance(config.decoder, Decoder.Config)
     config.encoder.checkpoint = checkpoint
     config.decoder.checkpoint = checkpoint.copy_tree()
 
@@ -1060,9 +894,6 @@ def _head(channels: int, channels_out: int) -> nn.Sequential:
     )
 
 
-_POINTWISE: Final = map_cost(primal=1, adjoint=0, adjoint_inputs=0, adjoint_outputs=0)
-"""A forward elementwise op with one scalar operand."""
-
 _SUM: Final = map_cost(
     primal=1,
     adjoint=0,
@@ -1071,9 +902,6 @@ _SUM: Final = map_cost(
     adjoint_outputs=0,
 )
 """A forward sum or product of two tensors."""
-
-_CLAMP: Final = map_cost(primal=2, adjoint=0, adjoint_inputs=0, adjoint_outputs=0)
-"""A forward two-sided clamp."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1088,33 +916,21 @@ class _Layers:
         self,
         channels_in: int,
         channels_out: int,
+        kernel: tuple[int, int, int] = (3, 3, 3),
         *,
         grid: tuple[int, int, int],
-        kernel: tuple[int, int, int] = (3, 3, 3),
         stride: tuple[int, int, int] = (1, 1, 1),
-        padding: tuple[int, int, int] = (1, 1, 1),
+        past: int = 2,
     ) -> Cost:
-        """Cost ``_CausalConv3d`` on ``grid``: the pad's copy, then the convolution."""
-        t, h, w = grid
-        pt, ph, pw = padding
-        padded = (t + 2 * pt, h + 2 * ph, w + 2 * pw)
-        moved = channels_in * (math.prod(grid) + math.prod(padded)) * self.batch_size
-        return traffic(
-            "primal",
-            kernel="elementwise",
-            elements=moved,
-            dtype=self.dtype,
-        ) + conv_cost(
-            channels_in=channels_in,
-            channels_out=channels_out,
-            kernel_size=kernel,
-            ndim=3,
-            groups=1,
-            bias=True,
-            input_grid=padded,
-            batch_size=self.batch_size,
+        """Cost ``CausalConv3d`` on ``grid``."""
+        return causal_conv3d_cost(
+            channels_in,
+            channels_out,
+            kernel,
             stride=stride,
-            padding=0,
+            past=past,
+            input_grid=grid,
+            batch_size=self.batch_size,
             dtype=self.dtype,
         )
 
@@ -1193,7 +1009,7 @@ class _Layers:
                 channels_out,
                 grid=grid,
                 kernel=(1, 1, 1),
-                padding=(0, 0, 0),
+                past=0,
             )
         return block
 
@@ -1270,7 +1086,7 @@ class _Layers:
                 grid=(t, h, w),
                 kernel=(3, 1, 1),
                 stride=(2, 1, 1),
-                padding=(0, 0, 0),
+                past=0,
             )
             # The first frame and the convolution's, joined.
             t = 1 + (t - 3) // 2 + 1
@@ -1313,7 +1129,6 @@ class _Layers:
                 2 * channels,
                 grid=(t - 1, h, w),
                 kernel=(3, 1, 1),
-                padding=(1, 0, 0),
             ) + traffic(
                 "primal",
                 kernel="elementwise",

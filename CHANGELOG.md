@@ -22,23 +22,26 @@ All notable priml changes are documented here. This project follows
   `PointMass` in SD's diffusion space (its latent scale is 1), and each half
   loads its own published file. `testdata/taesd_reference.pt` replays the
   reference's own outputs bit for bit.
-- `priml.model.ae.wan`: `WanVAE`, Wan 2.1's and Wan 2.2's causal video VAEs,
-  with `wan21()` and `wan22()` pinned to the float32 releases and
-  `wan21_comfy()` / `wan22_comfy()` to Comfy's bfloat16 / float16
-  repackagings. Clips are `1 + 4k` frames, encoded and decoded whole: the
-  reference's chunked caches compute the same causal convolutions, and
+- `priml.model.ae.video`: `CausalVideoVAE`, the causal video KL autoencoder
+  around a family's halves: uint8 clips of `1 + k` times its time factor in
+  frames to a `DiagonalGaussian`, and latents back to RGB. Its `encoder` and
+  `decoder` slots take any `VideoEncoderConfig` / `VideoDecoderConfig`. With
+  `CausalConv3d`, its `causal_conv3d_cost`, and `per_frame`, shared by:
+- `priml.model.ae.wan`: Wan 2.1's and Wan 2.2's halves, with `wan21()` and
+  `wan22()` pinned to the float32 releases and `wan21_comfy()` /
+  `wan22_comfy()` to Comfy's bfloat16 / float16 repackagings. Clips are
+  `1 + 4k` frames, encoded and decoded whole: the reference's chunked caches
+  compute the same causal convolutions, and
   `testdata/wan_reference_{21,22}.pt` replay both references bit for bit.
   Wan 2.2's stage shortcuts are injected (`average_shortcut`,
   `duplicate_shortcut`). Its latents normalize with the new
   `InverseStdLatents`.
-- `priml.model.ae.mochi`: `MochiVAE`, Mochi 1's asymmetric causal video VAE,
-  with `mochi()` pinned to genmo's float32 halves, each its own file, and
-  `mochi_comfy()` to Comfy's float16 repackaging. Clips are `1 + 6k`
-  frames; the encoder reads RGB with its Fourier features and attends
-  causally along time. `testdata/mochi_reference.pt` replays the reference's
-  own outputs bit for bit. Its latents normalize with the new `StdLatents`.
-- `priml.model.ae.video`: `CausalConv3d` and `per_frame`, shared by the Wan
-  and Mochi ports.
+- `priml.model.ae.mochi`: Mochi 1's asymmetric halves, with `mochi()` pinned
+  to genmo's float32 halves, each its own file, and `mochi_comfy()` to
+  Comfy's float16 repackaging. Clips are `1 + 6k` frames; the encoder reads
+  RGB with its Fourier features and attends causally along time.
+  `testdata/mochi_reference.pt` replays the reference's own outputs bit for
+  bit. Its latents normalize with the new `StdLatents`.
 - `priml.model.ae.latent_norm`: `ShiftScaleLatents` (FLUX.1's
   `(z - shift) * scale`) and `BatchNormLatents` (FLUX.2's frozen batch norm,
   read from the checkpoint).

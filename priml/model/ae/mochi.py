@@ -7,8 +7,11 @@ into frames and pixels. The encoder reads RGB with two octaves of Fourier
 features, 15 channels.
 
 Each half is published as its own float32 file, named as this module names
-it. Build the published model from :func:`mochi`, or :func:`mochi_comfy` for
-Comfy's float16 repackaging of both halves in one file.
+it. Mochi's own draw, ``noise * exp(logvar * 0.5) + mean``, is
+:class:`~priml.model.ae.distribution.DiagonalGaussian`'s without the
+log-variance clamp. Build the published model from :func:`mochi`, or :func:`mochi_comfy` for
+Comfy's float16 repackaging of both halves in one file: each a
+:class:`~priml.model.ae.video.CausalVideoVAE` around this module's halves.
 
 Apache-2.0 license and attribution: ``LICENSES/mochi``.
 
@@ -22,7 +25,7 @@ References:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Final, Self, cast, override
+from typing import TYPE_CHECKING, Final, cast, override
 
 import math
 
@@ -36,9 +39,13 @@ from priml.cost import Cost, cost, map_cost, traffic
 from priml.math.pixel import unpatchify
 from priml.model.ae.checkpoint import CheckpointFile, HubFile, read_state
 from priml.model.ae.custom_types import StateDictRemap
-from priml.model.ae.distribution import DiagonalGaussian
-from priml.model.ae.latent_norm import LatentNormalizer, StdLatents
-from priml.model.ae.video import CausalConv3d
+from priml.model.ae.latent_norm import StdLatents
+from priml.model.ae.video import (
+    CausalConv3d,
+    CausalVideoVAE,
+    causal_conv3d_cost,
+    per_frame,
+)
 from priml.model.attention.kernel import SdpaFused
 from priml.model.conv import Conv3d
 from priml.model.custom_types import AttentionKernel
@@ -160,6 +167,10 @@ class Encoder(nn.Module):
         remap: StateDictRemap = remap_mochi_state_dict
         """Renames ``checkpoint``'s tensors to this module's."""
 
+        def factors(self) -> tuple[int, int]:
+            """Return the ``(time, space)`` downsampling from pixels to latent."""
+            return math.prod(self.temporal), math.prod(self.spatial)
+
         def cost(
             self,
             *,
@@ -185,8 +196,6 @@ class Encoder(nn.Module):
                 batch_size=batch_size,
                 dtype=dtype,
                 num_groups=self.num_groups,
-                channels_head=self.channels_head,
-                attn_kernel=self.attn_kernel,
             )
             widths, grid = self.channels_hidden, input_grid
             fourier = self.channels_in * (1 + 2 * len(self.fourier_octaves))
@@ -205,8 +214,8 @@ class Encoder(nn.Module):
             total += layers.blocks(
                 widths[0],
                 self.blocks_per_stage[0],
-                self.attention[0],
                 grid=grid,
+                attention=self if self.attention[0] else None,
             )
             for stage, (t, s) in enumerate(
                 zip(self.temporal, self.spatial, strict=True),
@@ -221,8 +230,8 @@ class Encoder(nn.Module):
                 total += down + layers.blocks(
                     widths[stage + 1],
                     self.blocks_per_stage[stage + 1],
-                    self.attention[stage + 1],
                     grid=grid,
+                    attention=self if self.attention[stage + 1] else None,
                 )
             width = widths[-1]
             return (
@@ -230,8 +239,8 @@ class Encoder(nn.Module):
                 + layers.blocks(
                     width,
                     self.blocks_per_stage[-1],
-                    self.attention[-1],
                     grid=grid,
+                    attention=self if self.attention[-1] else None,
                 )
                 + layers.norm(width, grid=grid)
                 + cost(silu, channels=batch_size * width * math.prod(grid), dtype=dtype)
@@ -344,6 +353,10 @@ class Decoder(nn.Module):
         remap: StateDictRemap = remap_mochi_state_dict
         """Renames ``checkpoint``'s tensors to this module's."""
 
+        def factors(self) -> tuple[int, int]:
+            """Return the ``(time, space)`` downsampling from pixels to latent."""
+            return math.prod(self.temporal), math.prod(self.spatial)
+
         def cost(
             self,
             *,
@@ -369,8 +382,6 @@ class Decoder(nn.Module):
                 batch_size=batch_size,
                 dtype=dtype,
                 num_groups=self.num_groups,
-                channels_head=1,
-                attn_kernel=SdpaFused.Config(),
             )
             widths, grid = self.channels_hidden, input_grid
             total = cost(
@@ -384,7 +395,12 @@ class Decoder(nn.Module):
                 input_grid=grid,
                 batch_size=batch_size,
                 dtype=dtype,
-            ) + layers.blocks(widths[0], self.blocks_per_stage[0], False, grid=grid)
+            ) + layers.blocks(
+                widths[0],
+                self.blocks_per_stage[0],
+                grid=grid,
+                attention=None,
+            )
             for stage, (t, s) in enumerate(
                 zip(self.temporal, self.spatial, strict=True),
             ):
@@ -400,7 +416,12 @@ class Decoder(nn.Module):
             width = widths[-1]
             return (
                 total
-                + layers.blocks(width, self.blocks_per_stage[-1], False, grid=grid)
+                + layers.blocks(
+                    width,
+                    self.blocks_per_stage[-1],
+                    grid=grid,
+                    attention=None,
+                )
                 + cost(silu, channels=batch_size * width * math.prod(grid), dtype=dtype)
                 + layers.linear(
                     width,
@@ -484,223 +505,32 @@ _MOCHI_STD: Final = [
 ]  # fmt: skip
 
 
-class MochiVAE(nn.Module):
-    """Mochi's VAE as an ``Autoencoder`` over videos; either half may be left out.
-
-    ``encode`` returns a diagonal Gaussian; call ``sample()`` or ``mode()`` on
-    it. The model is frozen and always in evaluation mode.
-    """
-
-    class Config(Fig["MochiVAE"]):
-        """The halves, the clip geometry, and the published latent normalizer.
-
-        The defaults are Mochi's published model, which :func:`mochi` returns.
-        """
-
-        encoder: Encoder.Config | None = field(default_factory=Encoder.Config)
-        """Pixels to posterior; ``None`` builds and loads no encoder."""
-
-        decoder: Decoder.Config | None = field(default_factory=Decoder.Config)
-        """Latents to pixels; ``None`` builds and loads no decoder."""
-
-        num_frames: int = 163
-        """Frames in the clip the latent shape and the cost are stated at."""
-
-        image_size: tuple[int, int] = (480, 848)
-        """``(height, width)`` of those frames."""
-
-        latent_norm: Makeable[LatentNormalizer] = field(
-            default_factory=lambda: StdLatents.Config(
-                mean=list(_MOCHI_MEAN),
-                std=list(_MOCHI_STD),
-            ),
-        )
-        """The statistics Mochi's diffusion model trains with; the autoencoder never applies them."""
-
-        def factors(self) -> tuple[int, int]:
-            """Return the ``(time, space)`` downsampling from pixels to latent."""
-            half = self.encoder or self.decoder
-            if half is None:
-                raise ValueError("MochiVAE.Config needs an encoder or a decoder.")
-            return math.prod(half.temporal), math.prod(half.spatial)
-
-        def latent_shape(self) -> tuple[int, int, int, int]:
-            """Return ``(channels_latent, frames, height, width)`` of the clip's latent."""
-            time, space = self.factors()
-            half = self.encoder or self.decoder
-            assert half is not None
-            height, width = self.image_size
-            frames = 1 + (self.num_frames - 1) // time
-            return half.channels_latent, frames, height // space, width // space
-
-        def cost(
-            self,
-            *,
-            batch_size: int,
-            dtype: torch.dtype | None,
-            **kwargs: object,
-        ) -> Cost:
-            """Cost one ``decode(encode(clip).sample())`` round trip of the stated clip.
-
-            Forward only; the parameters are still owned.
-
-            Args:
-              batch_size: Clips in this invocation.
-              dtype: Activation dtype; ``None`` is torch's default.
-              **kwargs: The open bus, forwarded to both halves.
-
-            Returns:
-              cost: Forward FLOPs, logical bytes, and parameter ownership.
-
-            """
-            if self.encoder is None or self.decoder is None:
-                raise ValueError(
-                    "MochiVAE.Config.cost prices both halves; one is None.",
-                )
-            channels, frames, height, width = self.latent_shape()
-            clip = (self.num_frames, *self.image_size)
-            pixels_in = batch_size * self.encoder.channels_in * math.prod(clip)
-            pixels_out = batch_size * self.decoder.channels_out * math.prod(clip)
-            latents = batch_size * channels * frames * height * width
-            f32 = torch.float32
-            full = (
-                cost(
-                    self.encoder,
-                    **{
-                        **kwargs,
-                        "input_grid": clip,
-                        "batch_size": batch_size,
-                        "dtype": dtype,
-                    },
-                )
-                + cost(
-                    self.decoder,
-                    **{
-                        **kwargs,
-                        "input_grid": (frames, height, width),
-                        "batch_size": batch_size,
-                        "dtype": dtype,
-                    },
-                )
-                # ``clip.float() / 127.5 - 1`` in.
-                + traffic(
-                    "primal",
-                    kernel="elementwise",
-                    elements=pixels_in,
-                    dtype=torch.uint8,
-                )
-                + traffic("primal", kernel="elementwise", elements=pixels_in, dtype=f32)
-                + _POINTWISE(channels=pixels_in, dtype=f32).tile(2)
-                # Clamp the log-variance; ``exp(0.5 * logvar)``.
-                + _CLAMP(channels=latents, dtype=dtype)
-                + _POINTWISE(channels=latents, dtype=dtype).tile(2)
-                # ``mean + std * noise``: the noise written, a product, a sum.
-                + traffic("primal", kernel="elementwise", elements=latents, dtype=dtype)
-                + _SUM(channels=latents, dtype=dtype).tile(2)
-                # ``(x + 1) / 2`` and a two-sided clamp out.
-                + _POINTWISE(channels=pixels_out, dtype=dtype).tile(2)
-                + _CLAMP(channels=pixels_out, dtype=dtype)
-            )
-            return Cost(
-                cells=full.only("primal").cells,
-                params=full.params,
-                params_active=full.params_active,
-            )
-
-    def __init__(self, config: Config) -> None:
-        super().__init__()
-        halves = [half for half in (config.encoder, config.decoder) if half is not None]
-        if not halves:
-            raise ValueError("MochiVAE needs an encoder or a decoder.")
-        if len({half.channels_latent for half in halves}) != 1:
-            raise ValueError("The encoder and decoder disagree on channels_latent.")
-        self.time, self.space = config.factors()
-        self.encoder = None if config.encoder is None else config.encoder.make()
-        self.decoder = None if config.decoder is None else config.decoder.make()
-        self.eval()
-        self.requires_grad_(False)
-
-    @override
-    def train(self, mode: bool = True) -> Self:
-        """Stay in evaluation mode: the published weights are frozen."""
-        del mode
-        return super().train(False)
-
-    def encode(self, x: Tensor, /) -> DiagonalGaussian:
-        """Return the posterior over latents.
-
-        Mochi's own draw, ``noise * exp(logvar * 0.5) + mean``, is this one's
-        without the log-variance clamp.
-
-        Args:
-          x: ``[..., 3, T, H, W]`` uint8 RGB, ``T = 1 + 6k`` frames.
-
-        Returns:
-          posterior: Diagonal Gaussian over ``[..., channels_latent, t, h, w]``.
-
-        Raises:
-          TypeError: ``x`` is not uint8.
-          ValueError: The model was built without an encoder, or the clip's
-            frames or sides do not divide.
-
-        """
-        if self.encoder is None:
-            raise ValueError("This MochiVAE was built without an encoder.")
-        if x.dtype != torch.uint8:
-            raise TypeError(f"MochiVAE encodes uint8 RGB in [0, 255]; got {x.dtype}.")
-        frames, height, width = x.shape[-3:]
-        if (frames - 1) % self.time or height % self.space or width % self.space:
-            raise ValueError(
-                f"MochiVAE encodes 1 + {self.time}k frames of sides divisible by "
-                f"{self.space}; got {frames} frames of {height}x{width}.",
-            )
-        # ``x / 127.5 - 1``, the reference's own map.
-        pixels = x.reshape(-1, *x.shape[-4:]).float() / 127.5 - 1
-        moments = self.encoder(pixels)
-        moments = moments.reshape(*x.shape[:-4], *moments.shape[1:])
-        mean, logvar = moments.chunk(2, dim=-4)
-        return DiagonalGaussian(mean, logvar)
-
-    def decode(self, z: Tensor, /) -> Tensor:
-        """Decode latents to RGB in ``[0, 1]``.
-
-        Args:
-          z: ``[..., channels_latent, t, h, w]`` raw latents.
-
-        Returns:
-          video: ``[..., 3, 1 + 6 (t - 1), H, W]`` float RGB, clamped.
-
-        Raises:
-          ValueError: The model was built without a decoder.
-
-        """
-        if self.decoder is None:
-            raise ValueError("This MochiVAE was built without a decoder.")
-        decoded = self.decoder(z.reshape(-1, *z.shape[-4:]))
-        decoded = decoded.reshape(*z.shape[:-4], *decoded.shape[1:])
-        return ((decoded + 1) / 2).clamp(0, 1)
-
-
-def mochi() -> MochiVAE.Config:
+def mochi() -> CausalVideoVAE.Config:
     """Return Mochi 1's VAE: 12 channels, 6x in time, 8x in space.
 
     Returns:
       config: The published model, float32 weights pinned per half.
 
     """
-    return MochiVAE.Config()
+    return CausalVideoVAE.Config(
+        encoder=Encoder.Config(),
+        decoder=Decoder.Config(),
+        num_frames=163,
+        image_size=(480, 848),
+        latent_norm=StdLatents.Config(mean=list(_MOCHI_MEAN), std=list(_MOCHI_STD)),
+    )
 
 
-def mochi_comfy() -> MochiVAE.Config:
+def mochi_comfy() -> CausalVideoVAE.Config:
     """Return :func:`mochi` read from Comfy's repackaging, rounded to float16.
 
     Returns:
       config: The model, its weights pinned.
 
     """
-    config = MochiVAE.Config()
-    assert config.encoder is not None
-    assert config.decoder is not None
+    config = mochi()
+    assert isinstance(config.encoder, Encoder.Config)
+    assert isinstance(config.decoder, Decoder.Config)
     checkpoint = HubFile.Config(
         repo_id="Comfy-Org/mochi_preview_repackaged",
         filename="split_files/vae/mochi_vae.safetensors",
@@ -756,9 +586,7 @@ class _FrameGroupNorm(GroupNorm2d):
     @override
     def forward(self, input: Tensor, **kwargs: object) -> Tensor:
         del kwargs
-        b, _, t = input.shape[:3]
-        frames = super().forward(input.transpose(1, 2).flatten(0, 1))
-        return frames.unflatten(0, (b, t)).transpose(1, 2)
+        return per_frame(super().forward, input)
 
 
 class _Attention(nn.Module):
@@ -886,9 +714,6 @@ _SUM: Final = map_cost(
 )
 """A forward sum or product of two tensors."""
 
-_CLAMP: Final = map_cost(primal=2, adjoint=0, adjoint_inputs=0, adjoint_outputs=0)
-"""A forward two-sided clamp."""
-
 _SIN_COS: Final = map_cost(
     primal=4,
     adjoint=0,
@@ -901,13 +726,11 @@ _SIN_COS: Final = map_cost(
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Layers:
-    """Price the reference's layers at one batch size, head width, and dtype."""
+    """Price the reference's layers at one batch size, group count, and dtype."""
 
     batch_size: int
     dtype: torch.dtype | None
     num_groups: int
-    channels_head: int
-    attn_kernel: Makeable[AttentionKernel]
 
     def linear(
         self,
@@ -967,18 +790,11 @@ class _Layers:
         )
 
     def causal(self, channels: int, *, grid: tuple[int, int, int]) -> Cost:
-        """Cost a residual ``CausalConv3d``: the replicating pad's copy, then the 3x3x3."""
-        t, h, w = grid
-        padded = (t + 2, h + 2, w + 2)
-        moved = self.batch_size * channels * (math.prod(grid) + math.prod(padded))
-        return traffic(
-            "primal",
-            kernel="elementwise",
-            elements=moved,
-            dtype=self.dtype,
-        ) + cost(
-            Conv3d.Config(channels, channels, kernel_size=3, padding=0, bias=True),
-            input_grid=padded,
+        """Cost a residual block's replicating ``CausalConv3d``."""
+        return causal_conv3d_cost(
+            channels,
+            channels,
+            input_grid=grid,
             batch_size=self.batch_size,
             dtype=self.dtype,
         )
@@ -987,11 +803,11 @@ class _Layers:
         self,
         channels: int,
         count: int,
-        attends: bool,
         *,
         grid: tuple[int, int, int],
+        attention: Encoder.Config | None,
     ) -> Cost:
-        """Cost ``count`` ``_ResBlock`` on ``grid``, each attending when ``attends``."""
+        """Cost ``count`` ``_ResBlock`` on ``grid``, each attending as ``attention`` says."""
         elements = self.batch_size * channels * math.prod(grid)
         block = (
             self.norm(channels, grid=grid).tile(2, copies=2)
@@ -999,7 +815,7 @@ class _Layers:
             + self.causal(channels, grid=grid).tile(2, copies=2)
             + _SUM(channels=elements, dtype=self.dtype)
         )
-        if attends:
+        if attention is not None:
             t, h, w = grid
             block += (
                 self.norm(channels, grid=grid)
@@ -1013,12 +829,12 @@ class _Layers:
                 + self.rows(channels, 3 * channels, rows=math.prod(grid), bias=False)
                 + _POINTWISE(channels=2 * elements, dtype=self.dtype).tile(3)
                 + cost(
-                    self.attn_kernel,
+                    attention.attn_kernel,
                     seq_len=t,
                     batch_size=self.batch_size * h * w,
                     dtype=self.dtype,
-                    num_heads=channels // self.channels_head,
-                    channels_head=self.channels_head,
+                    num_heads=channels // attention.channels_head,
+                    channels_head=attention.channels_head,
                 )
                 + self.rows(channels, channels, rows=math.prod(grid), bias=True)
                 + _SUM(channels=elements, dtype=self.dtype)
@@ -1036,29 +852,17 @@ class _Layers:
     ) -> tuple[Cost, tuple[int, int, int]]:
         """Cost a downsampling convolution; return it with the grid it leaves."""
         t, h, w = grid
-        padded = (t + factor_t - 1, h, w)
-        moved = self.batch_size * channels_in * (math.prod(grid) + math.prod(padded))
-        convolution = cost(
-            Conv3d.Config(
-                channels_in,
-                channels_out,
-                kernel_size=(factor_t, factor_s, factor_s),
-                stride=(factor_t, factor_s, factor_s),
-                padding=0,
-                bias=True,
-            ),
-            input_grid=padded,
+        return causal_conv3d_cost(
+            channels_in,
+            channels_out,
+            (factor_t, factor_s, factor_s),
+            stride=(factor_t, factor_s, factor_s),
+            past=factor_t - 1,
+            input_grid=grid,
             batch_size=self.batch_size,
             dtype=self.dtype,
-        )
-        moved_cost = traffic(
-            "primal",
-            kernel="elementwise",
-            elements=moved,
-            dtype=self.dtype,
-        )
-        return moved_cost + convolution, (
-            padded[0] // factor_t,
+        ), (
+            (t + factor_t - 1) // factor_t,
             h // factor_s,
             w // factor_s,
         )
@@ -1079,7 +883,7 @@ class _Layers:
         out = (factor_t * t - factor_t + 1, h * factor_s, w * factor_s)
         unfolded = self.batch_size * expanded * math.prod(grid)
         total = (
-            self.blocks(channels_in, count, False, grid=grid)
+            self.blocks(channels_in, count, grid=grid, attention=None)
             + self.linear(
                 channels_in,
                 expanded,

@@ -23,8 +23,10 @@ import torch
 from priml.model.ae.checkpoint import HubFile, LocalFile
 from priml.model.ae.distribution import DiagonalGaussian
 from priml.model.ae.latent_norm import InverseStdLatents
+from priml.model.ae.video import CausalVideoVAE
 from priml.model.ae.wan import (
-    WanVAE,
+    Decoder,
+    Encoder,
     average_shortcut,
     duplicate_shortcut,
     remap_wan_state_dict,
@@ -59,15 +61,15 @@ _PUBLISHED: Final = {
 }
 
 
-def tiny(version: str = "21") -> WanVAE.Config:
+def tiny(version: str = "21") -> CausalVideoVAE.Config:
     """Return a published layout at test size: three stages, widths 2 and 4.
 
     Both a spatial-only and a spatiotemporal resampler run, and Wan 2.2's both
     shortcuts.
     """
     config = wan21() if version == "21" else wan22()
-    assert config.encoder is not None
-    assert config.decoder is not None
+    assert isinstance(config.encoder, Encoder.Config)
+    assert isinstance(config.decoder, Decoder.Config)
     encoder, decoder = config.encoder, config.decoder
     encoder.channels_hidden = (2, 4, 4)
     decoder.channels_hidden = (4, 4, 2)
@@ -82,17 +84,17 @@ def tiny(version: str = "21") -> WanVAE.Config:
     return config
 
 
-def _clip(config: WanVAE.Config, *, frames: int = 5) -> Tensor:
+def _clip(config: CausalVideoVAE.Config, *, frames: int = 5) -> Tensor:
     generator = torch.Generator().manual_seed(0)
     shape = (2, 3, frames, *config.image_size)
     return torch.randint(0, 256, shape, generator=generator, dtype=torch.uint8)
 
 
-def _reference_layout(version: str) -> WanVAE.Config:
+def _reference_layout(version: str) -> CausalVideoVAE.Config:
     """Return the layout a reference golden was minted at."""
     config = tiny(version)
-    assert config.encoder is not None
-    assert config.decoder is not None
+    assert isinstance(config.encoder, Encoder.Config)
+    assert isinstance(config.decoder, Decoder.Config)
     encoder, decoder = config.encoder, config.decoder
     encoder.channels_hidden = decoder.channels_hidden = (2, 2)
     encoder.temporal = decoder.temporal = (True,)
@@ -162,8 +164,8 @@ def test_published_halves_load_exactly_the_published_tensors(name: str) -> None:
         for key, shape in (line.split() for line in lines)
     }
     config = _PUBLISHED[name]()
-    assert config.encoder is not None
-    assert config.decoder is not None
+    assert isinstance(config.encoder, Encoder.Config)
+    assert isinstance(config.decoder, Decoder.Config)
     assert isinstance(config.encoder.checkpoint, HubFile.Config)
     assert config.encoder.checkpoint == config.decoder.checkpoint
     assert config.encoder.checkpoint is not config.decoder.checkpoint
@@ -184,7 +186,7 @@ def test_published_halves_load_exactly_the_published_tensors(name: str) -> None:
     ids=["wan21", "wan22"],
 )
 def test_published_latents_and_statistics(
-    factory: Callable[[], WanVAE.Config],
+    factory: Callable[[], CausalVideoVAE.Config],
     latent_shape: tuple[int, int, int, int],
     channels: int,
 ) -> None:
@@ -244,8 +246,8 @@ def test_both_halves_load_one_release_file(tmp_path: Path) -> None:
             released[name] = value
     torch.save(released, tmp_path / "vae.pth")
     config = tiny("22")
-    assert config.encoder is not None
-    assert config.decoder is not None
+    assert isinstance(config.encoder, Encoder.Config)
+    assert isinstance(config.decoder, Decoder.Config)
     config.encoder.checkpoint = LocalFile.Config(path=tmp_path / "vae.pth")
     config.decoder.checkpoint = LocalFile.Config(path=tmp_path / "vae.pth")
     loaded = config.make()
@@ -255,71 +257,10 @@ def test_both_halves_load_one_release_file(tmp_path: Path) -> None:
     assert torch.equal(loaded.decode(latent), source.decode(latent))
 
 
-def test_leading_dimensions_pass_through() -> None:
-    config = tiny()
-    model = config.make()
-    clip = torch.randint(
-        0,
-        256,
-        (2, 4, 3, 5, *config.image_size),
-        generator=torch.Generator().manual_seed(1),
-        dtype=torch.uint8,
-    )
-    flat = model.encode(clip.flatten(0, 1)).mode()
-    nested = model.encode(clip).mode()
-    assert torch.equal(nested.flatten(0, 1), flat)
-    assert model.decode(nested).shape == clip.shape
-
-
-@pytest.mark.parametrize(
-    ("frames", "side"),
-    [(6, 8), (5, 10)],
-    ids=["frames", "sides"],
-)
-def test_encode_refuses_a_clip_the_resamplers_cannot_divide(
-    frames: int,
-    side: int,
-) -> None:
-    model = tiny().make()
-    clip = torch.zeros(2, 3, frames, side, 12, dtype=torch.uint8)
-    with pytest.raises(ValueError, match="frames of sides divisible by 4"):
-        _ = model.encode(clip)
-
-
-def test_encode_refuses_a_float_clip() -> None:
-    with pytest.raises(TypeError, match="uint8"):
-        _ = tiny().make().encode(torch.rand(2, 3, 5, 8, 12))
-
-
-def test_either_half_can_be_left_out() -> None:
-    encode_only, decode_only = tiny(), tiny()
-    encode_only.decoder = None
-    decode_only.encoder = None
-    with pytest.raises(ValueError, match="without a decoder"):
-        _ = encode_only.make().decode(torch.zeros(2, 3, 2, 2, 3))
-    with pytest.raises(ValueError, match="without an encoder"):
-        _ = decode_only.make().encode(_clip(tiny()))
-
-
-def test_train_leaves_the_frozen_model_in_eval_mode() -> None:
-    model = tiny().make()
-    _ = model.train()
-    assert not model.training
-    assert not any(parameter.requires_grad for parameter in model.parameters())
-
-
-def test_rejects_halves_that_disagree_on_the_latent() -> None:
-    config = tiny()
-    assert config.decoder is not None
-    config.decoder.channels_latent = 5
-    with pytest.raises(ValueError, match="channels_latent"):
-        _ = config.make()
-
-
 def test_rejects_resampling_flags_that_miss_a_stage() -> None:
     encoder_short, decoder_short = tiny(), tiny()
-    assert encoder_short.encoder is not None
-    assert decoder_short.decoder is not None
+    assert isinstance(encoder_short.encoder, Encoder.Config)
+    assert isinstance(decoder_short.decoder, Decoder.Config)
     encoder_short.encoder.temporal = (True,)
     decoder_short.decoder.channels_upsampled = (2,)
     with pytest.raises(ValueError, match="one flag per downsampling stage"):
@@ -328,24 +269,8 @@ def test_rejects_resampling_flags_that_miss_a_stage() -> None:
         _ = decoder_short.make()
 
 
-def test_config_needs_a_half() -> None:
-    config = tiny()
-    config.encoder = config.decoder = None
-    with pytest.raises(ValueError, match="needs an encoder or a decoder"):
-        _ = config.latent_shape()
-    with pytest.raises(ValueError, match="needs an encoder or a decoder"):
-        _ = config.make()
-
-
-def test_cost_needs_both_halves() -> None:
-    config = tiny()
-    config.decoder = None
-    with pytest.raises(ValueError, match="prices both halves"):
-        _ = config.cost(batch_size=1, dtype=None)
-
-
 def _round_trip(module: nn.Module, clip: Tensor) -> Tensor:
-    assert isinstance(module, WanVAE)
+    assert isinstance(module, CausalVideoVAE)
     return module.decode(module.encode(clip).sample())
 
 

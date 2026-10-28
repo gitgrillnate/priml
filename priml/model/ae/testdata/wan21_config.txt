@@ -1,4 +1,4 @@
-WanVAE.Config(
+CausalVideoVAE.Config(
         encoder=Encoder.Config(
             channels_in=3,
             patch_size=1,

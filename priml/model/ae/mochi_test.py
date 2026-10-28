@@ -22,7 +22,14 @@ import torch
 from priml.model.ae.checkpoint import HubFile, LocalFile
 from priml.model.ae.distribution import DiagonalGaussian
 from priml.model.ae.latent_norm import StdLatents
-from priml.model.ae.mochi import MochiVAE, mochi, mochi_comfy, remap_mochi_state_dict
+from priml.model.ae.mochi import (
+    Decoder,
+    Encoder,
+    mochi,
+    mochi_comfy,
+    remap_mochi_state_dict,
+)
+from priml.model.ae.video import CausalVideoVAE
 from priml.testing.bfb import host_agnostic_numerics
 from priml.testing.cost import assert_cost_matches_torch
 from priml.testing.golden import assert_pprint_golden, mismatches, read_tensors
@@ -35,11 +42,11 @@ _TESTDATA: Final = _CWD / "testdata"
 _REFERENCE_COMMIT: Final = "15c9bad662df1fa3e7b53136423695b286484c08"
 
 
-def tiny() -> MochiVAE.Config:
+def tiny() -> CausalVideoVAE.Config:
     """Return the published layout at the reference golden's size: widths 2 and 4."""
     config = mochi()
-    assert config.encoder is not None
-    assert config.decoder is not None
+    assert isinstance(config.encoder, Encoder.Config)
+    assert isinstance(config.decoder, Decoder.Config)
     encoder, decoder = config.encoder, config.decoder
     encoder.channels_hidden, decoder.channels_hidden = (2, 4), (4, 2)
     encoder.blocks_per_stage = decoder.blocks_per_stage = (1, 1, 1)
@@ -132,8 +139,8 @@ def test_published_halves_load_exactly_the_published_tensors(comfy: bool) -> Non
     Comfy's one file holds both halves, each under its prefix.
     """
     config = mochi_comfy() if comfy else mochi()
-    assert config.encoder is not None
-    assert config.decoder is not None
+    assert isinstance(config.encoder, Encoder.Config)
+    assert isinstance(config.decoder, Decoder.Config)
     assert isinstance(config.encoder.checkpoint, HubFile.Config)
     assert isinstance(config.decoder.checkpoint, HubFile.Config)
     config.encoder.checkpoint = config.decoder.checkpoint = None
@@ -190,8 +197,8 @@ def test_both_halves_load_their_own_files(tmp_path: Path) -> None:
         assert module is not None
         state = {key: value.contiguous() for key, value in module.state_dict().items()}
         save_file(state, str(tmp_path / f"{half}.safetensors"))
-    assert config.encoder is not None
-    assert config.decoder is not None
+    assert isinstance(config.encoder, Encoder.Config)
+    assert isinstance(config.decoder, Decoder.Config)
     config.encoder.checkpoint = LocalFile.Config(path=tmp_path / "encoder.safetensors")
     config.decoder.checkpoint = LocalFile.Config(path=tmp_path / "decoder.safetensors")
     loaded = config.make()
@@ -201,65 +208,10 @@ def test_both_halves_load_their_own_files(tmp_path: Path) -> None:
     assert torch.equal(loaded.decode(latent), source.decode(latent))
 
 
-def test_leading_dimensions_pass_through() -> None:
-    model = tiny().make()
-    clip = torch.randint(
-        0,
-        256,
-        (2, 5, 3, 4, 4, 6),
-        generator=torch.Generator().manual_seed(1),
-        dtype=torch.uint8,
-    )
-    flat = model.encode(clip.flatten(0, 1)).mode()
-    nested = model.encode(clip).mode()
-    assert torch.equal(nested.flatten(0, 1), flat)
-    assert model.decode(nested).shape == clip.shape
-
-
-@pytest.mark.parametrize(("frames", "side"), [(5, 4), (4, 5)], ids=["frames", "sides"])
-def test_encode_refuses_a_clip_the_resamplers_cannot_divide(
-    frames: int,
-    side: int,
-) -> None:
-    clip = torch.zeros(2, 3, frames, side, 6, dtype=torch.uint8)
-    with pytest.raises(ValueError, match="frames of sides divisible by 2"):
-        _ = tiny().make().encode(clip)
-
-
-def test_encode_refuses_a_float_clip() -> None:
-    with pytest.raises(TypeError, match="uint8"):
-        _ = tiny().make().encode(torch.rand(2, 3, 4, 4, 6))
-
-
-def test_either_half_can_be_left_out() -> None:
-    encode_only, decode_only = tiny(), tiny()
-    encode_only.decoder = None
-    decode_only.encoder = None
-    with pytest.raises(ValueError, match="without a decoder"):
-        _ = encode_only.make().decode(torch.zeros(2, 3, 2, 2, 3))
-    with pytest.raises(ValueError, match="without an encoder"):
-        _ = decode_only.make().encode(_clip())
-
-
-def test_train_leaves_the_frozen_model_in_eval_mode() -> None:
-    model = tiny().make()
-    _ = model.train()
-    assert not model.training
-    assert not any(parameter.requires_grad for parameter in model.parameters())
-
-
-def test_rejects_halves_that_disagree_on_the_latent() -> None:
-    config = tiny()
-    assert config.decoder is not None
-    config.decoder.channels_latent = 5
-    with pytest.raises(ValueError, match="channels_latent"):
-        _ = config.make()
-
-
 def test_rejects_per_stage_settings_that_miss_a_stage() -> None:
     encoder_short, decoder_short = tiny(), tiny()
-    assert encoder_short.encoder is not None
-    assert decoder_short.decoder is not None
+    assert isinstance(encoder_short.encoder, Encoder.Config)
+    assert isinstance(decoder_short.decoder, Decoder.Config)
     encoder_short.encoder.attention = (False, True)
     decoder_short.decoder.blocks_per_stage = (1, 1)
     for config in (encoder_short, decoder_short):
@@ -267,24 +219,8 @@ def test_rejects_per_stage_settings_that_miss_a_stage() -> None:
             _ = config.make()
 
 
-def test_config_needs_a_half() -> None:
-    config = tiny()
-    config.encoder = config.decoder = None
-    with pytest.raises(ValueError, match="needs an encoder or a decoder"):
-        _ = config.latent_shape()
-    with pytest.raises(ValueError, match="needs an encoder or a decoder"):
-        _ = config.make()
-
-
-def test_cost_needs_both_halves() -> None:
-    config = tiny()
-    config.decoder = None
-    with pytest.raises(ValueError, match="prices both halves"):
-        _ = config.cost(batch_size=1, dtype=None)
-
-
 def _round_trip(module: nn.Module, clip: Tensor) -> Tensor:
-    assert isinstance(module, MochiVAE)
+    assert isinstance(module, CausalVideoVAE)
     return module.decode(module.encode(clip).sample())
 
 

@@ -17,7 +17,7 @@ References:
 
 from __future__ import annotations
 
-from dataclasses import field
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, Self, override
 
 from configgle import Fig, Makeable
@@ -99,33 +99,6 @@ def remap_taesd_state_dict(
     return {f"layers.{key}": tensor for key, tensor in state.items()}
 
 
-def taesd_file(
-    repo_id: str,
-    filename: str,
-    *,
-    revision: str,
-    sha256: str,
-) -> HubFile.Config:
-    """Return one pinned half of a published TAESD.
-
-    Args:
-      repo_id: Hub repository.
-      filename: The half's safetensors.
-      revision: Full commit SHA.
-      sha256: The file's digest.
-
-    Returns:
-      source: The pinned Hub file.
-
-    """
-    return HubFile.Config(
-        repo_id=repo_id,
-        filename=filename,
-        revision=revision,
-        sha256=sha256,
-    )
-
-
 class Encoder(nn.Module):
     """Pixels in ``[0, 1]`` to latents: a block, then three stride-2 stages."""
 
@@ -142,9 +115,9 @@ class Encoder(nn.Module):
         """Latent channels."""
 
         checkpoint: Makeable[CheckpointFile] | None = field(
-            default_factory=lambda: taesd_file(
-                "madebyollin/taesd",
-                "taesd_encoder.safetensors",
+            default_factory=lambda: HubFile.Config(
+                repo_id="madebyollin/taesd",
+                filename="taesd_encoder.safetensors",
                 revision=TAESD_REVISION,
                 sha256="160d90c61c3a5ce50fe2cbe6404b3429f5763772d61b38523cc37e1525b4e19f",
             ),
@@ -227,9 +200,9 @@ class Decoder(nn.Module):
         """Latent channels."""
 
         checkpoint: Makeable[CheckpointFile] | None = field(
-            default_factory=lambda: taesd_file(
-                "madebyollin/taesd",
-                "taesd_decoder.safetensors",
+            default_factory=lambda: HubFile.Config(
+                repo_id="madebyollin/taesd",
+                filename="taesd_decoder.safetensors",
                 revision=TAESD_REVISION,
                 sha256="f0fb51dd10d41c26612c070fa0b52ea0215a5ff90792134b4971109dd713c019",
             ),
@@ -503,15 +476,15 @@ def taesdxl() -> TAESD.Config:
     config = TAESD.Config()
     assert config.encoder is not None
     assert config.decoder is not None
-    config.encoder.checkpoint = taesd_file(
-        "madebyollin/taesdxl",
-        "taesdxl_encoder.safetensors",
+    config.encoder.checkpoint = HubFile.Config(
+        repo_id="madebyollin/taesdxl",
+        filename="taesdxl_encoder.safetensors",
         revision=TAESDXL_REVISION,
         sha256="9f37c0b28f72ec4ca835dc7dbf05255bdf323cde8cf12a304674f106466c98ef",
     )
-    config.decoder.checkpoint = taesd_file(
-        "madebyollin/taesdxl",
-        "taesdxl_decoder.safetensors",
+    config.decoder.checkpoint = HubFile.Config(
+        repo_id="madebyollin/taesdxl",
+        filename="taesdxl_decoder.safetensors",
         revision=TAESDXL_REVISION,
         sha256="f6013131e7eb412ef20113f1acc2ea7d3e47e53196ca0530fa65d9b61d814b61",
     )
@@ -567,12 +540,12 @@ class _Block(nn.Module):
         return self.fuse(self.conv(x) + self.skip(x))
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _Layers:
     """Price the reference's layers at one batch size and dtype."""
 
-    def __init__(self, *, batch_size: int, dtype: torch.dtype | None) -> None:
-        self.batch_size = batch_size
-        self.dtype = dtype
+    batch_size: int
+    dtype: torch.dtype | None
 
     def conv(
         self,

@@ -1,4 +1,4 @@
-MochiVAE.Config(
+CausalVideoVAE.Config(
         encoder=Encoder.Config(
             channels_in=3,
             fourier_octaves=(6, 7),
